@@ -55,7 +55,7 @@ export type DownloadQueueClient = Pick<
 interface DownloadQueuePageProps {
   client: DownloadQueueClient;
   logScope: "local" | "remote";
-  showLocalDetails?: boolean;
+  showLocalPaths?: boolean;
 }
 
 const downloadStatusText: Record<DownloadStatus, string> = {
@@ -77,7 +77,7 @@ const downloadStatusText: Record<DownloadStatus, string> = {
 export function DownloadQueuePage({
   client,
   logScope,
-  showLocalDetails = true
+  showLocalPaths = true
 }: DownloadQueuePageProps) {
   const capabilities = getAppCapabilities();
   const [tasks, setTasks] = useState<DownloadTask[]>([]);
@@ -416,7 +416,7 @@ export function DownloadQueuePage({
                           </div>
                         </div>
                       </div>
-                      {showLocalDetails && <div className="flex min-w-0 items-center gap-2 text-xs text-muted-foreground sm:max-w-[45%]">
+                      {showLocalPaths && <div className="flex min-w-0 items-center gap-2 text-xs text-muted-foreground sm:max-w-[45%]">
                         <Folder className="size-4 shrink-0" />
                         <span className="truncate" title={animeGroup.savePath}>{animeGroup.savePath}</span>
                       </div>}
@@ -435,7 +435,6 @@ export function DownloadQueuePage({
                                 <DownloadTaskRow
                                   key={task.id}
                                   task={task}
-                                  showLocalDetails={showLocalDetails}
                                   mutatingTaskId={mutatingTaskId}
                                   mutatingFileId={mutatingFileId}
                                   scanningTaskId={scanningTaskId}
@@ -518,7 +517,6 @@ export function DownloadQueuePage({
 
 function DownloadTaskRow({
   task,
-  showLocalDetails,
   mutatingTaskId,
   mutatingFileId,
   scanningTaskId,
@@ -528,7 +526,6 @@ function DownloadTaskRow({
   onToggleFile
 }: {
   task: DownloadTask;
-  showLocalDetails: boolean;
   mutatingTaskId: string | null;
   mutatingFileId: string | null;
   scanningTaskId: string | null;
@@ -627,22 +624,18 @@ function DownloadTaskRow({
         <div className="flex flex-wrap items-center gap-x-5 gap-y-2 text-xs text-muted-foreground">
           <span className="flex items-center gap-1.5"><Gauge className="size-4" />{task.engine === "embedded" ? "内置引擎" : "qBittorrent"}</span>
           <ReleaseMetadataBadges metadata={task} />
-          {showLocalDetails && (
-            <>
-              <span className="flex min-w-24 items-center gap-1.5 tabular-nums" title="下载速度">
-                <DownloadIcon className="size-4" />
-                {formatSpeed(task.downloadSpeed)}
-              </span>
-              <span className="flex min-w-24 items-center gap-1.5 tabular-nums" title="上传速度">
-                <Upload className="size-4" />
-                {formatSpeed(task.uploadSpeed)}
-              </span>
-              <span className="flex min-w-28 items-center gap-1.5 tabular-nums sm:ml-auto" title="预计剩余时间">
-                <Clock3 className="size-4" />
-                {formatDownloadEta(task)}
-              </span>
-            </>
-          )}
+          <span className="flex min-w-24 items-center gap-1.5 tabular-nums" title="下载速度">
+            <DownloadIcon className="size-4" />
+            {formatSpeed(task.downloadSpeed)}
+          </span>
+          <span className="flex min-w-24 items-center gap-1.5 tabular-nums" title="上传速度">
+            <Upload className="size-4" />
+            {formatSpeed(task.uploadSpeed)}
+          </span>
+          <span className="flex min-w-28 items-center gap-1.5 tabular-nums sm:ml-auto" title="预计剩余时间">
+            <Clock3 className="size-4" />
+            {formatDownloadEta(task)}
+          </span>
         </div>
 
         <div className="grid min-w-0 grid-cols-[minmax(0,1fr)_3rem] items-center gap-3">

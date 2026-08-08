@@ -108,6 +108,7 @@ export function AnimeDownloadTaskSheet({
               task={task}
               fansubNames={fansubNames}
               onPlayMedia={onPlayMedia}
+              showLocalDetails={detail.filter !== "completed"}
               onRequestRemove={detail.filter === "completed" && onRemoveTask
                 ? () => setRemoveTarget(task)
                 : undefined}
@@ -177,11 +178,13 @@ function DownloadTaskCard({
   task,
   fansubNames,
   onPlayMedia,
+  showLocalDetails,
   onRequestRemove
 }: {
   task: DownloadTask;
   fansubNames: Map<string, string>;
   onPlayMedia?: (target: MediaPlaybackTarget) => Promise<void>;
+  showLocalDetails: boolean;
   onRequestRemove?: () => void;
 }) {
   const runtime = getAppRuntime();
@@ -242,13 +245,15 @@ function DownloadTaskCard({
 
       <Progress className="mt-3" value={task.progress} />
 
-      <dl className="mt-4 grid grid-cols-1 gap-x-4 gap-y-2 text-xs sm:grid-cols-2">
-        <DownloadTaskMeta className="sm:col-span-2" label="保存路径" value={task.savePath} />
-        <DownloadTaskMeta label="创建时间" value={formatDateTime(task.createdAt)} />
-        <DownloadTaskMeta label="完成时间" value={formatDateTime(task.completedAt)} />
-        <DownloadTaskMeta label="下载速度" value={formatSpeed(task.downloadSpeed)} />
-        <DownloadTaskMeta label="上传速度" value={formatSpeed(task.uploadSpeed)} />
-      </dl>
+      {showLocalDetails && (
+        <dl className="mt-4 grid grid-cols-1 gap-x-4 gap-y-2 text-xs sm:grid-cols-2">
+          <DownloadTaskMeta className="sm:col-span-2" label="保存路径" value={task.savePath} />
+          <DownloadTaskMeta label="创建时间" value={formatDateTime(task.createdAt)} />
+          <DownloadTaskMeta label="完成时间" value={formatDateTime(task.completedAt)} />
+          <DownloadTaskMeta label="下载速度" value={formatSpeed(task.downloadSpeed)} />
+          <DownloadTaskMeta label="上传速度" value={formatSpeed(task.uploadSpeed)} />
+        </dl>
+      )}
 
       {fileActionError && (
         <Alert className="mt-4" variant="destructive">

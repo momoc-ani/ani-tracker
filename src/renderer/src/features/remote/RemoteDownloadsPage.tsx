@@ -23,7 +23,6 @@ export function RemoteDownloadsPage() {
     <DownloadQueuePage
       client={remoteDownloadQueueClient}
       logScope="remote"
-      showLocalDetails={false}
     />
   );
 }
