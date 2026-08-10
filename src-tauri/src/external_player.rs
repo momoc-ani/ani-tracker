@@ -41,6 +41,12 @@ enum PlaybackMonitorKind {
     PotPlayer,
 }
 
+#[derive(Debug, PartialEq)]
+enum MpvPlaybackEvent {
+    Path(PathBuf),
+    Percent(f64),
+}
+
 trait AsyncIpcStream: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T> AsyncIpcStream for T where T: AsyncRead + AsyncWrite + Unpin + Send {}
 
@@ -432,22 +438,34 @@ async fn monitor_mpv(
     let stream = connect_mpv_endpoint(&endpoint).await?;
     let (reader, mut writer) = tokio::io::split(stream);
     writer
-        .write_all(b"{\"command\":[\"observe_property\",1,\"percent-pos\"]}\n")
+        .write_all(
+            b"{\"command\":[\"observe_property\",1,\"percent-pos\"]}\n{\"command\":[\"observe_property\",2,\"path\"]}\n",
+        )
         .await
-        .map_err(|error| format!("订阅 mpv 播放进度失败：{error}"))?;
+        .map_err(|error| format!("订阅 mpv 播放状态失败：{error}"))?;
     let mut lines = BufReader::new(reader).lines();
+    let mut current_file_path = file_path;
     while let Some(line) = lines
         .next_line()
         .await
         .map_err(|error| format!("读取 mpv 播放进度失败：{error}"))?
     {
-        let Some(percent) = parse_progress_line(&line, true) else {
-            continue;
-        };
-        match media_state.report_external_playback_progress(&file_path, percent) {
-            Ok(true) => break,
-            Ok(false) => {}
-            Err(error) => log::warn!("Tauri mpv 进度回写失败 error={error}"),
+        match parse_mpv_playback_event(&line) {
+            Some(MpvPlaybackEvent::Path(path)) => {
+                log::info!(
+                    "Tauri 外部播放器切换媒体 old={} new={}",
+                    current_file_path.display(),
+                    path.display()
+                );
+                current_file_path = path;
+            }
+            Some(MpvPlaybackEvent::Percent(percent)) => {
+                match media_state.report_external_playback_progress(&current_file_path, percent) {
+                    Ok(true) | Ok(false) => {}
+                    Err(error) => log::warn!("Tauri mpv 进度回写失败 error={error}"),
+                }
+            }
+            None => {}
         }
     }
     #[cfg(unix)]
@@ -490,12 +508,15 @@ async fn monitor_potplayer(media_state: AppMediaState, file_path: PathBuf) -> Re
         .await
         .map_err(|error| format!("读取 PotPlayer GSMTC 进度失败：{error}"))?
     {
-        let Some(percent) = parse_progress_line(&line, false) else {
+        let Some((percent, title)) = parse_potplayer_progress_line(&line) else {
             continue;
         };
-        match media_state.report_external_playback_progress(&file_path, percent) {
-            Ok(true) => break,
-            Ok(false) => {}
+        match media_state.report_external_playback_progress_with_title(
+            &file_path,
+            title.as_deref(),
+            percent,
+        ) {
+            Ok(true) | Ok(false) => {}
             Err(error) => log::warn!("Tauri PotPlayer 进度回写失败 error={error}"),
         }
     }
@@ -540,6 +561,51 @@ fn parse_progress_line(line: &str, mpv: bool) -> Option<f64> {
     }
     let percent = value.get(if mpv { "data" } else { "percent" })?.as_f64()?;
     percent.is_finite().then(|| percent.clamp(0.0, 100.0))
+}
+
+/// 解析 mpv 当前文件或播放百分比事件。
+fn parse_mpv_playback_event(line: &str) -> Option<MpvPlaybackEvent> {
+    let value: Value = serde_json::from_str(line).ok()?;
+    if value.get("event")?.as_str()? != "property-change" {
+        return None;
+    }
+    match value.get("name")?.as_str()? {
+        "path" => parse_local_media_path(value.get("data")?.as_str()?).map(MpvPlaybackEvent::Path),
+        "percent-pos" => parse_progress_line(line, true).map(MpvPlaybackEvent::Percent),
+        _ => None,
+    }
+}
+
+/// 将 mpv 的本地路径或 file URI 转换为本地路径。
+fn parse_local_media_path(value: &str) -> Option<PathBuf> {
+    if value.trim().is_empty() {
+        return None;
+    }
+    if value.starts_with("file://") {
+        return url::Url::parse(value).ok()?.to_file_path().ok();
+    }
+    if value.contains("://") {
+        return None;
+    }
+    Some(PathBuf::from(value))
+}
+
+/// 解析 PotPlayer GSMTC 的百分比与当前媒体标题。
+#[cfg(any(target_os = "windows", test))]
+fn parse_potplayer_progress_line(line: &str) -> Option<(f64, Option<String>)> {
+    let value: Value = serde_json::from_str(line).ok()?;
+    let percent = value
+        .get("percent")
+        .and_then(Value::as_f64)
+        .filter(|value| value.is_finite())?
+        .clamp(0.0, 100.0);
+    let title = value
+        .get("title")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned);
+    Some((percent, title))
 }
 
 /// 创建长度受控的本地播放器 IPC 地址。
@@ -635,7 +701,14 @@ for ($attempt = 0; $attempt -lt 14400; $attempt++) {
   if ($duration -gt 0) {
     $position = ($timeline.Position - $timeline.StartTime).TotalSeconds
     $percent = [Math]::Max(0, [Math]::Min(100, $position / $duration * 100))
-    [Console]::Out.WriteLine((@{ percent = $percent } | ConvertTo-Json -Compress))
+    $title = $null
+    try {
+      $properties = Await-WinRt ($session.TryGetMediaPropertiesAsync()) ([Windows.Media.Control.GlobalSystemMediaTransportControlsSessionMediaProperties])
+      $title = $properties.Title
+    } catch {}
+    $payload = @{ percent = $percent }
+    if (-not [String]::IsNullOrWhiteSpace($title)) { $payload.title = $title }
+    [Console]::Out.WriteLine(($payload | ConvertTo-Json -Compress))
   }
   Start-Sleep -Seconds 2
 }
@@ -706,6 +779,42 @@ mod tests {
         assert_eq!(
             parse_progress_line(r#"{"percent":105}"#, false),
             Some(100.0)
+        );
+    }
+
+    /// 验证 mpv 切集事件更新文件目标，并兼容 file URI。
+    #[test]
+    fn parses_mpv_media_switch_events() {
+        assert_eq!(
+            parse_mpv_playback_event(
+                r#"{"event":"property-change","name":"path","data":"file:///tmp/Episode%2002.mkv"}"#
+            ),
+            Some(MpvPlaybackEvent::Path(PathBuf::from("/tmp/Episode 02.mkv")))
+        );
+        assert_eq!(
+            parse_mpv_playback_event(
+                r#"{"event":"property-change","name":"percent-pos","data":92.5}"#
+            ),
+            Some(MpvPlaybackEvent::Percent(92.5))
+        );
+        assert_eq!(
+            parse_mpv_playback_event(
+                r#"{"event":"property-change","name":"path","data":"https://example.test/episode.mkv"}"#
+            ),
+            None
+        );
+    }
+
+    /// 验证 PotPlayer 输出当前媒体标题，并保留百分比边界归一化。
+    #[test]
+    fn parses_potplayer_progress_with_title() {
+        assert_eq!(
+            parse_potplayer_progress_line(r#"{"percent":105,"title":"Episode 02.mkv"}"#),
+            Some((100.0, Some("Episode 02.mkv".to_owned())))
+        );
+        assert_eq!(
+            parse_potplayer_progress_line(r#"{"percent":91.25}"#),
+            Some((91.25, None))
         );
     }
 }
