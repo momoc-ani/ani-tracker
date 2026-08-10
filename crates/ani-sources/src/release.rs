@@ -677,18 +677,55 @@ fn detect_resolution(title: &str) -> Option<ReleaseResolution> {
 }
 
 fn detect_episode_range(title: &str) -> Option<ReleaseEpisodeRange> {
-    [
-        episode_range_season(),
-        episode_range_bracket(),
-        episode_range_generic(),
-    ]
-    .into_iter()
-    .find_map(|pattern| {
-        let captures = pattern.captures(title)?;
-        let start = captures.get(1)?.as_str().parse::<f64>().ok()?;
-        let end = captures.get(2)?.as_str().parse::<f64>().ok()?;
-        (end > start).then_some(ReleaseEpisodeRange { start, end })
-    })
+    for pattern in [episode_range_season(), episode_range_bracket()] {
+        if let Some(range) = pattern
+            .captures(title)
+            .as_ref()
+            .and_then(parse_episode_range_captures)
+        {
+            return Some(range);
+        }
+    }
+
+    let captures = episode_range_generic().captures(title)?;
+    if is_ambiguous_season_episode_range(&captures) {
+        return None;
+    }
+    parse_episode_range_captures(&captures)
+}
+
+/// 将正则捕获的起止集数转换为有效连集范围。
+fn parse_episode_range_captures(captures: &regex::Captures<'_>) -> Option<ReleaseEpisodeRange> {
+    let start = captures.get(1)?.as_str().parse::<f64>().ok()?;
+    let end = captures.get(2)?.as_str().parse::<f64>().ok()?;
+    (end > start).then_some(ReleaseEpisodeRange { start, end })
+}
+
+/// 排除“第二季 2 - 05”被当成第 2 至 5 集的歧义写法。
+fn is_ambiguous_season_episode_range(captures: &regex::Captures<'_>) -> bool {
+    let Some(start) = captures.get(1).map(|value| value.as_str()) else {
+        return false;
+    };
+    let Some(end) = captures.get(2).map(|value| value.as_str()) else {
+        return false;
+    };
+    let Some(full_match) = captures.get(0).map(|value| value.as_str()) else {
+        return false;
+    };
+    let normalized = full_match
+        .trim_start_matches(|character: char| {
+            character.is_whitespace() || character == '_' || character == '-'
+        })
+        .to_ascii_lowercase();
+    let explicitly_labeled = normalized.starts_with("ep")
+        || normalized.starts_with("episode")
+        || normalized.starts_with('第');
+    let spaced_separator = full_match.contains(" - ") || full_match.contains(" ~ ");
+    !explicitly_labeled
+        && spaced_separator
+        && start.len() == 1
+        && end.len() > 1
+        && end.starts_with('0')
 }
 
 fn detect_episode_no(title: &str) -> Option<f64> {
@@ -1275,14 +1312,27 @@ mod tests {
     #[test]
     fn distinguishes_episode_ranges_and_batches() {
         let range = parse_release_title("[字幕组] 测试番 [01-12 合集][1080p]", &[]);
+        let season_range = parse_release_title("[字幕组] 测试番 S2E02-05 [1080p]", &[]);
+        let labeled_range = parse_release_title("[字幕组] 测试番 EP 2 - 05 [1080p]", &[]);
+        let bare_range = parse_release_title("[字幕组] 测试番 2-05 [1080p]", &[]);
         let batch = parse_release_title("[字幕组] 测试番 10-bit 1080p [S3 Fin]", &[]);
+        let season_episode = parse_release_title(
+            "[LoliHouse] 乙女游戏世界对路人角色很不友好2 / Otome Game Sekai wa Mob ni Kibishii Sekai desu 2 - 05 [WebRip 1080p HEVC-10bit AAC][简繁内封字幕]",
+            &[],
+        );
 
         assert_eq!(range.episode_no, None);
         assert_eq!(range.episode_range.expect("episode range").end, 12.0);
         assert_eq!(range.content_kind, ReleaseContentKind::Range);
+        assert_eq!(season_range.episode_range.expect("season range").start, 2.0);
+        assert_eq!(labeled_range.episode_range.expect("labeled range").end, 5.0);
+        assert_eq!(bare_range.episode_range.expect("bare range").end, 5.0);
         assert_eq!(batch.episode_no, None);
         assert_eq!(batch.series_season_no, Some(3));
         assert_eq!(batch.content_kind, ReleaseContentKind::Batch);
+        assert_eq!(season_episode.episode_no, Some(5.0));
+        assert_eq!(season_episode.episode_range, None);
+        assert_eq!(season_episode.content_kind, ReleaseContentKind::Episode);
     }
 
     /// 验证字幕组异体字符生成相同稳定 ID。

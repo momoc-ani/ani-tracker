@@ -523,6 +523,7 @@ fn validate_args(method: &str, args: Vec<Value>) -> Result<Vec<Value>, RemoteRpc
                 "episodeNo",
                 "fansubGroupId",
                 "paused",
+                "confirmUnknownSeason",
             ],
             validate_add_release_download,
         ),
@@ -760,7 +761,8 @@ fn validate_add_release_download(object: &Map<String, Value>) -> Result<(), Remo
     if let Some(value) = object.get("episodeNo") {
         validate_number(Some(value), "集数", 0.0, 100_000.0)?;
     }
-    validate_optional_bool(object.get("paused"), "暂停状态")
+    validate_optional_bool(object.get("paused"), "暂停状态")?;
+    validate_optional_bool(object.get("confirmUnknownSeason"), "季度确认状态")
 }
 
 fn validate_source(object: &Map<String, Value>) -> Result<(), RemoteRpcError> {
@@ -1478,7 +1480,7 @@ mod tests {
                     "storage": { "userDataDir": "/Users/test" },
                     "players": [{ "id": "builtin" }]
                 })),
-                "pauseDownload" | "removeDownload" => Ok(json!([])),
+                "pauseDownload" | "removeDownload" | "addReleaseDownload" => Ok(json!([])),
                 _ => Ok(json!({ "args": args })),
             }
         }
@@ -1514,6 +1516,50 @@ mod tests {
             )
             .await
             .expect_err("unknown argument");
+        assert_eq!(invalid.code, "INVALID_ARGUMENTS");
+    }
+
+    /// 验证远程仅接受布尔类型的单条未知季度确认，不放宽其他下载参数。
+    #[tokio::test]
+    async fn accepts_remote_unknown_season_confirmation() {
+        let service = RemoteRpcService::new(std::sync::Arc::new(EchoHandler));
+        let release = json!({
+            "id": "release-season-2-episode-5",
+            "title": "[LoliHouse] 测试番 2 - 05 [简繁内封字幕]",
+            "sourceId": "mikan",
+            "sourceName": "蜜柑计划 RSS",
+            "torrentUrl": "https://mikanani.me/Download/test.torrent",
+            "publishedAt": "2026-08-06T13:15:00Z"
+        });
+        let confirmed = service
+            .dispatch(
+                json!({
+                    "method": "addReleaseDownload",
+                    "args": [{
+                        "release": release.clone(),
+                        "animeId": "bangumi-412144",
+                        "confirmUnknownSeason": true
+                    }]
+                }),
+                &["downloads.control".to_owned()],
+            )
+            .await;
+        assert!(confirmed.is_ok());
+
+        let invalid = service
+            .dispatch(
+                json!({
+                    "method": "addReleaseDownload",
+                    "args": [{
+                        "release": release,
+                        "animeId": "bangumi-412144",
+                        "confirmUnknownSeason": "true"
+                    }]
+                }),
+                &["downloads.control".to_owned()],
+            )
+            .await
+            .expect_err("non-boolean confirmation must fail");
         assert_eq!(invalid.code, "INVALID_ARGUMENTS");
     }
 
