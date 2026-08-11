@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use ani_contracts::{DesktopMediaToolsStatus, MediaToolStatus};
-use ani_domain::{AppSettings, DownloadTask, MediaFile, ReportPlaybackProgressInput};
+use ani_domain::{AppSettings, DownloadTask, MediaFile, ReportPlaybackProgressInput, TorrentFile};
 use ani_media::{DownloadMediaScanner, MediaScanResult};
 #[cfg(desktop)]
 use ani_media::{FfprobeMediaProbe, MediaProbe, MediaProbeContext};
@@ -156,6 +156,18 @@ impl AppMediaState {
         if registered || self.is_in_download_directory(&candidate)? {
             return Ok(candidate);
         }
+        if self.is_in_download_task(&candidate)? {
+            log::info!(
+                "Tauri 外部媒体路径通过下载任务授权 path={}",
+                candidate.display()
+            );
+            return Ok(candidate);
+        }
+        log::warn!(
+            "Tauri 外部媒体路径授权拒绝 requested={} canonical={}",
+            requested,
+            candidate.display()
+        );
         Err("媒体路径不属于 Ani Tracker 下载目录或媒体登记".to_owned())
     }
 
@@ -165,37 +177,25 @@ impl AppMediaState {
         file_path: &Path,
         percent: f64,
     ) -> Result<bool, String> {
-        self.report_external_playback_progress_with_title(file_path, None, percent)
-    }
-
-    /// 将外部播放器当前媒体标题解析为唯一文件，并回写已看状态。
-    pub(crate) fn report_external_playback_progress_with_title(
-        &self,
-        file_path: &Path,
-        media_title: Option<&str>,
-        percent: f64,
-    ) -> Result<bool, String> {
         if !percent.is_finite() || percent < 90.0 {
             return Ok(false);
         }
+        let target_key = path_key(file_path);
         let storage = self
             .storage
             .lock()
             .map_err(|error| format!("回写外部播放器进度失败：{error}"))?;
         let repository = storage.repository();
-        let media_files = repository
+        let media = repository
             .list_media_files()
-            .map_err(|error| format!("读取媒体登记失败：{error}"))?;
+            .map_err(|error| format!("读取媒体登记失败：{error}"))?
+            .into_iter()
+            .find(|media| path_key(Path::new(&media.file_path)) == target_key);
         let downloads = repository
             .list_downloads()
             .map_err(|error| format!("读取下载任务失败：{error}"))?;
-        let resolved_path =
-            resolve_external_media_path(file_path, media_title, &media_files, &downloads);
-        let target_key = path_key(&resolved_path);
-        let media = media_files
-            .iter()
-            .find(|media| path_key(Path::new(&media.file_path)) == target_key);
         let task = media
+            .as_ref()
             .and_then(|media| media.download_task_id.as_deref())
             .and_then(|task_id| downloads.iter().find(|task| task.id == task_id))
             .or_else(|| {
@@ -417,6 +417,14 @@ impl AppMediaState {
         Ok(false)
     }
 
+    /// 判断媒体是否精确对应某个下载任务的文件清单。
+    fn is_in_download_task(&self, candidate: &Path) -> Result<bool, String> {
+        let downloads = self
+            .with_download_repository(|repository| repository.list_downloads())
+            .map_err(|error| format!("读取下载任务失败：{error}"))?;
+        Ok(is_download_task_file_path(candidate, &downloads))
+    }
+
     fn with_download_repository<T>(
         &self,
         operation: impl FnOnce(&dyn DownloadRepository) -> RepositoryResult<T>,
@@ -593,62 +601,26 @@ fn path_key(path: &Path) -> String {
     }
 }
 
-/// 仅在播放器标题能唯一对应已登记媒体时切换回写目标。
-fn resolve_external_media_path(
-    initial_path: &Path,
-    media_title: Option<&str>,
-    media_files: &[MediaFile],
-    downloads: &[DownloadTask],
-) -> PathBuf {
-    let Some(title) = media_title.filter(|value| !value.trim().is_empty()) else {
-        return initial_path.to_owned();
-    };
-    let mut candidates = Vec::new();
-    for media in media_files {
-        if external_media_title_matches(title, &media.file_name) {
-            candidates.push(PathBuf::from(&media.file_path));
-        }
+/// 解析下载任务中的文件路径，并阻止相对路径逃逸保存目录。
+fn resolve_download_task_file_path(task: &DownloadTask, file: &TorrentFile) -> Option<PathBuf> {
+    let file_path = Path::new(&file.name);
+    if file_path.is_absolute() {
+        return crate::path_utils::canonicalize(file_path).ok();
     }
-    for task in downloads {
-        for file in &task.files {
-            if external_media_title_matches(title, &file.name) {
-                candidates.push(Path::new(&task.save_path).join(&file.name));
-            }
-        }
-    }
-    let mut seen = HashSet::new();
-    candidates.retain(|path| seen.insert(path_key(path)));
-    if candidates.len() == 1 {
-        return candidates.remove(0);
-    }
-    initial_path.to_owned()
+    let root = crate::path_utils::canonicalize(&task.save_path).ok()?;
+    let resolved = crate::path_utils::canonicalize(root.join(file_path)).ok()?;
+    resolved.starts_with(&root).then_some(resolved)
 }
 
-/// 比较播放器标题与媒体文件名，兼容播放器省略扩展名的情况。
-fn external_media_title_matches(title: &str, file_name: &str) -> bool {
-    let title = normalize_external_media_label(title);
-    let file_name = normalize_external_media_label(file_name);
-    if title.is_empty() || file_name.is_empty() {
-        return false;
-    }
-    title == file_name
-        || Path::new(&title)
-            .file_stem()
-            .is_some_and(|stem| stem.to_string_lossy() == file_name)
-        || Path::new(&file_name)
-            .file_stem()
-            .is_some_and(|stem| stem.to_string_lossy() == title)
-}
-
-/// 归一化播放器标题中的目录分隔符与大小写。
-fn normalize_external_media_label(value: &str) -> String {
-    value
-        .trim()
-        .replace('\\', "/")
-        .rsplit('/')
-        .next()
-        .unwrap_or_default()
-        .to_ascii_lowercase()
+/// 判断候选路径是否精确对应任一下载任务文件。
+fn is_download_task_file_path(candidate: &Path, tasks: &[DownloadTask]) -> bool {
+    let candidate_key = path_key(candidate);
+    tasks.iter().any(|task| {
+        task.files.iter().any(|file| {
+            resolve_download_task_file_path(task, file)
+                .is_some_and(|path| path_key(&path) == candidate_key)
+        })
+    })
 }
 
 fn setting_u64(settings: &AppSettings, pointer: &str, fallback: u64) -> u64 {
@@ -707,17 +679,85 @@ mod tests {
         std::fs::remove_dir_all(root).expect("remove media resolver directory");
     }
 
-    /// 验证外部播放器标题匹配文件名和省略扩展名的情况。
+    /// 验证自定义下载目录中的任务文件可以通过精确路径授权。
     #[test]
-    fn matches_external_media_titles() {
-        assert!(external_media_title_matches(
-            "D:\\Anime\\Episode 02.mkv",
-            "Episode 02.mkv"
+    fn authorizes_exact_download_task_file() {
+        let directory = test_directory("exact");
+        let media_path = directory.join("episode.mkv");
+        let other_path = directory.join("unlisted.mkv");
+        std::fs::write(&media_path, b"media").expect("write media");
+        std::fs::write(&other_path, b"other").expect("write other");
+        let task = test_download_task(&directory, "episode.mkv");
+
+        assert!(is_download_task_file_path(&media_path, &[task.clone()]));
+        assert!(!is_download_task_file_path(&other_path, &[task]));
+        std::fs::remove_dir_all(directory).expect("remove download directory");
+    }
+
+    /// 验证任务文件中的父级跳转不会授权保存目录之外的文件。
+    #[test]
+    fn rejects_download_task_path_escape() {
+        let container = test_directory("escape");
+        let directory = container.join("download");
+        let outside_path = container.join("outside.mkv");
+        std::fs::create_dir_all(&directory).expect("create download directory");
+        std::fs::write(&outside_path, b"outside").expect("write outside media");
+        let task = test_download_task(&directory, "../outside.mkv");
+
+        assert!(!is_download_task_file_path(&outside_path, &[task]));
+        std::fs::remove_dir_all(container).expect("remove escape directory");
+    }
+
+    /// 创建隔离的标准库临时测试目录。
+    fn test_directory(label: &str) -> PathBuf {
+        let directory = std::env::temp_dir().join(format!(
+            "ani-media-path-auth-{}-{label}",
+            std::process::id()
         ));
-        assert!(external_media_title_matches("Episode 02", "Episode 02.mkv"));
-        assert!(!external_media_title_matches(
-            "Episode 03",
-            "Episode 02.mkv"
-        ));
+        std::fs::create_dir_all(&directory).expect("create test directory");
+        directory
+    }
+
+    /// 构造路径授权测试使用的最小下载任务。
+    fn test_download_task(directory: &Path, file_name: &str) -> DownloadTask {
+        DownloadTask {
+            id: "download-path-test".to_owned(),
+            release_id: None,
+            anime_id: None,
+            episode_id: None,
+            anime_title: None,
+            episode_no: None,
+            fansub_group_id: None,
+            fansub_name: None,
+            resolution: None,
+            declared_video_codec: None,
+            normalized_video_codec: None,
+            bit_depth: None,
+            subtitle_languages: Vec::new(),
+            subtitle: None,
+            correlation_tag: None,
+            engine: ani_domain::TorrentEngineKind::Embedded,
+            torrent_hash: None,
+            name: "路径授权测试".to_owned(),
+            status: ani_domain::DownloadStatus::Completed,
+            progress: 1.0,
+            download_speed: 0,
+            upload_speed: 0,
+            eta_seconds: None,
+            save_path: directory.to_string_lossy().into_owned(),
+            files: vec![TorrentFile {
+                id: "file-path-test".to_owned(),
+                index: 0,
+                name: file_name.to_owned(),
+                episode_id: None,
+                episode_no: None,
+                size: 5,
+                progress: 1.0,
+                priority: 1,
+                selected: true,
+            }],
+            created_at: "2026-08-10T00:00:00Z".to_owned(),
+            completed_at: Some("2026-08-10T00:00:00Z".to_owned()),
+        }
     }
 }
