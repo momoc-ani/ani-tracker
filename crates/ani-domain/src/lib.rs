@@ -180,7 +180,7 @@ pub struct ReleaseSourceConfig {
 
 /// 返回下载源默认请求间隔。
 fn default_source_request_interval_ms() -> i64 {
-    1_500
+    600
 }
 
 /// 单个下载源的请求和同步游标。
@@ -333,6 +333,9 @@ pub struct RequestCircuitState {
     pub failure_count: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backoff_until: Option<String>,
+    /// 网络级失败所属的运行时上下文；provider 级失败为空。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network_context: Option<String>,
 }
 
 /// 番剧来源绑定的建立方式。
@@ -858,6 +861,75 @@ pub struct AnimeDiscoverySeasonQuery {
     pub season: String,
     #[serde(default)]
     pub force_refresh: bool,
+}
+
+/// Bangumi 在线浏览使用的排序方式。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum BangumiBrowseSort {
+    BangumiRank,
+    Recent,
+    Rating,
+}
+
+/// Bangumi 在线浏览的未来或更早年份区间。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum BangumiBrowseYearRange {
+    Future {
+        #[serde(rename = "startYear")]
+        start_year: i64,
+    },
+    Earlier {
+        #[serde(rename = "endYear")]
+        end_year: i64,
+    },
+}
+
+/// Bangumi 在线浏览筛选条件，不依赖本地季度目录。
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BangumiBrowseFilters {
+    #[serde(default)]
+    pub formats: Vec<String>,
+    #[serde(default)]
+    pub source_materials: Vec<String>,
+    #[serde(default)]
+    pub genres: Vec<String>,
+    #[serde(default)]
+    pub demographics: Vec<String>,
+    #[serde(default)]
+    pub regions: Vec<String>,
+    #[serde(default)]
+    pub years: Vec<i64>,
+    #[serde(default)]
+    pub year_range: Option<BangumiBrowseYearRange>,
+    #[serde(default)]
+    pub min_rating: f64,
+}
+
+/// Bangumi 在线浏览的分页输入。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BangumiBrowseQuery {
+    #[serde(default)]
+    pub keyword: String,
+    pub sort: BangumiBrowseSort,
+    #[serde(default)]
+    pub filters: BangumiBrowseFilters,
+    pub page: usize,
+    pub page_size: usize,
+}
+
+/// Bangumi 在线浏览的分页响应。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BangumiBrowseResult {
+    pub query: BangumiBrowseQuery,
+    pub items: Vec<Anime>,
+    pub total: usize,
+    pub has_more: bool,
+    pub source: String,
 }
 
 /// 月度新番采集及持久化结果。
@@ -1654,6 +1726,10 @@ mod tests {
         assert_eq!(
             decoded.payload.circuit_state.key,
             "release-source:torznab-contract"
+        );
+        assert_eq!(
+            decoded.payload.circuit_state.network_context.as_deref(),
+            Some("fixture-network")
         );
     }
 

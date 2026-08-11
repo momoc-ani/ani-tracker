@@ -9,6 +9,7 @@ use ani_repository::{ReleaseSourceRepository, RepositoryError, RepositoryResult}
 use chrono::{DateTime, SecondsFormat, Utc};
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use reqwest::{Client, Method, Proxy};
+use serde_json::Value;
 
 mod bindings;
 mod metadata;
@@ -45,16 +46,22 @@ pub use search::{
     MAX_RELEASE_SOURCE_FETCH_LIMIT, MAX_RELEASE_SOURCE_RESULT_LIMIT,
 };
 
-pub const DEFAULT_SOURCE_REQUEST_INTERVAL_MS: u64 = 1_500;
+/// 用户来源缺少有效配置时使用的默认采集间隔。
+pub const DEFAULT_SOURCE_REQUEST_INTERVAL_MS: u64 = 600;
+/// 普通下载源允许执行的最小采集间隔。
 pub const MIN_SOURCE_REQUEST_INTERVAL_MS: u64 = 250;
+/// 所有下载源允许执行的最大采集间隔。
 pub const MAX_SOURCE_REQUEST_INTERVAL_MS: u64 = 60_000;
+/// AniBT 固定执行的最小采集间隔。
 pub const ANIBT_MIN_REQUEST_INTERVAL_MS: u64 = 500;
 const RELEASE_SOURCE_CIRCUIT_GROUP: &str = "release-source";
 const FORBIDDEN_BACKOFF_SECONDS: &[u64] = &[10 * 60, 20 * 60, 30 * 60];
 const RATE_LIMIT_BACKOFF_SECONDS: &[u64] = &[60, 5 * 60, 15 * 60, 30 * 60];
 const TRANSIENT_BACKOFF_SECONDS: &[u64] = &[30, 2 * 60, 30 * 60];
+const TRANSPORT_BACKOFF_SECONDS: &[u64] = &[5, 15, 60];
 const BACKGROUND_TRANSPORT_RETRY_DELAYS_MS: &[u64] = &[300, 900];
 const BACKGROUND_TRANSPORT_RETRY_JITTER_MS: u64 = 250;
+const MAX_HTTP_STATUS_DETAIL_CHARS: usize = 240;
 
 /// 元数据请求使用的代理模式。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -159,8 +166,8 @@ pub enum SourceError {
     InvalidHeader(String),
     #[error("HTTP 请求失败：{0}")]
     Transport(#[from] reqwest::Error),
-    #[error("HTTP 响应状态异常：{status}")]
-    HttpStatus { status: u16 },
+    #[error("HTTP 响应状态异常：{status}{}", http_status_detail_suffix(.detail.as_deref()))]
+    HttpStatus { status: u16, detail: Option<String> },
     #[error("HTTP 响应超过 {limit} 字节限制")]
     ResponseTooLarge { limit: usize },
     #[error("来源响应解析失败：{0}")]
@@ -429,16 +436,76 @@ fn classify_transport_failure_detail(detail: &str) -> Option<&'static str> {
     None
 }
 
+/// 仅从 AniList GraphQL 错误数组提取有限长度的脱敏详情。
+fn http_status_detail(source_id: &str, body: &[u8]) -> Option<String> {
+    if source_id != "metadata-anilist" {
+        return None;
+    }
+    let payload: Value = serde_json::from_slice(body).ok()?;
+    let messages = payload
+        .get("errors")?
+        .as_array()?
+        .iter()
+        .filter_map(|error| error.get("message").and_then(Value::as_str))
+        .filter_map(sanitize_http_status_detail)
+        .collect::<Vec<_>>();
+    let detail = messages.join("; ");
+    (!detail.is_empty()).then_some(detail)
+}
+
+/// 移除控制字符并限制外部错误详情长度。
+fn sanitize_http_status_detail(value: &str) -> Option<String> {
+    let normalized = value
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if normalized.is_empty() {
+        return None;
+    }
+    let mut characters = normalized.chars();
+    let mut detail = characters
+        .by_ref()
+        .take(MAX_HTTP_STATUS_DETAIL_CHARS)
+        .collect::<String>();
+    if characters.next().is_some() {
+        detail.push_str("...");
+    }
+    Some(detail)
+}
+
+/// 将可选详情转换为稳定错误后缀。
+fn http_status_detail_suffix(detail: Option<&str>) -> String {
+    detail.map_or_else(String::new, |detail| format!("：{detail}"))
+}
+
 /// 组合直连/代理传输、持久化限流和熔断的来源网络服务。
 pub struct SourceNetworkService {
     direct_client: NativeHttpClient,
     proxy_client: NativeHttpClient,
     circuit_breaker: CircuitBreaker,
+    network_context: String,
 }
 
 impl SourceNetworkService {
     /// 创建共享主机限流状态的直连和代理连接池。
     pub fn new(proxy_config: NativeHttpConfig) -> Result<Self, SourceError> {
+        Self::new_with_network_context(proxy_config, "standalone")
+    }
+
+    /// 创建绑定当前有效网络上下文的来源连接池。
+    pub fn new_with_network_context(
+        proxy_config: NativeHttpConfig,
+        network_context: impl Into<String>,
+    ) -> Result<Self, SourceError> {
         let rate_limiter = HostRateLimiter::default();
         let mut direct_config = proxy_config.clone();
         direct_config.proxy_mode = ProxyMode::Off;
@@ -450,6 +517,7 @@ impl SourceNetworkService {
             )?,
             proxy_client: NativeHttpClient::new_with_rate_limiter(proxy_config, rate_limiter)?,
             circuit_breaker: CircuitBreaker::default(),
+            network_context: network_context.into(),
         })
     }
 
@@ -503,12 +571,20 @@ impl SourceNetworkService {
             NetworkRequestChannel::Background => "release-source-background",
         };
         let circuit_key = format!("{circuit_group}:{}", source.id);
-        let previous = state_store.get_circuit_state(&circuit_key)?;
+        let persisted = state_store.get_circuit_state(&circuit_key)?;
+        let previous =
+            applicable_circuit_state(persisted.as_ref(), &host, self.network_context.as_str());
+        if persisted.is_some() && previous.is_none() {
+            log::info!(
+                "Rust 来源熔断上下文已变化：source_id={}, host={}, circuit_action=probe",
+                source.id,
+                host
+            );
+        }
         let now = Utc::now();
-        self.circuit_breaker
-            .ensure_available(previous.as_ref(), now)?;
+        self.circuit_breaker.ensure_available(previous, now)?;
         let request_interval_ms = normalize_source_request_interval(source, &parsed);
-        wait_for_persisted_interval(previous.as_ref(), request_interval_ms, now).await;
+        wait_for_persisted_interval(previous, request_interval_ms, now).await;
 
         request.source_id.clone_from(&source.id);
         request.request_interval_ms = request_interval_ms;
@@ -532,12 +608,13 @@ impl SourceNetworkService {
             Ok(response) => {
                 let retry_after = parse_retry_after(response.header("retry-after"));
                 match self.circuit_breaker.record_http_failure(
-                    previous.as_ref(),
+                    previous,
                     &circuit_key,
                     circuit_group,
                     Some(&host),
                     response.status,
                     retry_after,
+                    &self.network_context,
                     Utc::now(),
                 ) {
                     Some(state) => self.persist_state_after_failure(state_store, &state),
@@ -553,12 +630,13 @@ impl SourceNetworkService {
                 }
                 Err(SourceError::HttpStatus {
                     status: response.status,
+                    detail: http_status_detail(&source.id, &response.body),
                 })
             }
             Err(error) => {
                 self.persist_transport_failure(
                     state_store,
-                    previous.as_ref(),
+                    previous,
                     &circuit_key,
                     circuit_group,
                     &host,
@@ -577,12 +655,12 @@ impl SourceNetworkService {
         circuit_group: &str,
         host: &str,
     ) {
-        let state = self.circuit_breaker.record_failure(
+        let state = self.circuit_breaker.record_network_failure(
             previous,
             circuit_key,
             circuit_group,
             Some(host),
-            None,
+            &self.network_context,
             Utc::now(),
         );
         self.persist_state_after_failure(state_store, &state);
@@ -694,26 +772,34 @@ impl CircuitBreaker {
             last_request_at: Some(to_iso(now)),
             failure_count: 0,
             backoff_until: None,
+            network_context: None,
         }
     }
 
-    /// 失败请求按连续次数计算退避，并尊重服务端 Retry-After。
-    pub fn record_failure(
+    /// 网络传输失败按当前网络上下文计算短退避。
+    pub fn record_network_failure(
         &self,
         previous: Option<&RequestCircuitState>,
         key: &str,
         group: &str,
         host: Option<&str>,
-        retry_after: Option<Duration>,
+        network_context: &str,
         now: DateTime<Utc>,
     ) -> RequestCircuitState {
-        let failure_count = previous.map_or(1, |state| state.failure_count.max(0) + 1);
-        let configured = scheduled_delay(TRANSIENT_BACKOFF_SECONDS, failure_count);
-        let delay = retry_after.map_or(configured, |value| value.max(configured));
-        build_failure_state(key, group, host, failure_count, delay, now)
+        let failure_count = next_failure_count(previous, Some(network_context));
+        let delay = scheduled_delay(TRANSPORT_BACKOFF_SECONDS, failure_count);
+        build_failure_state(
+            key,
+            group,
+            host,
+            failure_count,
+            delay,
+            Some(network_context),
+            now,
+        )
     }
 
-    /// 按 Electron 基线对 403、429 和 5xx 选择退避曲线。
+    /// 对 403/429 使用网络级退避，对 5xx 使用 provider 级退避。
     #[allow(clippy::too_many_arguments)]
     pub fn record_http_failure(
         &self,
@@ -723,15 +809,16 @@ impl CircuitBreaker {
         host: Option<&str>,
         status: u16,
         retry_after: Option<Duration>,
+        network_context: &str,
         now: DateTime<Utc>,
     ) -> Option<RequestCircuitState> {
-        let failure_count = previous.map_or(1, |state| state.failure_count.max(0) + 1);
-        let schedule = match status {
-            403 => FORBIDDEN_BACKOFF_SECONDS,
-            429 => RATE_LIMIT_BACKOFF_SECONDS,
-            500..=599 => TRANSIENT_BACKOFF_SECONDS,
+        let (schedule, state_network_context) = match status {
+            403 => (FORBIDDEN_BACKOFF_SECONDS, Some(network_context)),
+            429 => (RATE_LIMIT_BACKOFF_SECONDS, Some(network_context)),
+            500..=599 => (TRANSIENT_BACKOFF_SECONDS, None),
             _ => return None,
         };
+        let failure_count = next_failure_count(previous, state_network_context);
         let configured = scheduled_delay(schedule, failure_count);
         let delay = retry_after.map_or(configured, |value| value.max(configured));
         Some(build_failure_state(
@@ -740,9 +827,20 @@ impl CircuitBreaker {
             host,
             failure_count,
             delay,
+            state_network_context,
             now,
         ))
     }
+}
+
+/// 仅沿用相同失败范围内的连续次数。
+fn next_failure_count(
+    previous: Option<&RequestCircuitState>,
+    network_context: Option<&str>,
+) -> i64 {
+    previous
+        .filter(|state| state.network_context.as_deref() == network_context)
+        .map_or(1, |state| state.failure_count.max(0) + 1)
 }
 
 /// 从固定退避曲线选择当前失败次数对应的延迟。
@@ -760,6 +858,7 @@ fn build_failure_state(
     host: Option<&str>,
     failure_count: i64,
     delay: Duration,
+    network_context: Option<&str>,
     now: DateTime<Utc>,
 ) -> RequestCircuitState {
     let backoff_until =
@@ -771,7 +870,27 @@ fn build_failure_state(
         last_request_at: Some(to_iso(now)),
         failure_count,
         backoff_until: Some(to_iso(backoff_until)),
+        network_context: network_context.map(str::to_owned),
     }
+}
+
+/// 判断持久化熔断状态是否适用于当前请求主机和网络上下文。
+fn applicable_circuit_state<'a>(
+    state: Option<&'a RequestCircuitState>,
+    request_host: &str,
+    network_context: &str,
+) -> Option<&'a RequestCircuitState> {
+    state.filter(|state| {
+        let host_matches = state
+            .request_host
+            .as_deref()
+            .is_none_or(|host| host.eq_ignore_ascii_case(request_host));
+        let network_matches = state
+            .network_context
+            .as_deref()
+            .is_none_or(|context| context == network_context);
+        host_matches && network_matches
+    })
 }
 
 /// 校验来源请求 URL 仅使用 HTTP 或 HTTPS。
@@ -903,7 +1022,7 @@ mod tests {
     use tokio::net::TcpListener;
 
     use super::{
-        classify_transport_failure_detail, normalize_source_request_interval,
+        classify_transport_failure_detail, http_status_detail, normalize_source_request_interval,
         should_use_source_proxy, CircuitBreaker, CircuitStateStore, HostRateLimiter, HttpMethod,
         NativeHttpClient, NativeHttpConfig, NativeHttpRequest, NetworkRequestChannel, ProxyMode,
         SourceError, SourceNetworkService, ANIBT_MIN_REQUEST_INTERVAL_MS,
@@ -987,30 +1106,50 @@ mod tests {
         );
     }
 
+    /// 验证仅 AniList GraphQL 错误消息会进入状态详情且控制字符被移除。
+    #[test]
+    fn extracts_sanitized_anilist_http_error_detail() {
+        let body =
+            br#"{"errors":[{"message":"Syntax Error:\nExpected Name\u0000"}],"token":"secret"}"#;
+        let detail = http_status_detail("metadata-anilist", body);
+
+        assert_eq!(detail.as_deref(), Some("Syntax Error: Expected Name"));
+        assert!(http_status_detail("metadata-bangumi", body).is_none());
+        assert_eq!(
+            SourceError::HttpStatus {
+                status: 400,
+                detail,
+            }
+            .to_string(),
+            "HTTP 响应状态异常：400：Syntax Error: Expected Name"
+        );
+    }
+
     /// 验证熔断失败次数跨请求指数退避并在成功后清零。
     #[test]
     fn calculates_persistable_circuit_backoff() {
         let breaker = CircuitBreaker::default();
         let now = Utc.with_ymd_and_hms(2026, 7, 25, 0, 0, 0).unwrap();
-        let first = breaker.record_failure(
+        let first = breaker.record_network_failure(
             None,
             "source:test",
             "release-source",
             Some("example.test"),
-            None,
+            "network-a",
             now,
         );
-        let second = breaker.record_failure(
+        let second = breaker.record_network_failure(
             Some(&first),
             "source:test",
             "release-source",
             Some("example.test"),
-            Some(Duration::from_secs(120)),
+            "network-a",
             now,
         );
 
         assert_eq!(first.failure_count, 1);
         assert_eq!(second.failure_count, 2);
+        assert_eq!(second.network_context.as_deref(), Some("network-a"));
         assert!(breaker.ensure_available(Some(&second), now).is_err());
         let success =
             breaker.record_success("source:test", "release-source", Some("example.test"), now);
@@ -1031,6 +1170,7 @@ mod tests {
                 Some("example.test"),
                 403,
                 None,
+                "network-a",
                 now,
             )
             .expect("403 must trigger circuit");
@@ -1043,6 +1183,7 @@ mod tests {
         .expect("parse 403 backoff")
         .with_timezone(&Utc);
         assert_eq!((forbidden_until - now).num_minutes(), 10);
+        assert_eq!(forbidden.network_context.as_deref(), Some("network-a"));
 
         let rate_limited = breaker
             .record_http_failure(
@@ -1052,6 +1193,7 @@ mod tests {
                 Some("example.test"),
                 429,
                 Some(Duration::from_secs(120)),
+                "network-a",
                 now,
             )
             .expect("429 must trigger circuit");
@@ -1064,6 +1206,19 @@ mod tests {
         .expect("parse 429 backoff")
         .with_timezone(&Utc);
         assert_eq!((rate_limit_until - now).num_minutes(), 2);
+        let unavailable = breaker
+            .record_http_failure(
+                None,
+                "source:test",
+                "release-source",
+                Some("example.test"),
+                503,
+                None,
+                "network-a",
+                now,
+            )
+            .expect("503 must trigger circuit");
+        assert!(unavailable.network_context.is_none());
         assert!(breaker
             .record_http_failure(
                 None,
@@ -1072,6 +1227,7 @@ mod tests {
                 Some("example.test"),
                 404,
                 None,
+                "network-a",
                 now,
             )
             .is_none());
@@ -1153,6 +1309,101 @@ mod tests {
         assert!(state.backoff_until.is_none());
     }
 
+    /// 验证旧网络留下的退避不会阻塞新网络的首次探测。
+    #[tokio::test]
+    async fn ignores_network_scoped_backoff_after_context_changes() {
+        let url = serve_once("200 OK", &[], "new-network-ok").await;
+        let service = SourceNetworkService::new_with_network_context(
+            NativeHttpConfig {
+                proxy_mode: ProxyMode::Off,
+                ..NativeHttpConfig::default()
+            },
+            "network-b",
+        )
+        .expect("create source network service");
+        let store = MemoryCircuitStateStore::default();
+        *store.state.lock().expect("lock circuit state") = Some(RequestCircuitState {
+            key: "release-source:local".to_owned(),
+            group: "release-source".to_owned(),
+            request_host: None,
+            last_request_at: None,
+            failure_count: 3,
+            backoff_until: Some("2099-01-01T00:00:00.000Z".to_owned()),
+            network_context: Some("network-a".to_owned()),
+        });
+
+        let response = service
+            .execute(&store, &test_source("local", false, 250), get_request(url))
+            .await
+            .expect("probe new network");
+
+        assert_eq!(response.text(), "new-network-ok");
+    }
+
+    /// 验证 provider 级退避不会因网络上下文变化而失效。
+    #[tokio::test]
+    async fn preserves_provider_backoff_after_context_changes() {
+        let service = SourceNetworkService::new_with_network_context(
+            NativeHttpConfig {
+                proxy_mode: ProxyMode::Off,
+                ..NativeHttpConfig::default()
+            },
+            "network-b",
+        )
+        .expect("create source network service");
+        let store = MemoryCircuitStateStore::default();
+        *store.state.lock().expect("lock circuit state") = Some(RequestCircuitState {
+            key: "release-source:local".to_owned(),
+            group: "release-source".to_owned(),
+            request_host: None,
+            last_request_at: None,
+            failure_count: 1,
+            backoff_until: Some("2099-01-01T00:00:00.000Z".to_owned()),
+            network_context: None,
+        });
+
+        let error = service
+            .execute(
+                &store,
+                &test_source("local", false, 250),
+                get_request("http://127.0.0.1:9/".to_owned()),
+            )
+            .await
+            .expect_err("provider backoff must remain active");
+
+        assert!(matches!(error, SourceError::CircuitOpen { .. }));
+    }
+
+    /// 验证传输失败只写入当前网络上下文。
+    #[tokio::test]
+    async fn persists_transport_backoff_in_current_network_context() {
+        let (url, _) = serve_after_disconnects(1, "unused").await;
+        let service = SourceNetworkService::new_with_network_context(
+            NativeHttpConfig {
+                proxy_mode: ProxyMode::Off,
+                ..NativeHttpConfig::default()
+            },
+            "network-a",
+        )
+        .expect("create source network service");
+        let store = MemoryCircuitStateStore::default();
+
+        let error = service
+            .execute(&store, &test_source("local", false, 250), get_request(url))
+            .await
+            .expect_err("disconnected request must fail");
+
+        assert!(matches!(error, SourceError::Transport(_)));
+        let state = store
+            .state
+            .lock()
+            .expect("lock transport state")
+            .clone()
+            .expect("persisted transport state");
+        assert_eq!(state.failure_count, 1);
+        assert_eq!(state.network_context.as_deref(), Some("network-a"));
+    }
+
     /// 验证非成功状态会持久化失败次数和 Retry-After 退避。
     #[tokio::test]
     async fn persists_http_failure_circuit_state() {
@@ -1168,7 +1419,7 @@ mod tests {
             .await
             .expect_err("503 request must fail");
 
-        assert!(matches!(error, SourceError::HttpStatus { status: 503 }));
+        assert!(matches!(error, SourceError::HttpStatus { status: 503, .. }));
         let state = store
             .state
             .lock()
@@ -1177,6 +1428,7 @@ mod tests {
             .expect("persisted failure state");
         assert_eq!(state.failure_count, 1);
         assert!(state.backoff_until.is_some());
+        assert!(state.network_context.is_none());
     }
 
     /// 创建测试下载源配置。

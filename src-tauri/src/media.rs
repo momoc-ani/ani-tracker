@@ -177,25 +177,37 @@ impl AppMediaState {
         file_path: &Path,
         percent: f64,
     ) -> Result<bool, String> {
+        self.report_external_playback_progress_with_title(file_path, None, percent)
+    }
+
+    /// 将外部播放器当前媒体标题解析为唯一文件，并回写已看状态。
+    pub(crate) fn report_external_playback_progress_with_title(
+        &self,
+        file_path: &Path,
+        media_title: Option<&str>,
+        percent: f64,
+    ) -> Result<bool, String> {
         if !percent.is_finite() || percent < 90.0 {
             return Ok(false);
         }
-        let target_key = path_key(file_path);
         let storage = self
             .storage
             .lock()
             .map_err(|error| format!("回写外部播放器进度失败：{error}"))?;
         let repository = storage.repository();
-        let media = repository
+        let media_files = repository
             .list_media_files()
-            .map_err(|error| format!("读取媒体登记失败：{error}"))?
-            .into_iter()
-            .find(|media| path_key(Path::new(&media.file_path)) == target_key);
+            .map_err(|error| format!("读取媒体登记失败：{error}"))?;
         let downloads = repository
             .list_downloads()
             .map_err(|error| format!("读取下载任务失败：{error}"))?;
+        let resolved_path =
+            resolve_external_media_path(file_path, media_title, &media_files, &downloads);
+        let target_key = path_key(&resolved_path);
+        let media = media_files
+            .iter()
+            .find(|media| path_key(Path::new(&media.file_path)) == target_key);
         let task = media
-            .as_ref()
             .and_then(|media| media.download_task_id.as_deref())
             .and_then(|task_id| downloads.iter().find(|task| task.id == task_id))
             .or_else(|| {
@@ -623,6 +635,64 @@ fn is_download_task_file_path(candidate: &Path, tasks: &[DownloadTask]) -> bool 
     })
 }
 
+/// 仅在播放器标题能唯一对应已登记媒体时切换回写目标。
+fn resolve_external_media_path(
+    initial_path: &Path,
+    media_title: Option<&str>,
+    media_files: &[MediaFile],
+    downloads: &[DownloadTask],
+) -> PathBuf {
+    let Some(title) = media_title.filter(|value| !value.trim().is_empty()) else {
+        return initial_path.to_owned();
+    };
+    let mut candidates = Vec::new();
+    for media in media_files {
+        if external_media_title_matches(title, &media.file_name) {
+            candidates.push(PathBuf::from(&media.file_path));
+        }
+    }
+    for task in downloads {
+        for file in &task.files {
+            if external_media_title_matches(title, &file.name) {
+                candidates.push(Path::new(&task.save_path).join(&file.name));
+            }
+        }
+    }
+    let mut seen = HashSet::new();
+    candidates.retain(|path| seen.insert(path_key(path)));
+    if candidates.len() == 1 {
+        return candidates.remove(0);
+    }
+    initial_path.to_owned()
+}
+
+/// 比较播放器标题与媒体文件名，兼容播放器省略扩展名的情况。
+fn external_media_title_matches(title: &str, file_name: &str) -> bool {
+    let title = normalize_external_media_label(title);
+    let file_name = normalize_external_media_label(file_name);
+    if title.is_empty() || file_name.is_empty() {
+        return false;
+    }
+    title == file_name
+        || Path::new(&title)
+            .file_stem()
+            .is_some_and(|stem| stem.to_string_lossy() == file_name)
+        || Path::new(&file_name)
+            .file_stem()
+            .is_some_and(|stem| stem.to_string_lossy() == title)
+}
+
+/// 归一化播放器标题中的目录分隔符与大小写。
+fn normalize_external_media_label(value: &str) -> String {
+    value
+        .trim()
+        .replace('\\', "/")
+        .rsplit('/')
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+}
+
 fn setting_u64(settings: &AppSettings, pointer: &str, fallback: u64) -> u64 {
     settings
         .pointer(pointer)
@@ -677,6 +747,20 @@ mod tests {
         );
 
         std::fs::remove_dir_all(root).expect("remove media resolver directory");
+    }
+
+    /// 验证外部播放器标题匹配文件名和省略扩展名的情况。
+    #[test]
+    fn matches_external_media_titles() {
+        assert!(external_media_title_matches(
+            "D:\\Anime\\Episode 02.mkv",
+            "Episode 02.mkv"
+        ));
+        assert!(external_media_title_matches("Episode 02", "Episode 02.mkv"));
+        assert!(!external_media_title_matches(
+            "Episode 03",
+            "Episode 02.mkv"
+        ));
     }
 
     /// 验证自定义下载目录中的任务文件可以通过精确路径授权。
