@@ -785,11 +785,16 @@ mod tests {
     /// 验证 mpv 切集事件更新文件目标，并兼容 file URI。
     #[test]
     fn parses_mpv_media_switch_events() {
+        let media_path = std::env::temp_dir().join("Episode 02.mkv");
+        let media_uri = url::Url::from_file_path(&media_path)
+            .expect("build media file URI")
+            .to_string();
         assert_eq!(
-            parse_mpv_playback_event(
-                r#"{"event":"property-change","name":"path","data":"file:///tmp/Episode%2002.mkv"}"#
-            ),
-            Some(MpvPlaybackEvent::Path(PathBuf::from("/tmp/Episode 02.mkv")))
+            parse_mpv_playback_event(&format!(
+                r#"{{"event":"property-change","name":"path","data":{}}}"#,
+                serde_json::to_string(&media_uri).expect("encode media file URI")
+            )),
+            Some(MpvPlaybackEvent::Path(media_path))
         );
         assert_eq!(
             parse_mpv_playback_event(

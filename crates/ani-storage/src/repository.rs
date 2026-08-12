@@ -4603,18 +4603,15 @@ fn merge_json_objects(existing: &Value, incoming: &Value) -> Value {
                 if !is_meaningful_json(incoming_value) {
                     continue;
                 }
-                let value = if key == "contentRating"
-                    && merged
+                let restricted_content_rating = key == "contentRating"
+                    && (merged
                         .get(key)
                         .and_then(Value::as_str)
                         .is_some_and(is_restricted_content_rating)
-                {
-                    Value::String("18+".to_owned())
-                } else if key == "contentRating"
-                    && incoming_value
-                        .as_str()
-                        .is_some_and(is_restricted_content_rating)
-                {
+                        || incoming_value
+                            .as_str()
+                            .is_some_and(is_restricted_content_rating));
+                let value = if restricted_content_rating {
                     Value::String("18+".to_owned())
                 } else {
                     merged.get(key).map_or_else(
