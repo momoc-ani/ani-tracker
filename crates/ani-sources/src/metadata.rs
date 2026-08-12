@@ -3,9 +3,10 @@ use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Instant;
 
 use ani_domain::{
-    Anime, AnimeAlias, AnimeAliasLanguage, AnimeDetailPartialError, AnimeRating,
-    BangumiBrowseFilters, BangumiBrowseQuery, BangumiBrowseResult, BangumiBrowseSort,
-    BangumiBrowseYearRange, ReleaseSourceConfig, SourceKind,
+    is_restricted_anime_content, is_restricted_content_rating, Anime, AnimeAlias,
+    AnimeAliasLanguage, AnimeDetailPartialError, AnimeRating, BangumiBrowseFilters,
+    BangumiBrowseQuery, BangumiBrowseResult, BangumiBrowseSort, BangumiBrowseYearRange,
+    ReleaseSourceConfig, SourceKind,
 };
 use chrono::{Datelike, NaiveDate, SecondsFormat, TimeZone, Utc};
 use futures_util::stream::{self, StreamExt};
@@ -266,6 +267,7 @@ impl AnimeMetadataService {
             .append_pair("offset", &offset.to_string());
 
         let mut filter = Map::from_iter([("type".to_owned(), json!([2]))]);
+        filter.insert("nsfw".to_owned(), json!(false));
         let tags = bangumi_browse_tags(&query.filters);
         if !tags.is_empty() {
             filter.insert("tag".to_owned(), json!(tags));
@@ -307,13 +309,19 @@ impl AnimeMetadataService {
         let total = response
             .total
             .unwrap_or(offset.saturating_add(returned_count));
-        let items = subjects
+        let mut items = subjects
             .into_iter()
             .map(|item| {
                 let (year, month) = date_or_now(item.date.as_deref());
                 map_bangumi(item, year, month)
             })
             .collect::<Vec<_>>();
+        let unfiltered_count = items.len();
+        items.retain(|item| !is_restricted_anime_content(item));
+        let filtered_count = unfiltered_count.saturating_sub(items.len());
+        if filtered_count > 0 {
+            log::info!("Bangumi 在线浏览已过滤成人内容 items={filtered_count}");
+        }
         log::info!(
             "Bangumi 在线浏览完成 page={} page_size={} items={} total={} duration_ms={}",
             query.page,
@@ -1773,7 +1781,18 @@ fn merge_detail(primary: Option<Value>, secondary: Option<Value>) -> Option<Valu
         (left, right) => return left.or(right),
     };
     for (key, value) in right {
-        if matches!(
+        if key == "contentRating" {
+            let restricted = left
+                .get(&key)
+                .and_then(Value::as_str)
+                .is_some_and(is_restricted_content_rating)
+                || value.as_str().is_some_and(is_restricted_content_rating);
+            if restricted {
+                left.insert(key, Value::String("18+".to_owned()));
+            } else {
+                left.entry(key).or_insert(value);
+            }
+        } else if matches!(
             key.as_str(),
             "genres" | "studios" | "staff" | "metadataSources"
         ) {
@@ -2207,6 +2226,7 @@ struct BangumiSubject {
     platform: Option<String>,
     total_episodes: Option<i64>,
     tags: Option<Vec<BangumiTag>>,
+    nsfw: Option<bool>,
 }
 
 impl BangumiSubject {
@@ -2225,6 +2245,10 @@ impl BangumiSubject {
         self.platform = self.platform.or(fallback.platform);
         self.total_episodes = self.total_episodes.or(fallback.total_episodes);
         self.tags = self.tags.or(fallback.tags);
+        self.nsfw = match (self.nsfw, fallback.nsfw) {
+            (Some(left), Some(right)) => Some(left || right),
+            (left, right) => left.or(right),
+        };
         self
     }
 }
@@ -2391,8 +2415,17 @@ fn map_bangumi_for_stage(
             if is_english { 78 } else { 82 },
         );
     }
-    let detail = (stage == BangumiMapStage::Detail)
-        .then(|| build_bangumi_detail(&mut item, &infobox, &date));
+    let restricted = bangumi_content_rating(&item, &infobox)
+        .as_deref()
+        .is_some_and(is_restricted_content_rating);
+    let detail = match stage {
+        BangumiMapStage::Detail => Some(build_bangumi_detail(&mut item, &infobox, &date)),
+        BangumiMapStage::Catalog if restricted => Some(json!({
+            "contentRating": "18+",
+            "metadataSources": ["bangumi"]
+        })),
+        BangumiMapStage::Catalog => None,
+    };
     Anime {
         id,
         title,
@@ -2431,6 +2464,7 @@ fn build_bangumi_detail(
     infobox: &BangumiInfoboxIndex,
     premiere_date: &str,
 ) -> Value {
+    let content_rating = bangumi_content_rating(item, infobox);
     let mut genres = item.tags.take().unwrap_or_default();
     genres.sort_by_key(|tag| std::cmp::Reverse(tag.count.unwrap_or_default()));
     let genres = genres
@@ -2467,7 +2501,7 @@ fn build_bangumi_detail(
         "staff": build_staff(infobox, &["导演", "原作", "系列构成", "脚本", "人物设定", "音乐", "总作画监督"], "bangumi"),
         "sourceMaterial": infobox.values(&["原作", "原案"]).into_iter().next(),
         "durationMinutes": duration_minutes,
-        "contentRating": infobox.first_value(&["分级", "等级"]),
+        "contentRating": content_rating,
         "demographic": infobox.first_value(&["受众", "读者对象"]),
         "countryOfOrigin": infobox.first_value(&["国家/地区", "制片国家/地区", "国家", "地区"]),
         "ranking": item.rating.as_ref().and_then(|rating| rating.rank.filter(|rank| *rank > 0).map(|rank| json!({"rank": rank, "source": "bangumi", "category": "Bangumi 排名"}))),
@@ -2476,6 +2510,27 @@ fn build_bangumi_detail(
     });
     remove_nulls(&mut detail);
     detail
+}
+
+/// 优先使用 Bangumi 成人标记，并以明确分级或标签作为兼容兜底。
+fn bangumi_content_rating(item: &BangumiSubject, infobox: &BangumiInfoboxIndex) -> Option<String> {
+    let declared = infobox.first_value(&["分级", "等级"]);
+    let restricted = item.nsfw == Some(true)
+        || declared
+            .as_deref()
+            .is_some_and(is_restricted_content_rating)
+        || item.tags.as_ref().is_some_and(|tags| {
+            tags.iter().any(|tag| {
+                tag.name
+                    .as_deref()
+                    .is_some_and(is_restricted_content_rating)
+            })
+        });
+    if restricted {
+        Some("18+".to_owned())
+    } else {
+        declared
+    }
 }
 
 fn map_bangumi_format(value: Option<&str>) -> Option<&'static str> {
@@ -3745,6 +3800,7 @@ mod tests {
                 name: Some("动画".to_owned()),
                 count: Some(100),
             }]),
+            nsfw: None,
         };
 
         let catalog = map_bangumi_catalog(subject.clone(), 2026, 7);
@@ -3855,6 +3911,63 @@ mod tests {
             deferred_final.detail.as_ref().unwrap()["durationMinutes"],
             30
         );
+    }
+
+    /// 验证 Bangumi 成人标记在基础目录阶段即可供发现页过滤。
+    #[test]
+    fn maps_bangumi_nsfw_marker_in_catalog_stage() {
+        let restricted = map_bangumi_catalog(
+            BangumiSubject {
+                id: 102,
+                subject_type: 2,
+                name: "Restricted Anime".to_owned(),
+                date: Some("2026-07-03".to_owned()),
+                nsfw: Some(true),
+                ..BangumiSubject::default()
+            },
+            2026,
+            7,
+        );
+        assert_eq!(restricted.detail.as_ref().unwrap()["contentRating"], "18+");
+        assert!(ani_domain::is_restricted_anime_content(&restricted));
+
+        let regular = map_bangumi_catalog(
+            BangumiSubject {
+                id: 103,
+                subject_type: 2,
+                name: "Regular Anime".to_owned(),
+                date: Some("2026-07-03".to_owned()),
+                nsfw: Some(false),
+                ..BangumiSubject::default()
+            },
+            2026,
+            7,
+        );
+        assert!(regular.detail.is_none());
+    }
+
+    /// 验证任一来源确认成人内容后，合并结果仍保留受限标记。
+    #[test]
+    fn preserves_restricted_rating_across_metadata_merge() {
+        let mut regular = anime("bangumi-1", "测试番", json!({"bangumi": "1"}));
+        regular.detail = Some(json!({"contentRating": "PG-13"}));
+        let mut restricted = anime("anilist-1", "测试番", json!({"anilist": "1"}));
+        restricted.detail = Some(json!({"contentRating": "18+"}));
+
+        let merged = merge_anime_metadata_batches(&[
+            AnimeMetadataBatch {
+                source: "bangumi".to_owned(),
+                items: vec![regular],
+            },
+            AnimeMetadataBatch {
+                source: "anilist".to_owned(),
+                items: vec![restricted],
+            },
+        ]);
+
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].detail.as_ref().unwrap()["contentRating"], "18+");
+        assert!(ani_domain::is_restricted_anime_content(&merged[0]));
     }
 
     /// 验证 Mikan HTML 可提取放送、职员和复合时长。
@@ -3969,6 +4082,13 @@ mod tests {
                         "date": "2026-07-03",
                         "rating": {"score": 8.6, "total": 5000, "rank": 12},
                         "tags": [{"name": "奇幻", "count": 100}]
+                    }, {
+                        "id": 102,
+                        "type": 2,
+                        "name": "Restricted Anime",
+                        "name_cn": "受限番",
+                        "date": "2026-07-04",
+                        "nsfw": true
                     }],
                     "total": 42,
                     "limit": 20,
@@ -4030,6 +4150,7 @@ mod tests {
         assert_eq!(result.source, "bangumi");
         assert_eq!(result.total, 42);
         assert!(result.has_more);
+        assert_eq!(result.items.len(), 1);
         assert_eq!(result.items[0].external_ids["bangumi"], "101");
         let browse_request = requests
             .iter()
@@ -4037,6 +4158,7 @@ mod tests {
             .expect("Bangumi browse request");
         assert!(browse_request.contains("\"sort\":\"score\""));
         assert!(browse_request.contains("\"tag\":[\"奇幻\"]"));
+        assert!(browse_request.contains("\"nsfw\":false"));
         assert!(browse_request.contains("\"air_date\":[\">=2026-01-01\",\"<2027-01-01\"]"));
     }
 

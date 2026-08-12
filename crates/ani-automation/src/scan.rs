@@ -2,11 +2,11 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use ani_domain::{
-    resolve_anime_download_path, AnimeReleaseQuery, AnimeSourceBinding, AnimeStatus, AppSettings,
-    AutomationDownloadedItem, AutomationRunError, AutomationRunResult, AutomationSkippedItem,
-    Episode, EpisodePreference, EpisodeStatus, FansubGroup, MyAnime, NotificationKind,
-    NotificationRecord, NotificationSeverity, Release, ReleaseMatchContext, ReleaseMatchResult,
-    ReleaseSourceConfig, RssSubscriptionReleaseQuery,
+    is_restricted_anime_content, resolve_anime_download_path, AnimeReleaseQuery,
+    AnimeSourceBinding, AnimeStatus, AppSettings, AutomationDownloadedItem, AutomationRunError,
+    AutomationRunResult, AutomationSkippedItem, Episode, EpisodePreference, EpisodeStatus,
+    FansubGroup, MyAnime, NotificationKind, NotificationRecord, NotificationSeverity, Release,
+    ReleaseMatchContext, ReleaseMatchResult, ReleaseSourceConfig, RssSubscriptionReleaseQuery,
 };
 use ani_repository::RepositoryResult;
 use ani_sources::{
@@ -155,6 +155,10 @@ impl AutomationRunService {
         );
 
         for anime in anime_items {
+            if is_restricted_anime_content(&anime.anime) {
+                push_anime_skip(&mut result, &anime, "番剧标记为成人内容");
+                continue;
+            }
             if matches!(anime.status, AnimeStatus::Completed | AnimeStatus::Dropped) {
                 push_anime_skip(
                     &mut result,
@@ -1268,6 +1272,39 @@ mod tests {
             .expect("lock episodes")
             .iter()
             .any(|item| item.id == "episode-auto-3" && item.status == EpisodeStatus::Downloading));
+    }
+
+    /// 验证明确定义为成人内容的追番不会进入自动下载流程。
+    #[tokio::test]
+    async fn skips_restricted_anime_during_automatic_scan() {
+        let mut store = memory_store_with_episode();
+        store.anime[0].anime.detail = Some(serde_json::json!({"contentRating": "18+"}));
+        let executor = Arc::new(RecordingExecutor {
+            requests: Mutex::new(Vec::new()),
+        });
+        let service = AutomationRunService::new(test_network(), executor.clone());
+
+        let result = service
+            .run(
+                &store,
+                AutomationRunOptions {
+                    now: Some(
+                        Utc.with_ymd_and_hms(2026, 7, 25, 12, 0, 0)
+                            .single()
+                            .expect("fixed time"),
+                    ),
+                    settings: automation_settings(),
+                    sources: Vec::new(),
+                    fansubs: Vec::new(),
+                },
+            )
+            .await
+            .expect("run automation");
+
+        assert_eq!(result.checked_episodes, 0);
+        assert_eq!(result.skipped.len(), 1);
+        assert_eq!(result.skipped[0].reason, "番剧标记为成人内容");
+        assert!(executor.requests.lock().expect("lock requests").is_empty());
     }
 
     /// 验证续作不会自动下载未标季数的同名旧季度资源。

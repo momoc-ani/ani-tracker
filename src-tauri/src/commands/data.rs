@@ -12,13 +12,13 @@ use std::{
 
 use ani_contracts::AppCommandError;
 use ani_domain::{
-    Anime, AnimeDetailResult, AnimeDiscoveryQuery, AnimeDiscoveryResult,
-    AnimeDiscoverySearchResult, AnimeDiscoverySeasonQuery, AnimeDiscoverySeasonResult,
-    AnimeDiscoverySyncTaskStatus, AnimeSeasonSyncState, AnimeWatchProgress, AppSettings,
-    BangumiBrowseQuery, BangumiBrowseResult, BangumiBrowseYearRange, DashboardData, Episode,
-    EpisodePreference, FansubGroup, MyAnime, NotificationRecord, PlaybackCheckpoint,
-    ReleaseSourceConfig, ReportPlaybackProgressInput, SavePlaybackCheckpointInput,
-    SetAnimeWatchProgressInput,
+    is_restricted_anime_content, Anime, AnimeDetailResult, AnimeDiscoveryQuery,
+    AnimeDiscoveryResult, AnimeDiscoverySearchResult, AnimeDiscoverySeasonQuery,
+    AnimeDiscoverySeasonResult, AnimeDiscoverySyncTaskStatus, AnimeSeasonSyncState,
+    AnimeWatchProgress, AppSettings, BangumiBrowseQuery, BangumiBrowseResult,
+    BangumiBrowseYearRange, DashboardData, Episode, EpisodePreference, FansubGroup, MyAnime,
+    NotificationRecord, PlaybackCheckpoint, ReleaseSourceConfig, ReportPlaybackProgressInput,
+    SavePlaybackCheckpointInput, SetAnimeWatchProgressInput,
 };
 use ani_repository::{prelude::*, RepositoryError};
 use ani_sources::{
@@ -663,12 +663,19 @@ pub(crate) async fn list_anime_catalog(
     month: Option<i64>,
     state: State<'_, AppStorageState>,
 ) -> Result<Vec<Anime>, AppCommandError> {
-    run_query(
+    let mut items = run_query(
         "读取番剧目录",
         Arc::clone(state.storage()),
         move |storage| storage.repository().list_anime_catalog(year, month),
     )
-    .await
+    .await?;
+    let unfiltered_count = items.len();
+    items.retain(|item| !is_restricted_anime_content(item));
+    let filtered_count = unfiltered_count.saturating_sub(items.len());
+    if filtered_count > 0 {
+        log::info!("Tauri 新番目录已过滤成人内容 items={filtered_count}");
+    }
+    Ok(items)
 }
 
 /// 聚合本地目录与在线元数据来源搜索结果，并尽力更新本地缓存。
@@ -682,7 +689,7 @@ pub(crate) async fn search_anime_catalog(
     let storage = Arc::clone(state.storage());
     let defaults = state.platform_defaults().clone();
     let query_keyword = keyword.clone();
-    let (local, settings) = run_query(
+    let (mut local, settings) = run_query(
         "读取番剧搜索上下文",
         Arc::clone(&storage),
         move |storage| {
@@ -694,6 +701,9 @@ pub(crate) async fn search_anime_catalog(
     )
     .await?;
     if keyword.is_empty() {
+        local
+            .items
+            .retain(|item| !is_restricted_anime_content(item));
         return Ok(local);
     }
     let network = source_state
@@ -706,7 +716,7 @@ pub(crate) async fn search_anime_catalog(
             &keyword,
         )
         .await;
-    let items = merge_anime_metadata_batches(&[
+    let cached_items = merge_anime_metadata_batches(&[
         AnimeMetadataBatch {
             source: "local".to_owned(),
             items: local.items,
@@ -716,9 +726,10 @@ pub(crate) async fn search_anime_catalog(
             items: online.items,
         },
     ]);
+    let mut items = cached_items.clone();
+    items.retain(|item| !is_restricted_anime_content(item));
     let mut errors = visible_discovery_errors("关键词搜索", online.errors);
-    if !items.is_empty() {
-        let cached_items = items.clone();
+    if !cached_items.is_empty() {
         if let Err(error) = run_query("缓存在线番剧搜索结果", storage, move |storage| {
             storage
                 .repository()
@@ -814,7 +825,7 @@ pub(crate) async fn collect_anime_month(
     let defaults = state.platform_defaults().clone();
     let year = query.year;
     let month = query.month;
-    let (existing, settings) = run_query(
+    let (mut existing, settings) = run_query(
         "读取月度采集上下文",
         Arc::clone(&storage),
         move |storage| {
@@ -827,6 +838,7 @@ pub(crate) async fn collect_anime_month(
         },
     )
     .await?;
+    existing.retain(|item| !is_restricted_anime_content(item));
     let network = source_state
         .network_service(&settings)
         .await
@@ -867,7 +879,11 @@ pub(crate) async fn collect_anime_month(
         items: persisted
             .items
             .into_iter()
-            .filter(|item| item.premiere_year == year && item.premiere_month == month)
+            .filter(|item| {
+                item.premiere_year == year
+                    && item.premiere_month == month
+                    && !is_restricted_anime_content(item)
+            })
             .collect(),
         added_count: persisted.added_count,
         existing_count: persisted.existing_count,

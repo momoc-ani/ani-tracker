@@ -2,16 +2,16 @@ use std::cmp::{Ordering, Reverse};
 use std::collections::{HashMap, HashSet};
 
 use ani_domain::{
-    Anime, AnimeAlias, AnimeAliasLanguage, AnimeDetailPartialError, AnimeDetailRefreshState,
-    AnimeDetailResult, AnimeDiscoverySearchResult, AnimeRating, AnimeRssSubscription,
-    AnimeSeasonSyncState, AnimeSourceBinding, AnimeSourceBindingMatchMethod, AnimeSourceExclusion,
-    AnimeSourceExclusionScope, AnimeStatus, AnimeWatchProgress, AppSettings, DailyReminderItem,
-    DailyReminderSummary, DashboardData, DownloadStatus, DownloadTask, Episode, EpisodePreference,
-    EpisodeStatus, EpisodeSummary, FansubGroup, MediaAvailability, MediaContentKind, MediaFile,
-    MediaOrigin, MyAnime, NormalizedVideoCodec, NotificationKind, NotificationRecord,
-    NotificationSeverity, PendingAction, PlaybackCheckpoint, Release, ReleaseResolution,
-    ReleaseSourceConfig, ReleaseSourceSyncState, ReportPlaybackProgressInput, RequestCircuitState,
-    SavePlaybackCheckpointInput, SecretReference, SecretValue, SecureStore,
+    is_restricted_content_rating, Anime, AnimeAlias, AnimeAliasLanguage, AnimeDetailPartialError,
+    AnimeDetailRefreshState, AnimeDetailResult, AnimeDiscoverySearchResult, AnimeRating,
+    AnimeRssSubscription, AnimeSeasonSyncState, AnimeSourceBinding, AnimeSourceBindingMatchMethod,
+    AnimeSourceExclusion, AnimeSourceExclusionScope, AnimeStatus, AnimeWatchProgress, AppSettings,
+    DailyReminderItem, DailyReminderSummary, DashboardData, DownloadStatus, DownloadTask, Episode,
+    EpisodePreference, EpisodeStatus, EpisodeSummary, FansubGroup, MediaAvailability,
+    MediaContentKind, MediaFile, MediaOrigin, MyAnime, NormalizedVideoCodec, NotificationKind,
+    NotificationRecord, NotificationSeverity, PendingAction, PlaybackCheckpoint, Release,
+    ReleaseResolution, ReleaseSourceConfig, ReleaseSourceSyncState, ReportPlaybackProgressInput,
+    RequestCircuitState, SavePlaybackCheckpointInput, SecretReference, SecretValue, SecureStore,
     SetAnimeWatchProgressInput, SourceHealth, SourceKind, SubtitleLanguage, SubtitlePreference,
     TorrentEngineKind, TorrentFile, WeeklyScheduleDay,
 };
@@ -4603,10 +4603,25 @@ fn merge_json_objects(existing: &Value, incoming: &Value) -> Value {
                 if !is_meaningful_json(incoming_value) {
                     continue;
                 }
-                let value = merged.get(key).map_or_else(
-                    || incoming_value.clone(),
-                    |existing_value| merge_json_objects(existing_value, incoming_value),
-                );
+                let value = if key == "contentRating"
+                    && merged
+                        .get(key)
+                        .and_then(Value::as_str)
+                        .is_some_and(is_restricted_content_rating)
+                {
+                    Value::String("18+".to_owned())
+                } else if key == "contentRating"
+                    && incoming_value
+                        .as_str()
+                        .is_some_and(is_restricted_content_rating)
+                {
+                    Value::String("18+".to_owned())
+                } else {
+                    merged.get(key).map_or_else(
+                        || incoming_value.clone(),
+                        |existing_value| merge_json_objects(existing_value, incoming_value),
+                    )
+                };
                 merged.insert(key.clone(), value);
             }
             Value::Object(merged)

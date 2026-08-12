@@ -1941,6 +1941,40 @@ fn preserves_existing_catalog_fields_for_empty_incremental_values() {
     assert_eq!(detail["durationMinutes"], 24);
 }
 
+/// 验证成人分级一经来源确认，不会被后续普通来源刷新降级覆盖。
+#[test]
+fn preserves_restricted_catalog_rating_during_incremental_merge() {
+    let directory = TestDirectory::new("restricted-catalog-rating");
+    let storage = Storage::open(test_options(&directory, "active.sqlite"))
+        .expect("create restricted catalog database");
+    let fixture: ContractFixture<P3FollowingWriteModelFixture> =
+        serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../fixtures/contracts/p3-following-write-model.v1.json"
+        )))
+        .expect("decode following fixture");
+    let repository = storage.repository();
+    let mut restricted = fixture.payload.my_anime.anime;
+    restricted.id = "restricted-anime-1".to_owned();
+    restricted.detail = Some(json!({"contentRating": "18+"}));
+    repository
+        .upsert_anime_catalog(&[restricted.clone()])
+        .expect("save restricted catalog");
+
+    let mut regular_refresh = restricted;
+    regular_refresh.detail = Some(json!({"contentRating": "PG-13"}));
+    repository
+        .upsert_anime_catalog(&[regular_refresh])
+        .expect("merge regular rating refresh");
+
+    let persisted = repository
+        .get_anime_catalog_by_id("restricted-anime-1")
+        .expect("read restricted catalog")
+        .expect("restricted catalog exists");
+    assert_eq!(persisted.detail.as_ref().unwrap()["contentRating"], "18+");
+    assert!(ani_domain::is_restricted_anime_content(&persisted));
+}
+
 /// 验证仅刷新易变时间戳时不会重写未变化目录行。
 #[test]
 fn skips_unchanged_catalog_rows_during_incremental_upsert() {
