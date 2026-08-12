@@ -2,10 +2,12 @@
 import { createHash } from "node:crypto";
 import { createReadStream, createWriteStream } from "node:fs";
 import { access, mkdir, rename, rm } from "node:fs/promises";
+import { get as httpGet } from "node:http";
 import { get as httpsGet } from "node:https";
 import { dirname, resolve } from "node:path";
 import process from "node:process";
 import { pipeline } from "node:stream/promises";
+import { pathToFileURL } from "node:url";
 import { HttpsProxyAgent } from "https-proxy-agent";
 import {
   DESKTOP_LIBVLC_SOURCE,
@@ -13,42 +15,49 @@ import {
   findDesktopLibVlcAsset
 } from "./libvlc-resource-manifest.mjs";
 
-const options = parseArgs(process.argv.slice(2));
-const asset = options.sourceCode
-  ? DESKTOP_LIBVLC_SOURCE
-  : findDesktopLibVlcAsset(options.platform, options.arch);
-if (!asset?.archiveName || !asset.url || !asset.archiveSha256) {
-  const target = options.sourceCode ? "source code" : `${options.platform}-${options.arch}`;
-  throw new Error(`[libvlc] no downloadable archive for ${target}`);
+if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
+  await main(process.argv.slice(2));
 }
 
-const destination = options.output
-  ?? resolve(".cache", "libvlc", DESKTOP_LIBVLC_VERSION, asset.archiveName);
-const proxyUrl = options.proxyUrl || resolveProxyUrl(process.env);
-const downloadAgent = proxyUrl ? new HttpsProxyAgent(proxyUrl) : undefined;
-if (proxyUrl) {
-  console.log(`[libvlc] using proxy: ${formatProxyUrl(proxyUrl)}`);
-}
-
-if (!(await hasExpectedHash(destination, asset.archiveSha256))) {
-  if (options.offline) {
-    throw new Error(`[libvlc] offline archive missing or invalid: ${destination}`);
+/** 下载并校验命令行指定平台的官方 VLC 归档。 */
+async function main(args) {
+  const options = parseArgs(args);
+  const asset = options.sourceCode
+    ? DESKTOP_LIBVLC_SOURCE
+    : findDesktopLibVlcAsset(options.platform, options.arch);
+  if (!asset?.archiveName || !asset.url || !asset.archiveSha256) {
+    const target = options.sourceCode ? "source code" : `${options.platform}-${options.arch}`;
+    throw new Error(`[libvlc] no downloadable archive for ${target}`);
   }
-  await mkdir(dirname(destination), { recursive: true });
-  await downloadVerified(asset.url, destination, asset.archiveSha256, options);
-} else {
-  console.log(`[libvlc] cache hit: ${destination}`);
-}
 
-console.log(`[libvlc] archive ready: ${destination}`);
+  const destination = options.output
+    ?? resolve(".cache", "libvlc", DESKTOP_LIBVLC_VERSION, asset.archiveName);
+  const proxyUrl = options.proxyUrl || resolveProxyUrl(process.env);
+  const downloadAgent = proxyUrl ? new HttpsProxyAgent(proxyUrl) : undefined;
+  if (proxyUrl) {
+    console.log(`[libvlc] using proxy: ${formatProxyUrl(proxyUrl)}`);
+  }
+
+  if (!(await hasExpectedHash(destination, asset.archiveSha256))) {
+    if (options.offline) {
+      throw new Error(`[libvlc] offline archive missing or invalid: ${destination}`);
+    }
+    await mkdir(dirname(destination), { recursive: true });
+    await downloadVerified(asset.url, destination, asset.archiveSha256, options, downloadAgent);
+  } else {
+    console.log(`[libvlc] cache hit: ${destination}`);
+  }
+
+  console.log(`[libvlc] archive ready: ${destination}`);
+}
 
 /** 下载固定摘要的官方归档，并在失败时清理临时文件。 */
-async function downloadVerified(url, outputPath, expectedSha256, currentOptions) {
+async function downloadVerified(url, outputPath, expectedSha256, currentOptions, downloadAgent) {
   let lastError;
   for (let attempt = 1; attempt <= currentOptions.retries; attempt += 1) {
     const temporaryPath = `${outputPath}.part-${process.pid}`;
     try {
-      await downloadFile(url, temporaryPath, currentOptions.timeoutMs);
+      await downloadFile(url, temporaryPath, currentOptions.timeoutMs, 5, downloadAgent);
       const actualSha256 = await sha256(temporaryPath);
       if (actualSha256 !== expectedSha256) {
         throw new Error(`SHA-256 mismatch: expected ${expectedSha256}, received ${actualSha256}`);
@@ -66,11 +75,13 @@ async function downloadVerified(url, outputPath, expectedSha256, currentOptions)
   throw new Error(`[libvlc] failed to download ${url}: ${errorMessage(lastError)}`);
 }
 
-/** 使用系统代理和空闲超时读取 HTTPS 资源。 */
-async function downloadFile(url, destination, timeoutMs, redirectsRemaining = 5) {
+/** 使用系统代理和空闲超时读取 HTTP(S) 资源。固定摘要校验保护重定向后的产物。 */
+export async function downloadFile(url, destination, timeoutMs, redirectsRemaining = 5, agent) {
   await new Promise((resolveDownload, rejectDownload) => {
-    const request = httpsGet(url, {
-      agent: downloadAgent,
+    const requestUrl = new URL(url);
+    const requestGet = requestClient(requestUrl);
+    const request = requestGet(requestUrl, {
+      agent,
       headers: { "User-Agent": "ani-tracker-build" }
     }, async (response) => {
       try {
@@ -78,7 +89,13 @@ async function downloadFile(url, destination, timeoutMs, redirectsRemaining = 5)
         if (response.statusCode && response.statusCode >= 300 && response.statusCode < 400 && location) {
           response.resume();
           if (redirectsRemaining <= 0) throw new Error("Too many redirects");
-          await downloadFile(new URL(location, url).href, destination, timeoutMs, redirectsRemaining - 1);
+          await downloadFile(
+            new URL(location, requestUrl).href,
+            destination,
+            timeoutMs,
+            redirectsRemaining - 1,
+            agent
+          );
           resolveDownload();
           return;
         }
@@ -95,6 +112,13 @@ async function downloadFile(url, destination, timeoutMs, redirectsRemaining = 5)
     request.setTimeout(timeoutMs, () => request.destroy(new Error(`Request timed out after ${timeoutMs}ms`)));
     request.once("error", rejectDownload);
   });
+}
+
+/** 根据 URL 协议选择 Node 下载客户端，并拒绝非 HTTP(S) 重定向。 */
+function requestClient(url) {
+  if (url.protocol === "https:") return httpsGet;
+  if (url.protocol === "http:") return httpGet;
+  throw new Error(`Unsupported download protocol: ${url.protocol}`);
 }
 
 /** 判断归档是否已存在且摘要匹配。 */
