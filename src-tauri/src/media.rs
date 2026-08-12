@@ -773,7 +773,10 @@ mod tests {
         std::fs::write(&other_path, b"other").expect("write other");
         let task = test_download_task(&directory, "episode.mkv");
 
-        assert!(is_download_task_file_path(&media_path, &[task.clone()]));
+        assert!(is_download_task_file_path(
+            &media_path,
+            std::slice::from_ref(&task)
+        ));
         assert!(!is_download_task_file_path(&other_path, &[task]));
         std::fs::remove_dir_all(directory).expect("remove download directory");
     }

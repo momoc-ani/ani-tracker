@@ -66,7 +66,7 @@
     "check:rust": "cargo check --workspace",
     "test:rust": "cargo test --workspace",
     "test:mobile-package": "node --test scripts/sync-tauri-mobile-brand-assets.test.mjs scripts/verify-tauri-mobile-package.test.mjs scripts/verify-tauri-mobile-workflows.test.mjs",
-    "test:desktop-gates": "node --test scripts/libvlc-macos-relocation.test.mjs scripts/prepare-qbittorrent-resources.test.mjs scripts/prepare-tauri-gate-resources.test.mjs scripts/verify-tauri-desktop-workflow.test.mjs",
+    "test:desktop-gates": "node --test scripts/download-libvlc-archive.test.mjs scripts/libvlc-macos-relocation.test.mjs scripts/prepare-qbittorrent-resources.test.mjs scripts/prepare-tauri-gate-resources.test.mjs scripts/verify-tauri-desktop-workflow.test.mjs",
     "test:retired-hosts": "node --test scripts/verify-retired-host-boundaries.test.mjs",
     "lint:rust": "cargo fmt --all -- --check && cargo clippy --workspace --all-targets -- -D warnings",
     "release:set-version": "node scripts/set-tauri-release-version.mjs",

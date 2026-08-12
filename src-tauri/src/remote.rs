@@ -10,8 +10,9 @@ use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::{Aes256Gcm, Nonce};
 use ani_contracts::{AppCommandError, RemoteGatewayStatus, RemotePairingChallenge};
 use ani_domain::{
-    AppSettings, Episode, EpisodePreference, MyAnime, ReleaseSourceConfig,
-    ReportPlaybackProgressInput, SavePlaybackCheckpointInput, SetAnimeWatchProgressInput,
+    is_restricted_anime_content, AppSettings, Episode, EpisodePreference, MyAnime,
+    ReleaseSourceConfig, ReportPlaybackProgressInput, SavePlaybackCheckpointInput,
+    SetAnimeWatchProgressInput,
 };
 use ani_remote::{
     parse_trusted_origins, GatewayConfig, ImageCache, ImageCacheAsset, RemoteDeviceAuth,
@@ -457,8 +458,12 @@ impl RemoteRpcHandler for TauriRemoteRpcHandler {
             "listAnimeCatalog" => {
                 let year = args.first().and_then(Value::as_i64);
                 let month = args.get(1).and_then(Value::as_i64);
-                self.query(move |repository| repository.list_anime_catalog(year, month))
-                    .await
+                self.query(move |repository| {
+                    let mut items = repository.list_anime_catalog(year, month)?;
+                    items.retain(|item| !is_restricted_anime_content(item));
+                    Ok(items)
+                })
+                .await
             }
             "getAnimeDetail" => {
                 let id = string_arg(&args, 0)?;

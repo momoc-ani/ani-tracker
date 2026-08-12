@@ -794,6 +794,37 @@ pub struct Anime {
     pub detail: Option<Value>,
 }
 
+/// 判断番剧是否带有明确的成人内容分级，供发现目录统一过滤。
+pub fn is_restricted_anime_content(anime: &Anime) -> bool {
+    anime
+        .detail
+        .as_ref()
+        .and_then(|detail| detail.get("contentRating"))
+        .and_then(Value::as_str)
+        .is_some_and(is_restricted_content_rating)
+}
+
+/// 仅识别明确成人标记，避免误伤 PG-13、16+ 等普通分级。
+pub fn is_restricted_content_rating(value: &str) -> bool {
+    let normalized = value.trim().to_lowercase().replace([' ', '-', '_'], "");
+    normalized.starts_with("r18")
+        || normalized.starts_with("18+")
+        || normalized.starts_with("18禁")
+        || matches!(
+            normalized.as_str(),
+            "adult"
+                | "adultsonly"
+                | "hentai"
+                | "nsfw"
+                | "成人"
+                | "成人向"
+                | "成人动画"
+                | "里番"
+                | "色情"
+                | "限制级"
+        )
+}
+
 /// 单部追番的 RSS 订阅设置。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -1789,5 +1820,22 @@ mod tests {
 
         assert_eq!(format!("{secret:?}"), "SecretValue([REDACTED])");
         assert_eq!(secret.expose(), b"do-not-log");
+    }
+
+    /// 验证明确定义的成人分级会被拦截，普通年龄分级保持可见。
+    #[test]
+    fn identifies_only_explicit_restricted_content_ratings() {
+        for rating in ["18+", "R-18", "R18+", "NSFW", "Adult", "成人向", "里番"] {
+            assert!(
+                super::is_restricted_content_rating(rating),
+                "rating={rating}"
+            );
+        }
+        for rating in ["PG-13", "R-15", "16+", "全年龄", "后宫", "恋爱"] {
+            assert!(
+                !super::is_restricted_content_rating(rating),
+                "rating={rating}"
+            );
+        }
     }
 }

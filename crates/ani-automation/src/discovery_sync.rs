@@ -3,8 +3,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use ani_domain::{
-    Anime, AnimeDetailRefreshState, AnimeDiscoverySeasonQuery, AnimeDiscoverySeasonResult,
-    AnimeSeasonSyncState,
+    is_restricted_anime_content, Anime, AnimeDetailRefreshState, AnimeDiscoverySeasonQuery,
+    AnimeDiscoverySeasonResult, AnimeSeasonSyncState,
 };
 use ani_repository::{
     AnimeCatalogRepository, AnimeCatalogWriteResult, ReleaseSourceRepository, RepositoryResult,
@@ -177,6 +177,9 @@ impl AnimeDiscoverySyncService {
                     .items
                     .extend(store.list_season_catalog_month(result.query.year, month)?);
             }
+            result
+                .items
+                .retain(|item| !is_restricted_anime_content(item));
         }
         Ok(result)
     }
@@ -292,7 +295,9 @@ impl AnimeDiscoverySyncService {
             existing_count = items.len();
         }
         items.retain(|item| {
-            item.premiere_year == query.year && months.contains(&item.premiere_month)
+            item.premiere_year == query.year
+                && months.contains(&item.premiere_month)
+                && !is_restricted_anime_content(item)
         });
         log::info!(
             "Rust 新番季度同步完成：year={}, season={}, items={}, added={}, anilist_succeeded={}",
