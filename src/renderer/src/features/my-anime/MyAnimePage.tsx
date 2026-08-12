@@ -68,6 +68,7 @@ import type {
   VideoBitDepth
 } from "@shared/domain";
 import { findEpisodeDownloadLink, summarizeAnimeDownloads } from "@shared/download-episode-links";
+import { compareReleaseEpisodeDescending, findReleaseDownloadTask } from "@shared/release-identity";
 import type { MediaPlaybackTarget } from "@shared/player-selection";
 import { formatSubtitleLanguages, formatVideoBitDepth, resolveSubtitleLanguages, subtitleLanguageText } from "@shared/release-metadata";
 
@@ -187,6 +188,7 @@ export function MyAnimePage({
   const [sourceBindingState, setSourceBindingState] = useState<AnimeSourceBindingState | null>(null);
   const [sourceBindingLoading, setSourceBindingLoading] = useState(false);
   const [sourceBindingActionKey, setSourceBindingActionKey] = useState<string | null>(null);
+  const [unknownSeasonDownloadTarget, setUnknownSeasonDownloadTarget] = useState<Release | null>(null);
   const [loading, setLoading] = useState(true);
   const [episodeLoading, setEpisodeLoading] = useState(false);
   const [saving, setSaving] = useState(false);
@@ -570,10 +572,11 @@ export function MyAnimePage({
     setAnimeRssReleaseGroups([]);
     setAnimeReleaseResolved(false);
     setAnimeRssReleaseResolved(false);
-    void refreshAnimeSourceBindings(target.anime.id);
     if (nextTab === "rss") {
+      void refreshAnimeSourceBindings(target.anime.id);
       await searchAnimeRssReleases(target);
     } else {
+      await refreshAnimeSourceBindings(target.anime.id);
       await searchAnimeReleases(target);
     }
   }
@@ -588,6 +591,7 @@ export function MyAnimePage({
     setAnimeRssReleaseResolved(false);
     setSourceBindingState(null);
     setSourceBindingActionKey(null);
+    setUnknownSeasonDownloadTarget(null);
   }
 
   /** 打开某部追番的下载任务明细抽屉。 */
@@ -600,6 +604,25 @@ export function MyAnimePage({
 
   function closeDownloadDetail() {
     setDownloadDetail(null);
+  }
+
+  /** 移除单个已完成下载任务，并同步本地任务快照。 */
+  async function removeAnimeDownloadTask(taskId: string, deleteFiles: boolean): Promise<void> {
+    try {
+      const latestDownloads = await appApi.removeDownload(taskId, deleteFiles);
+      setDownloadTasks(latestDownloads);
+      console.info("[my-anime] 已移除下载任务", { taskId, deleteFiles });
+      setMessage({
+        tone: "success",
+        text: deleteFiles ? "已删除任务及其文件" : "已移除任务，文件已保留"
+      });
+    } catch (error) {
+      setMessage({
+        tone: "error",
+        text: error instanceof Error ? error.message : "删除下载资源失败"
+      });
+      throw error;
+    }
   }
 
   /** 打开追番规则抽屉，并保留已采集的番剧元数据快照。 */
@@ -652,7 +675,7 @@ export function MyAnimePage({
         cacheTtlMs: releaseSearchCacheTtlMs,
         forceRefresh: options.forceRefresh
       });
-      const releases = dedupeReleases(result.releases).map((release) => ({
+      const releases = sortReleases(dedupeReleases(result.releases)).map((release) => ({
         ...release,
         animeId: target.anime.id
       }));
@@ -942,7 +965,24 @@ export function MyAnimePage({
     }
   }
 
-  async function addAnimeReleaseDownload(release: Release) {
+  /** 未知季度资源先要求单条确认，明确不匹配资源始终拒绝。 */
+  function requestAnimeReleaseDownload(release: Release) {
+    if (!downloadTarget) {
+      return;
+    }
+    const compatibility = classifyAnimeRelease(release, downloadTarget.anime);
+    if (compatibility === "other") {
+      setUnknownSeasonDownloadTarget(release);
+      return;
+    }
+    if (compatibility === "mismatch") {
+      setMessage({ tone: "error", text: "该资源季度与当前追番不一致，无法添加下载" });
+      return;
+    }
+    void addAnimeReleaseDownload(release);
+  }
+
+  async function addAnimeReleaseDownload(release: Release, confirmUnknownSeason = false) {
     if (!downloadTarget) {
       return;
     }
@@ -950,7 +990,7 @@ export function MyAnimePage({
     setAddingReleaseId(release.id);
     try {
       const updatedDownloads = await appApi.addReleaseDownload(
-        buildAnimeReleaseDownloadInput(release, downloadTarget)
+        buildAnimeReleaseDownloadInput(release, downloadTarget, confirmUnknownSeason)
       );
       setDownloadTasks(updatedDownloads);
       setMessage({ tone: "success", text: "已添加到下载队列" });
@@ -1156,7 +1196,7 @@ export function MyAnimePage({
             sourceBindingState={sourceBindingState}
             target={downloadTarget}
             onCancel={closeAnimeDownloads}
-            onAddRelease={(release) => void addAnimeReleaseDownload(release)}
+            onAddRelease={requestAnimeReleaseDownload}
             onAddRssSubscription={(subscription) => void addAnimeRssSubscription(subscription)}
             onAddSelected={(releases) => void addAnimeReleaseDownloads(releases)}
             onFansubChange={setAnimeReleaseFansubId}
@@ -1191,8 +1231,25 @@ export function MyAnimePage({
             setDownloadDetail((current) => (current ? { ...current, filter } : current))
           }
           onPlayMedia={onPlayMedia}
+          onRemoveTask={removeAnimeDownloadTask}
         />
       )}
+
+      <ConfirmActionDialog
+        confirmLabel="仅下载此条"
+        content={unknownSeasonDownloadTarget ? (
+          <div className="border-l-2 border-amber-500/70 pl-3 text-sm text-foreground">
+            {unknownSeasonDownloadTarget.title}
+          </div>
+        ) : undefined}
+        description="该资源没有足够的季度标记，系统无法确认它属于当前追番。确认后仅添加这一条资源，不会影响自动下载或批量下载规则。"
+        onConfirm={() => unknownSeasonDownloadTarget
+          ? addAnimeReleaseDownload(unknownSeasonDownloadTarget, true)
+          : undefined}
+        onOpenChange={(open) => !open && setUnknownSeasonDownloadTarget(null)}
+        open={Boolean(unknownSeasonDownloadTarget)}
+        title="确认下载季度待确认资源？"
+      />
 
       <ConfirmActionDialog
         confirmLabel="移除追番"
@@ -1944,7 +2001,6 @@ function AnimeDownloadPanel({
   const activeRssGroup = rssGroups.find((group) => group.subscription.id === selectedRssSubscriptionId) ?? rssGroups[0];
   const rssReleases = activeRssGroup?.releases ?? [];
   const tabReleases = activeTab === "rss" ? rssReleases : releases;
-  const releaseGroupingOptions = activeTab === "search" ? { preserveInputOrder: true } : undefined;
   const currentTabReleases = tabReleases.filter((release) => classifyAnimeRelease(release, target.anime) === "current");
   const otherTabReleases = tabReleases.filter((release) => classifyAnimeRelease(release, target.anime) === "other");
   const visibleReleases = activeTab === "rss"
@@ -1969,21 +2025,19 @@ function AnimeDownloadPanel({
   const sourceFailed = currentTabReleases.length === 0 && otherTabReleases.length === 0 && visibleErrors.length > 0;
   const linkedTasks = downloadTasks.filter((task) => task.animeId === target.anime.id);
   const releaseSignature = tabReleases.map(releaseKey).join("|");
-  const tabFamilies = groupReleaseVersions(currentTabReleases, target, releaseVersionSelections, releaseGroupingOptions);
-  const visibleFamilies = groupReleaseVersions(visibleReleases, target, releaseVersionSelections, releaseGroupingOptions);
+  const tabFamilies = groupReleaseVersions(currentTabReleases, target, releaseVersionSelections);
+  const visibleFamilies = groupReleaseVersions(visibleReleases, target, releaseVersionSelections);
   const visibleCollectionFamilies = groupReleaseVersions(
     visibleCollectionReleases,
     target,
-    releaseVersionSelections,
-    releaseGroupingOptions
+    releaseVersionSelections
   );
   const visibleEpisodeFamilies = groupReleaseVersions(
     visibleEpisodeReleases,
     target,
-    releaseVersionSelections,
-    releaseGroupingOptions
+    releaseVersionSelections
   );
-  const visibleOtherFamilies = groupReleaseVersions(visibleOtherEpisodeReleases, target, releaseVersionSelections, releaseGroupingOptions);
+  const visibleOtherFamilies = groupReleaseVersions(visibleOtherEpisodeReleases, target, releaseVersionSelections);
   const selectedReleases = visibleFamilies
     .filter((family) => selectedFamilyKeys.has(family.key))
     .map((family) => family.selectedRelease);
@@ -2091,7 +2145,7 @@ function AnimeDownloadPanel({
 
   /** 按集数渲染资源族，并保留批量选择能力。 */
   function renderEpisodeGroups(groupReleases: Release[], batchSelectable = true) {
-    const families = groupReleaseVersions(groupReleases, target, releaseVersionSelections, releaseGroupingOptions);
+    const families = groupReleaseVersions(groupReleases, target, releaseVersionSelections);
     return groupReleaseFamilyEpisodes(families).map((episodeGroup) => (
       <section key={episodeGroup.key}>
         <div className="flex min-h-9 items-center justify-between bg-primary/5 px-3 py-2 text-[11px] uppercase tracking-[0.04em]">
@@ -2323,7 +2377,7 @@ function AnimeDownloadPanel({
                   </section>
                 )
               : releaseGroups.map((group, groupIndex) => {
-                  const groupFamilies = groupReleaseVersions(group.releases, target, releaseVersionSelections, releaseGroupingOptions);
+                  const groupFamilies = groupReleaseVersions(group.releases, target, releaseVersionSelections);
                   const selection = getGroupSelectionState(groupFamilies);
                   const rssCandidate = buildMikanGroupRssSubscription(group, target);
                   const rssSubscribed = Boolean(rssCandidate && existingRssUrls.has(rssCandidate.url));
@@ -2605,6 +2659,12 @@ function ReleaseDownloadRow({
   const release = family.selectedRelease;
   const canDownload = Boolean(release.magnetUrl ?? release.torrentUrl);
   const selectable = canDownload && !linkedTask && batchSelectable;
+  const canAddIndividually = canDownload && !linkedTask;
+  const actionLabel = !batchSelectable
+    ? "确认本条季度待确认资源并添加下载"
+    : linkedTask
+      ? "已加入下载"
+      : "添加下载";
 
   return (
     <div className={cn("px-3 py-2.5 [@media(max-height:760px)]:py-2", (linkedTask || !batchSelectable) && "bg-muted/20")}>
@@ -2668,13 +2728,19 @@ function ReleaseDownloadRow({
           className="min-h-9 shrink-0 border-primary/20 bg-primary/10 px-2 text-primary hover:bg-primary/20 sm:px-3"
           variant="outline"
           onClick={() => onAddRelease(release)}
-          disabled={!canDownload || Boolean(linkedTask) || addingReleaseId === release.id || addingReleaseId === batchAddingReleaseId}
-          aria-label={linkedTask ? "已加入下载" : "添加下载"}
-          title={linkedTask ? "已加入下载" : "添加下载"}
+          disabled={!canAddIndividually || addingReleaseId === release.id || addingReleaseId === batchAddingReleaseId}
+          aria-label={actionLabel}
+          title={actionLabel}
         >
           <Download data-icon="inline-start" />
           <span className="hidden sm:inline">
-            {linkedTask ? "已加入" : addingReleaseId === release.id ? "添加中" : "添加下载"}
+            {linkedTask
+              ? "已加入"
+              : addingReleaseId === release.id
+                ? "添加中"
+                : batchSelectable
+                  ? "添加下载"
+                  : "确认下载"}
           </span>
         </Button>
       </div>
@@ -3233,7 +3299,8 @@ function buildMikanRssUrl(item: MyAnime): string | undefined {
 /** 构造追番资源添加下载时需要的关联参数。 */
 function buildAnimeReleaseDownloadInput(
   release: Release,
-  target: MyAnime
+  target: MyAnime,
+  confirmUnknownSeason = false
 ): AddReleaseDownloadInput {
   return {
     release: {
@@ -3243,7 +3310,8 @@ function buildAnimeReleaseDownloadInput(
     animeId: target.anime.id,
     episodeNo: release.episodeNo,
     fansubGroupId: release.fansubGroupId,
-    savePath: target.downloadDir
+    savePath: target.downloadDir,
+    confirmUnknownSeason
   };
 }
 
@@ -3286,13 +3354,8 @@ function dedupeReleaseErrors(errors: ReleaseSearchResult["errors"]): ReleaseSear
 
 function sortReleases(releases: Release[]): Release[] {
   return [...releases].sort((left, right) => {
-    const leftEpisode = left.episodeNo ?? -1;
-    const rightEpisode = right.episodeNo ?? -1;
-    if (leftEpisode !== rightEpisode) {
-      return rightEpisode - leftEpisode;
-    }
-
-    return (right.publishedAt ?? "").localeCompare(left.publishedAt ?? "");
+    return compareReleaseEpisodeDescending(left, right)
+      || (right.publishedAt ?? "").localeCompare(left.publishedAt ?? "");
   });
 }
 
@@ -3349,22 +3412,6 @@ function buildMikanGroupRssSubscription(group: ReleaseFansubGroup, target: MyAni
       release.sourceMeta?.rssUrl ??
       `https://mikanani.me/RSS/Bangumi?bangumiId=${encodeURIComponent(mikanBangumiId)}&subgroupid=${encodeURIComponent(mikanSubgroupId)}`
   };
-}
-
-function findReleaseDownloadTask(tasks: DownloadTask[], release: Release): DownloadTask | undefined {
-  return tasks.find((task) => {
-    if (task.releaseId === release.id) {
-      return true;
-    }
-
-    const releaseFansubKey = release.fansubGroupId ?? release.fansubName;
-    return Boolean(
-      releaseFansubKey &&
-      task.episodeNo !== undefined &&
-      task.episodeNo === release.episodeNo &&
-      (task.fansubGroupId ?? task.fansubName) === releaseFansubKey
-    );
-  });
 }
 
 function getReleaseFansubName(release: Release, fansubNames: Map<string, string>): string {

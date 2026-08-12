@@ -39,6 +39,7 @@ export function normalizeAnimeDetailMetadata(value: unknown): AnimeDetailMetadat
     durationMinutes: readPositiveInteger(value.durationMinutes),
     contentRating: readString(value.contentRating),
     demographic: readString(value.demographic),
+    countryOfOrigin: readString(value.countryOfOrigin),
     ranking: normalizeRanking(value.ranking),
     metadataSources: normalizeStringList(value.metadataSources),
     refreshedAt: readDateTime(value.refreshedAt)

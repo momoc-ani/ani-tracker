@@ -34,9 +34,15 @@ export function PlayerEpisodeList({
 }: PlayerEpisodeListProps) {
   const episodeItems = items.filter((item) => item.section === "episodes");
   const specialItems = items.filter((item) => item.section === "specials");
-  const viewedCount = episodeItems.filter((item) =>
-    item.status === "watched" || item.status === "playing"
-  ).length;
+  const episodeKeys = new Set(episodeItems.map(episodeItemKey));
+  const viewedKeys = new Set(episodeItems
+    .filter((item) => item.status === "watched" || item.status === "playing")
+    .map(episodeItemKey));
+  const episodeCount = episodeKeys.size;
+  const viewedCount = viewedKeys.size;
+  const episodeVersionLabel = episodeItems.length === episodeCount
+    ? String(episodeCount)
+    : `${episodeCount} 集/${episodeItems.length} 版本`;
   const activeItemId = items.find((item) => item.status === "playing")?.id;
   const scrollAreaRef = useRef<HTMLDivElement>(null);
   const activeRowRef = useRef<HTMLDivElement>(null);
@@ -87,7 +93,7 @@ export function PlayerEpisodeList({
     <div className="flex min-w-0 max-w-full flex-col overflow-hidden" role="list" aria-label={`${animeTitle} 播放列表`}>
       {specialItems.length > 0 && episodeItems.length > 0 && (
         <div className="flex items-center justify-between gap-3 px-4 py-2 text-xs font-medium text-muted-foreground" role="presentation">
-          <span>正片</span><Badge>{episodeItems.length}</Badge>
+          <span>正片</span><Badge>{episodeVersionLabel}</Badge>
         </div>
       )}
       {renderRows(episodeItems)}
@@ -115,7 +121,7 @@ export function PlayerEpisodeList({
             <div className="min-w-0">
               <h2 id="player-playlist-title" className="text-base font-semibold">播放列表</h2>
             </div>
-            <Badge>{episodeItems.length > 0 ? `${viewedCount}/${episodeItems.length}` : `${specialItems.length} 项`}</Badge>
+            <Badge>{episodeItems.length > 0 ? `${viewedCount}/${episodeCount}` : `${specialItems.length} 项`}</Badge>
           </div>
         )}
         {items.length === 0 ? (
@@ -135,6 +141,11 @@ export function PlayerEpisodeList({
       </section>
     </TooltipProvider>
   );
+}
+
+/** 返回用于播放进度统计的集数键，同集多个字幕组只统计一次。 */
+function episodeItemKey(item: PlayerEpisodeUiItem): string {
+  return item.episodeNo === undefined ? item.id : `episode:${item.episodeNo}`;
 }
 
 /** 渲染单集的编号、标题、媒体规格、进度和状态。 */

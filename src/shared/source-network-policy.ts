@@ -1,8 +1,12 @@
 import type { ReleaseSourceConfig } from "./domain";
 
-export const DEFAULT_SOURCE_REQUEST_INTERVAL_MS = 1_500;
+/** 用户新建下载源且未填写间隔时使用的默认采集间隔。 */
+export const DEFAULT_SOURCE_REQUEST_INTERVAL_MS = 600;
+/** 普通下载源允许配置的最小采集间隔。 */
 export const MIN_SOURCE_REQUEST_INTERVAL_MS = 250;
+/** 所有下载源允许配置的最大采集间隔。 */
 export const MAX_SOURCE_REQUEST_INTERVAL_MS = 60_000;
+/** AniBT 固定执行的最小采集间隔。 */
 export const ANIBT_MIN_REQUEST_INTERVAL_MS = 500;
 
 type SourceRequestTarget = Pick<ReleaseSourceConfig, "id" | "name" | "baseUrl" | "rssUrl">;

@@ -16,7 +16,7 @@ import {
   X
 } from "lucide-react";
 import type { ReactNode } from "react";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { toast } from "@/lib/toast";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
@@ -71,6 +71,7 @@ export function SourcesPage({ allowImmediateSync = true }: { allowImmediateSync?
   const [settings, setSettings] = useState<AppSettings | null>(null);
   const [credentials, setCredentials] = useState<Record<string, string>>({});
   const [intervalDrafts, setIntervalDrafts] = useState<Record<string, string>>({});
+  const intervalDraftsRef = useRef<Record<string, string>>({});
   const [expandedSourceIds, setExpandedSourceIds] = useState<Set<string>>(new Set());
   const [sourceMutationId, setSourceMutationId] = useState<string | null>(null);
   const [syncStatus, setSyncStatus] = useState<SourceSyncSchedulerStatus | null>(null);
@@ -92,12 +93,14 @@ export function SourcesPage({ allowImmediateSync = true }: { allowImmediateSync?
 
   useEffect(() => {
     if (data) {
-      setSources(data);
-      setCredentials(Object.fromEntries(data.map((source) => [source.id, source.apiKey ?? ""])));
-      setIntervalDrafts(Object.fromEntries(data.map((source) => [
+      const nextIntervalDrafts = Object.fromEntries(data.map((source) => [
         source.id,
         String(normalizeSourceInterval(source.requestIntervalMs, source))
-      ])));
+      ]));
+      setSources(data);
+      setCredentials(Object.fromEntries(data.map((source) => [source.id, source.apiKey ?? ""])));
+      intervalDraftsRef.current = nextIntervalDrafts;
+      setIntervalDrafts(nextIntervalDrafts);
     }
   }, [data]);
 
@@ -113,6 +116,12 @@ export function SourcesPage({ allowImmediateSync = true }: { allowImmediateSync?
     if (syncStatusData) setSyncStatus(syncStatusData);
   }, [syncStatusData]);
 
+  /** 同步保存采集间隔草稿，确保立即点击保存时读取到最新输入。 */
+  function updateIntervalDraft(sourceId: string, value: string) {
+    intervalDraftsRef.current = { ...intervalDraftsRef.current, [sourceId]: value };
+    setIntervalDrafts((current) => ({ ...current, [sourceId]: value }));
+  }
+
   /** 串行执行单个下载源变更，并统一处理错误与忙碌状态。 */
   async function runSourceMutation(
     source: ReleaseSourceConfig,
@@ -122,10 +131,13 @@ export function SourcesPage({ allowImmediateSync = true }: { allowImmediateSync?
   ) {
     setSourceMutationId(source.id);
     try {
-      setSources(await operation());
+      const nextSources = await operation();
+      setSources(nextSources);
       if (successMessage) toast.success(successMessage);
+      return nextSources;
     } catch (error) {
       toast.error(error instanceof Error ? error.message : failureMessage);
+      return undefined;
     } finally {
       setSourceMutationId(null);
     }
@@ -166,14 +178,30 @@ export function SourcesPage({ allowImmediateSync = true }: { allowImmediateSync?
 
   /** 保存单个下载源的最小采集间隔。 */
   async function saveSourceInterval(source: ReleaseSourceConfig) {
-    const requestIntervalMs = normalizeSourceInterval(Number(intervalDrafts[source.id]), source);
-    await runSourceMutation(
+    const draft = intervalDraftsRef.current[source.id] ?? intervalDrafts[source.id];
+    const requestIntervalMs = normalizeSourceInterval(Number(draft), source);
+    const savedSources = await runSourceMutation(
       source,
       () => appApi.upsertSource({ ...source, requestIntervalMs }),
-      "采集策略保存失败",
-      "采集策略已保存"
+      "采集策略保存失败"
     );
-    setIntervalDrafts((current) => ({ ...current, [source.id]: String(requestIntervalMs) }));
+    if (!savedSources) return;
+
+    const persistedSource = savedSources.find((item) => item.id === source.id);
+    const persistedInterval = persistedSource
+      ? normalizeSourceInterval(persistedSource.requestIntervalMs, persistedSource)
+      : undefined;
+    if (persistedInterval !== requestIntervalMs) {
+      if (persistedInterval !== undefined) {
+        updateIntervalDraft(source.id, String(persistedInterval));
+      }
+      toast.error("采集策略未正确持久化，请重试");
+      return;
+    }
+
+    updateIntervalDraft(source.id, String(requestIntervalMs));
+    console.info("[sources] 采集间隔已持久化", { sourceId: source.id, requestIntervalMs });
+    toast.success("采集策略已保存");
   }
 
   /** 校验并创建新的下载源。 */
@@ -206,7 +234,7 @@ export function SourcesPage({ allowImmediateSync = true }: { allowImmediateSync?
     try {
       setSources(await appApi.upsertSource(source));
       setCredentials((current) => ({ ...current, [source.id]: source.apiKey ?? "" }));
-      setIntervalDrafts((current) => ({ ...current, [source.id]: "1500" }));
+      updateIntervalDraft(source.id, "600");
       setDraft({ name: "", kind: "rss", url: "", apiKey: "" });
       setDraftErrors({});
       setAddSheetOpen(false);
@@ -574,7 +602,7 @@ export function SourcesPage({ allowImmediateSync = true }: { allowImmediateSync?
                                     max={MAX_SOURCE_REQUEST_INTERVAL_MS}
                                     step={250}
                                     value={intervalDrafts[source.id] ?? String(normalizeSourceInterval(source.requestIntervalMs, source))}
-                                    onChange={(event) => setIntervalDrafts({ ...intervalDrafts, [source.id]: event.target.value })}
+                                    onChange={(event) => updateIntervalDraft(source.id, event.target.value)}
                                   />
                                   <Button className="shrink-0 whitespace-nowrap" variant="outline" disabled={Boolean(sourceMutationId)} onClick={() => void saveSourceInterval(source)}>
                                     <Save data-icon="inline-start" />保存

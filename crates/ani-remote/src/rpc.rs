@@ -37,6 +37,7 @@ const METHODS: &[MethodDefinition] = &[
     ),
     method("listMyAnime", "library.read", RpcEffect::Read),
     method("upsertMyAnime", "library.write", RpcEffect::Write),
+    method("followBangumiAnime", "library.write", RpcEffect::Write),
     method("removeMyAnime", "library.write", RpcEffect::Write),
     method("listMyAnimeWatchProgress", "library.read", RpcEffect::Read),
     method("setAnimeWatchProgress", "library.write", RpcEffect::Write),
@@ -45,6 +46,7 @@ const METHODS: &[MethodDefinition] = &[
     method("listAnimeCatalog", "catalog.read", RpcEffect::Read),
     method("getAnimeDetail", "catalog.read", RpcEffect::Read),
     method("searchAnimeCatalog", "catalog.read", RpcEffect::Read),
+    method("browseBangumiAnime", "catalog.read", RpcEffect::Read),
     method("listFansubs", "library.read", RpcEffect::Read),
     method("listEpisodes", "library.read", RpcEffect::Read),
     method("upsertEpisode", "library.write", RpcEffect::Write),
@@ -291,8 +293,18 @@ fn validate_args(method: &str, args: Vec<Value>) -> Result<Vec<Value>, RemoteRpc
                 .ok_or_else(|| invalid_args("搜索关键词长度必须为 1-120 个字符"))?;
             Ok(vec![Value::String(keyword.to_owned())])
         }
+        "browseBangumiAnime" => validate_domain_object::<ani_domain::BangumiBrowseQuery>(
+            args,
+            &["keyword", "sort", "filters", "page", "pageSize"],
+            |object| {
+                validate_optional_text(object.get("keyword"), "Bangumi 搜索关键词", 120)?;
+                validate_number(object.get("page"), "Bangumi 页码", 1.0, 100_000.0)?;
+                validate_number(object.get("pageSize"), "Bangumi 每页数量", 1.0, 50.0)?;
+                Ok(())
+            },
+        ),
         "listAnimeCatalog" => validate_year_month(args),
-        "upsertMyAnime" => validate_domain_object::<ani_domain::MyAnime>(
+        "upsertMyAnime" | "followBangumiAnime" => validate_domain_object::<ani_domain::MyAnime>(
             args,
             &[
                 "id",
@@ -471,8 +483,8 @@ fn validate_args(method: &str, args: Vec<Value>) -> Result<Vec<Value>, RemoteRpc
         "removeDownload" => {
             let args = require_count(args, 2)?;
             parse_id(&args[0], "下载任务标识")?;
-            if args[1].as_bool() != Some(false) {
-                return Err(invalid_args("远程端只能保留文件并移除任务记录"));
+            if args[1].as_bool().is_none() {
+                return Err(invalid_args("删除文件参数必须是布尔值"));
             }
             Ok(args)
         }
@@ -511,6 +523,7 @@ fn validate_args(method: &str, args: Vec<Value>) -> Result<Vec<Value>, RemoteRpc
                 "episodeNo",
                 "fansubGroupId",
                 "paused",
+                "confirmUnknownSeason",
             ],
             validate_add_release_download,
         ),
@@ -748,7 +761,8 @@ fn validate_add_release_download(object: &Map<String, Value>) -> Result<(), Remo
     if let Some(value) = object.get("episodeNo") {
         validate_number(Some(value), "集数", 0.0, 100_000.0)?;
     }
-    validate_optional_bool(object.get("paused"), "暂停状态")
+    validate_optional_bool(object.get("paused"), "暂停状态")?;
+    validate_optional_bool(object.get("confirmUnknownSeason"), "季度确认状态")
 }
 
 fn validate_source(object: &Map<String, Value>) -> Result<(), RemoteRpcError> {
@@ -1135,7 +1149,7 @@ fn invalid_args(message: impl Into<String>) -> RemoteRpcError {
 
 fn sanitize_result(method: &str, mut value: Value) -> Result<Value, RemoteRpcError> {
     match method {
-        "listMyAnime" | "upsertMyAnime" | "removeMyAnime" => {
+        "listMyAnime" | "upsertMyAnime" | "followBangumiAnime" | "removeMyAnime" => {
             sanitize_array(&mut value, sanitize_my_anime)?
         }
         "listDownloads"
@@ -1197,6 +1211,13 @@ fn sanitize_result(method: &str, mut value: Value) -> Result<Value, RemoteRpcErr
                 for error in errors {
                     redact_string(Some(error));
                 }
+            }
+        }
+        "browseBangumiAnime" => {
+            let object = require_result_object(&mut value, "Bangumi 浏览结果")?;
+            redact_string(object.get_mut("source"));
+            if let Some(Value::Object(query)) = object.get_mut("query") {
+                redact_string(query.get_mut("keyword"));
             }
         }
         "searchReleases" | "searchAnimeReleases" | "searchRssSubscriptionReleases" => {
@@ -1459,7 +1480,7 @@ mod tests {
                     "storage": { "userDataDir": "/Users/test" },
                     "players": [{ "id": "builtin" }]
                 })),
-                "pauseDownload" => Ok(json!([])),
+                "pauseDownload" | "removeDownload" | "addReleaseDownload" => Ok(json!([])),
                 _ => Ok(json!({ "args": args })),
             }
         }
@@ -1498,6 +1519,50 @@ mod tests {
         assert_eq!(invalid.code, "INVALID_ARGUMENTS");
     }
 
+    /// 验证远程仅接受布尔类型的单条未知季度确认，不放宽其他下载参数。
+    #[tokio::test]
+    async fn accepts_remote_unknown_season_confirmation() {
+        let service = RemoteRpcService::new(std::sync::Arc::new(EchoHandler));
+        let release = json!({
+            "id": "release-season-2-episode-5",
+            "title": "[LoliHouse] 测试番 2 - 05 [简繁内封字幕]",
+            "sourceId": "mikan",
+            "sourceName": "蜜柑计划 RSS",
+            "torrentUrl": "https://mikanani.me/Download/test.torrent",
+            "publishedAt": "2026-08-06T13:15:00Z"
+        });
+        let confirmed = service
+            .dispatch(
+                json!({
+                    "method": "addReleaseDownload",
+                    "args": [{
+                        "release": release.clone(),
+                        "animeId": "bangumi-412144",
+                        "confirmUnknownSeason": true
+                    }]
+                }),
+                &["downloads.control".to_owned()],
+            )
+            .await;
+        assert!(confirmed.is_ok());
+
+        let invalid = service
+            .dispatch(
+                json!({
+                    "method": "addReleaseDownload",
+                    "args": [{
+                        "release": release,
+                        "animeId": "bangumi-412144",
+                        "confirmUnknownSeason": "true"
+                    }]
+                }),
+                &["downloads.control".to_owned()],
+            )
+            .await
+            .expect_err("non-boolean confirmation must fail");
+        assert_eq!(invalid.code, "INVALID_ARGUMENTS");
+    }
+
     /// 验证远程可以保存下载目录、引擎和做种配置。
     #[tokio::test]
     async fn accepts_remote_download_settings() {
@@ -1533,12 +1598,19 @@ mod tests {
         assert!(result.is_ok());
     }
 
-    /// 验证远程下载和设置写入不能越过本地文件与桌面字段边界。
+    /// 验证远程下载删除允许显式删除文件，其他设置写入仍不能越过桌面字段边界。
     #[tokio::test]
-    async fn rejects_local_file_and_desktop_mutations() {
+    async fn allows_download_file_removal_but_rejects_desktop_mutations() {
         let service = RemoteRpcService::new(std::sync::Arc::new(EchoHandler));
+        let remove_result = service
+            .dispatch(
+                json!({ "method": "removeDownload", "args": ["task-1", true] }),
+                &["downloads.control".to_owned()],
+            )
+            .await;
+        assert!(remove_result.is_ok());
+
         for request in [
-            json!({ "method": "removeDownload", "args": ["task-1", true] }),
             json!({ "method": "addDownloadUrl", "args": [{ "url": "magnet:?xt=urn:btih:abc", "savePath": "/tmp" }] }),
             json!({ "method": "updateSettings", "args": [{ "storage": { "userDataDir": "/tmp" } }] }),
             json!({ "method": "updateSettings", "args": [{ "network": { "remoteAccess": { "port": 1 } } }] }),

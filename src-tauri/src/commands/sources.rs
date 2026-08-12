@@ -433,7 +433,7 @@ pub(crate) async fn search_rss_subscription_releases(
         kind: SourceKind::Rss,
         enabled: true,
         use_proxy: true,
-        request_interval_ms: 1_500,
+        request_interval_ms: 800,
         base_url: None,
         api_key: None,
         rss_url: Some(subscription.url),

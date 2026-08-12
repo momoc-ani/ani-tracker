@@ -38,6 +38,7 @@ import type {
   PlayerSnapshot,
   PlayerSubtitleScale
 } from "@shared/player-contract";
+import { resolvePlayerShortcut } from "@shared/player-shortcuts";
 import { readStoredSubtitleScale, storeSubtitleScale } from "@/features/player/subtitle-scale";
 import { ArtPlayerAdapter } from "./art-player-adapter";
 import {
@@ -47,6 +48,7 @@ import {
 import type { PlaybackSessionClient } from "./playback-session-client";
 import {
   playlistItemLabel,
+  resolveAdjacentPlaylistItem,
   type RemotePlaylistItem
 } from "@/features/player/playback-list-model";
 import {
@@ -121,14 +123,14 @@ export function RemoteVideoPlayer({
       : undefined,
     [allowExternalPlayback]
   );
-  const activeIndex = useMemo(
-    () => activeItem ? playlist.findIndex((item) => item.id === activeItem.id) : -1,
+  const previousItem = useMemo(
+    () => resolveAdjacentPlaylistItem(playlist, activeItem, "previous"),
     [activeItem, playlist]
   );
-  const previousItem = activeIndex > 0 ? playlist[activeIndex - 1] : undefined;
-  const nextItem = activeIndex >= 0 && activeIndex < playlist.length - 1
-    ? playlist[activeIndex + 1]
-    : undefined;
+  const nextItem = useMemo(
+    () => resolveAdjacentPlaylistItem(playlist, activeItem, "next"),
+    [activeItem, playlist]
+  );
   const playing = playerSnapshot?.status === "playing";
   const buffering = !playerSnapshot
     || playerSnapshot.status === "loading"
@@ -562,12 +564,12 @@ export function RemoteVideoPlayer({
     if (command) void dispatchPlayerCommand(command);
   };
 
-  /** 处理播放器获得焦点后的快捷键。 */
+  /** 在播放器非编辑态处理空格和既有播放快捷键。 */
   const handleKeyDown = (event: ReactKeyboardEvent<HTMLElement>): void => {
-    if (event.target !== event.currentTarget) return;
-    const key = event.key.toLowerCase();
-    if ([" ", "arrowleft", "arrowright", "arrowup", "arrowdown"].includes(key)) event.preventDefault();
-    if (key === " ") togglePlayback();
+    const key = resolvePlayerShortcut(event);
+    if (!key) return;
+    if (["space", "arrowleft", "arrowright", "arrowup", "arrowdown"].includes(key)) event.preventDefault();
+    if (key === "space") togglePlayback();
     if (key === "arrowleft") seekTo(currentTimeSeconds - 10);
     if (key === "arrowright") seekTo(currentTimeSeconds + 10);
     if (key === "arrowup") setPlayerVolume(Math.min(1, volume + 0.05));
@@ -613,6 +615,7 @@ export function RemoteVideoPlayer({
 
   return (
     <main
+      autoFocus
       className={cn("player-page", environment === "desktop" ? "player-page-desktop" : "player-page-remote")}
       data-player-environment={environment}
       data-remote-fullscreen={environment === "remote" ? remoteFullscreenMode ?? undefined : undefined}

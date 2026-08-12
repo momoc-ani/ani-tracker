@@ -4,6 +4,7 @@ use ani_domain::{
     Release, ReleaseResolution, ReleaseSourceConfig, ReleaseSourceMeta, SubtitlePreference,
 };
 use chrono::{Local, SecondsFormat, TimeZone, Utc};
+use data_encoding::BASE32_NOPAD;
 use quick_xml::events::Event;
 use quick_xml::{Reader, XmlVersion};
 use regex::Regex;
@@ -487,6 +488,7 @@ fn map_rss_item(
         .flatten()
         .find(|value| is_torrent_url(value))
         .map(str::to_owned);
+    let info_hash = info_hash.or_else(|| extract_torrent_url_info_hash(torrent_url.as_deref()));
     let source_url = [guid, link]
         .into_iter()
         .flatten()
@@ -590,7 +592,8 @@ fn map_dmhy_row(row: ElementRef<'_>, config: &ReleaseSourceConfig) -> Option<Rel
     if magnet_url.is_none() && torrent_url.is_none() {
         return None;
     }
-    let info_hash = extract_info_hash(magnet_url.as_deref());
+    let info_hash = extract_info_hash(magnet_url.as_deref())
+        .or_else(|| extract_torrent_url_info_hash(torrent_url.as_deref()));
     let topic_id = topic_href
         .split("/topics/view/")
         .nth(1)
@@ -632,7 +635,8 @@ fn map_mikan_row(row: ElementRef<'_>, config: &ReleaseSourceConfig) -> Option<Re
             config.base_url.as_deref().unwrap_or(DEFAULT_MIKAN_BASE_URL),
         )
     });
-    let info_hash = extract_info_hash(magnet_url.as_deref());
+    let info_hash = extract_info_hash(magnet_url.as_deref())
+        .or_else(|| extract_torrent_url_info_hash(torrent_url.as_deref()));
     let text = element_text(row);
     Some(Release {
         id: stable_release_id(
@@ -657,15 +661,18 @@ fn map_mikan_row(row: ElementRef<'_>, config: &ReleaseSourceConfig) -> Option<Re
 
 fn map_mikan_anchor(anchor: ElementRef<'_>, config: &ReleaseSourceConfig) -> Option<Release> {
     let (id, title) = mikan_episode(anchor)?;
+    let torrent_url = absolutize_url(
+        &format!("/Download/{id}.torrent"),
+        config.base_url.as_deref().unwrap_or(DEFAULT_MIKAN_BASE_URL),
+    );
+    let info_hash = extract_torrent_url_info_hash(torrent_url.as_deref());
     Some(Release {
         id: stable_release_id(&config.id, &id),
         title,
         source_id: config.id.clone(),
         source_name: config.name.clone(),
-        torrent_url: absolutize_url(
-            &format!("/Download/{id}.torrent"),
-            config.base_url.as_deref().unwrap_or(DEFAULT_MIKAN_BASE_URL),
-        ),
+        torrent_url,
+        info_hash,
         published_at: now_iso(),
         ..empty_release()
     })
@@ -978,22 +985,63 @@ fn parse_seeders(text: &str) -> Option<i64> {
         .and_then(|value| parse_i64(value.as_str()))
 }
 
-fn normalize_info_hash(value: Option<&str>) -> Option<String> {
-    let normalized = value?.trim().to_lowercase();
+pub(crate) fn normalize_info_hash(value: Option<&str>) -> Option<String> {
+    let normalized = value?.trim();
+    let normalized = normalized
+        .get(..9)
+        .filter(|prefix| prefix.eq_ignore_ascii_case("urn:btih:"))
+        .and_then(|_| normalized.get(9..))
+        .unwrap_or(normalized);
+    if normalized.len() == 40 && normalized.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Some(normalized.to_ascii_lowercase());
+    }
+    if normalized.len() == 32 {
+        if let Ok(bytes) = BASE32_NOPAD.decode(normalized.to_ascii_uppercase().as_bytes()) {
+            if bytes.len() == 20 {
+                return Some(bytes_to_hex(&bytes));
+            }
+        }
+    }
     (normalized.len() >= 8
         && normalized.len() <= 64
         && normalized
             .chars()
             .all(|character| character.is_ascii_alphanumeric()))
-    .then_some(normalized)
+    .then(|| normalized.to_ascii_lowercase())
 }
 
-fn extract_info_hash(magnet_url: Option<&str>) -> Option<String> {
+pub(crate) fn extract_info_hash(magnet_url: Option<&str>) -> Option<String> {
     Regex::new(r"(?i)(?:^|[?&])xt=urn:btih:([a-z0-9]+)")
         .expect("info hash regex")
         .captures(magnet_url?)
         .and_then(|captures| captures.get(1))
-        .map(|value| value.as_str().to_lowercase())
+        .and_then(|value| normalize_info_hash(Some(value.as_str())))
+}
+
+/// 从严格的 40 位十六进制 torrent 文件名提取 BTIH。
+pub(crate) fn extract_torrent_url_info_hash(torrent_url: Option<&str>) -> Option<String> {
+    let url = Url::parse(torrent_url?.trim()).ok()?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return None;
+    }
+    let file_name = url.path_segments()?.next_back()?;
+    let hash = file_name.get(..40)?;
+    let suffix = file_name.get(40..)?;
+    (suffix.eq_ignore_ascii_case(".torrent")
+        && hash.len() == 40
+        && hash.bytes().all(|byte| byte.is_ascii_hexdigit()))
+    .then(|| hash.to_ascii_lowercase())
+}
+
+/// 将种子摘要字节编码为稳定的小写十六进制。
+fn bytes_to_hex(bytes: &[u8]) -> String {
+    let mut result = String::with_capacity(bytes.len() * 2);
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    for byte in bytes {
+        result.push(HEX[(byte >> 4) as usize] as char);
+        result.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    result
 }
 
 fn build_magnet_url(info_hash: Option<&str>, title: &str) -> Option<String> {
@@ -1172,8 +1220,8 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        parse_acgnx_api_response, parse_acgnx_html, parse_anibt_rss, parse_dmhy_list,
-        parse_mikan_release_list, parse_mikan_subgroups, parse_rss_releases,
+        extract_torrent_url_info_hash, parse_acgnx_api_response, parse_acgnx_html, parse_anibt_rss,
+        parse_dmhy_list, parse_mikan_release_list, parse_mikan_subgroups, parse_rss_releases,
         parse_torznab_releases,
     };
 
@@ -1205,6 +1253,29 @@ mod tests {
         );
         assert_eq!(releases[0].resolution, Some(ReleaseResolution::P1080));
 
+        let mikan_hash = "1a58b0c190ad7d33688cf570fc3c6c05f983977c";
+        let releases = parse_mikan_release_list(
+            &format!(
+                r#"<table><tr><td><a href="/Home/Episode/{mikan_hash}">[Nix-Raws] LV999的村民 S01E06 [1080p]</a></td></tr></table>"#
+            ),
+            &mikan,
+        );
+        assert_eq!(releases[0].info_hash.as_deref(), Some(mikan_hash));
+        assert_eq!(
+            releases[0].torrent_url.as_deref(),
+            Some("https://mikanani.me/Download/1a58b0c190ad7d33688cf570fc3c6c05f983977c.torrent")
+        );
+        assert_eq!(
+            extract_torrent_url_info_hash(Some("https://mikanani.me/Download/123.torrent")),
+            None
+        );
+        assert_eq!(
+            extract_torrent_url_info_hash(Some(
+                "https://example.test/file.torrent?hash=1a58b0c190ad7d33688cf570fc3c6c05f983977c"
+            )),
+            None
+        );
+
         let acgnx = source("acgnx", "ACGNX", "https://share.acgnx.se/");
         let releases = parse_acgnx_html(
             r#"<table><tr><td><a href="/show-42.html">[Sakurato] 测试番 - 04 [720p][AVC]</a></td><td><a href="magnet:?xt=urn:btih:ABC123DEF456">磁力</a></td><td><a href="/download/42.torrent">下载</a></td><td>850 MB seeders 9</td></tr></table>"#,
@@ -1231,6 +1302,18 @@ mod tests {
             releases[0].subtitle_languages,
             vec![SubtitleLanguage::Chs, SubtitleLanguage::Cht]
         );
+
+        let mikan_hash = "1a58b0c190ad7d33688cf570fc3c6c05f983977c";
+        let mikan_rss = source("mikan", "蜜柑计划 RSS", "https://mikanani.me/");
+        let releases = parse_rss_releases(
+            &format!(
+                r#"<rss><channel><item><title>[Nix-Raws] LV999的村民 S01E06 [1080p]</title><link>https://mikanani.me/Home/Episode/{mikan_hash}</link><enclosure url="https://mikanani.me/Download/20260730/{mikan_hash}.torrent"/></item></channel></rss>"#
+            ),
+            &mikan_rss,
+            Some("https://mikanani.me/RSS/Bangumi"),
+        )
+        .expect("parse Mikan RSS");
+        assert_eq!(releases[0].info_hash.as_deref(), Some(mikan_hash));
 
         let torznab = source("torznab", "Torznab", "https://indexer.test/");
         let page = parse_torznab_releases(

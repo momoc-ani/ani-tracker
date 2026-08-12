@@ -4,6 +4,10 @@ import {
   inferMediaContent,
   isSpecialMediaContent
 } from "@shared/media-content";
+import {
+  resolveAdjacentEpisodeItem,
+  type EpisodeNavigationDirection
+} from "@shared/player-playlist-policy";
 
 const VIDEO_EXTENSIONS = new Set([
   ".avi", ".flv", ".m2ts", ".m4v", ".mkv", ".mov", ".mp4", ".mpeg",
@@ -63,6 +67,15 @@ export function resolveInitialPlaylistItem(
 ): RemotePlaylistItem | undefined {
   return items.find((item) => item.task.id === taskId && item.fileIndex === fileIndex)
     ?? items.find((item) => item.task.id === taskId);
+}
+
+/** 返回严格相邻集的首选版本，同集其他字幕组不会成为上一集或下一集。 */
+export function resolveAdjacentPlaylistItem(
+  items: RemotePlaylistItem[],
+  activeItem: RemotePlaylistItem | null,
+  direction: EpisodeNavigationDirection
+): RemotePlaylistItem | undefined {
+  return resolveAdjacentEpisodeItem(items, activeItem, direction);
 }
 
 /** 返回播放器 URL 中合法的文件索引。 */

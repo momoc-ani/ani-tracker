@@ -223,6 +223,7 @@ CREATE TABLE IF NOT EXISTS request_circuit_state (
   last_request_at TEXT,
   failure_count INTEGER NOT NULL DEFAULT 0,
   backoff_until TEXT,
+  network_context TEXT,
   updated_at TEXT NOT NULL
 );
 

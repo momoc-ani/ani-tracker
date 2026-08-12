@@ -1,12 +1,15 @@
-import { ChevronDown, ChevronRight, Download, FolderOpen, Play } from "lucide-react";
+import { ChevronDown, ChevronRight, Download, FolderOpen, Play, Trash2 } from "lucide-react";
 import { useState } from "react";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { Checkbox } from "@/components/ui/checkbox";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
 import { Empty, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle } from "@/components/ui/empty";
+import { Field, FieldLabel } from "@/components/ui/field";
 import { Progress } from "@/components/ui/progress";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { ConfirmActionDialog } from "@/components/confirm-action-dialog";
 import { ReleaseMetadataBadges } from "@/components/release-metadata-badges";
 import { WorkbenchSheet } from "@/components/workbench-sheet";
 import { appApi } from "@/lib/api";
@@ -32,6 +35,7 @@ interface AnimeDownloadTaskSheetProps {
   onClose: () => void;
   onFilterChange: (filter: AnimeDownloadDetailFilter) => void;
   onPlayMedia?: (target: MediaPlaybackTarget) => Promise<void>;
+  onRemoveTask?: (taskId: string, deleteFiles: boolean) => Promise<void>;
 }
 
 const filterOptions: Array<{ value: AnimeDownloadDetailFilter; label: string }> = [
@@ -62,17 +66,19 @@ export function AnimeDownloadTaskSheet({
   fansubNames,
   onClose,
   onFilterChange,
-  onPlayMedia
+  onPlayMedia,
+  onRemoveTask
 }: AnimeDownloadTaskSheetProps) {
   const titleDisplay = resolveAnimeTitleDisplay(detail.item.anime);
   const animeTasks = getAnimeDownloadTasks(downloadTasks, detail.item.anime.id);
   const visibleTasks = filterDownloadTasks(animeTasks, detail.filter);
+  const [removeTarget, setRemoveTarget] = useState<DownloadTask | null>(null);
+  const [deleteFilesOnRemove, setDeleteFilesOnRemove] = useState(false);
   const counts = {
     all: animeTasks.length,
     active: animeTasks.filter(isActiveDownload).length,
     completed: animeTasks.filter(isCompletedDownload).length
   };
-
   return (
     <WorkbenchSheet
       className="sm:max-w-2xl"
@@ -102,6 +108,10 @@ export function AnimeDownloadTaskSheet({
               task={task}
               fansubNames={fansubNames}
               onPlayMedia={onPlayMedia}
+              showLocalDetails={detail.filter !== "completed"}
+              onRequestRemove={detail.filter === "completed" && onRemoveTask
+                ? () => setRemoveTarget(task)
+                : undefined}
             />
           ))}
         </div>
@@ -113,6 +123,41 @@ export function AnimeDownloadTaskSheet({
             <EmptyDescription>当前筛选下没有下载任务。</EmptyDescription>
           </EmptyHeader>
         </Empty>
+      )}
+      {onRemoveTask && (
+        <ConfirmActionDialog
+          confirmLabel={deleteFilesOnRemove ? "删除任务和文件" : "移除任务"}
+          content={
+            <Field className="rounded-md border p-3" orientation="horizontal">
+              <Checkbox
+                checked={deleteFilesOnRemove}
+                id="my-anime-delete-completed-files"
+                onCheckedChange={(checked) => setDeleteFilesOnRemove(checked === true)}
+              />
+              <FieldLabel className="min-w-0 cursor-pointer font-normal" htmlFor="my-anime-delete-completed-files">
+                <span className="block text-sm font-medium">同时删除原文件</span>
+                <span className="mt-1 block text-xs text-muted-foreground">文件删除后无法从应用内恢复。</span>
+              </FieldLabel>
+            </Field>
+          }
+          description={removeTarget
+            ? deleteFilesOnRemove
+              ? `下载任务「${removeTarget.name}」及其原文件将被永久删除。`
+              : `下载任务「${removeTarget.name}」将从任务列表中移除，已下载文件会保留。`
+            : "该下载任务将从任务列表中移除。"}
+          onConfirm={async () => {
+            if (!removeTarget) return;
+            await onRemoveTask(removeTarget.id, deleteFilesOnRemove);
+          }}
+          onOpenChange={(open) => {
+            if (!open) {
+              setRemoveTarget(null);
+              setDeleteFilesOnRemove(false);
+            }
+          }}
+          open={Boolean(removeTarget)}
+          title="确认移除已完成资源？"
+        />
       )}
     </WorkbenchSheet>
   );
@@ -132,11 +177,15 @@ export function isCompletedDownload(task: DownloadTask): boolean {
 function DownloadTaskCard({
   task,
   fansubNames,
-  onPlayMedia
+  onPlayMedia,
+  showLocalDetails,
+  onRequestRemove
 }: {
   task: DownloadTask;
   fansubNames: Map<string, string>;
   onPlayMedia?: (target: MediaPlaybackTarget) => Promise<void>;
+  showLocalDetails: boolean;
+  onRequestRemove?: () => void;
 }) {
   const runtime = getAppRuntime();
   const mobileRuntime = runtime === "android" || runtime === "ios";
@@ -196,13 +245,15 @@ function DownloadTaskCard({
 
       <Progress className="mt-3" value={task.progress} />
 
-      <dl className="mt-4 grid grid-cols-1 gap-x-4 gap-y-2 text-xs sm:grid-cols-2">
-        <DownloadTaskMeta className="sm:col-span-2" label="保存路径" value={task.savePath} />
-        <DownloadTaskMeta label="创建时间" value={formatDateTime(task.createdAt)} />
-        <DownloadTaskMeta label="完成时间" value={formatDateTime(task.completedAt)} />
-        <DownloadTaskMeta label="下载速度" value={formatSpeed(task.downloadSpeed)} />
-        <DownloadTaskMeta label="上传速度" value={formatSpeed(task.uploadSpeed)} />
-      </dl>
+      {showLocalDetails && (
+        <dl className="mt-4 grid grid-cols-1 gap-x-4 gap-y-2 text-xs sm:grid-cols-2">
+          <DownloadTaskMeta className="sm:col-span-2" label="保存路径" value={task.savePath} />
+          <DownloadTaskMeta label="创建时间" value={formatDateTime(task.createdAt)} />
+          <DownloadTaskMeta label="完成时间" value={formatDateTime(task.completedAt)} />
+          <DownloadTaskMeta label="下载速度" value={formatSpeed(task.downloadSpeed)} />
+          <DownloadTaskMeta label="上传速度" value={formatSpeed(task.uploadSpeed)} />
+        </dl>
+      )}
 
       {fileActionError && (
         <Alert className="mt-4" variant="destructive">
@@ -267,37 +318,50 @@ function DownloadTaskCard({
         </Collapsible>
       )}
 
-      {!isCollection && isCompletedDownload(task) && (
+      {isCompletedDownload(task) && (
         <div className="mt-4 flex flex-col gap-3 border-t pt-3 sm:flex-row sm:items-center sm:justify-between">
-          <div className={cn(
-            "grid w-full gap-2 sm:ml-auto sm:flex sm:w-auto",
-            supportsReveal ? "grid-cols-2" : "grid-cols-1"
-          )}>
+          {onRequestRemove && (
             <Button
-              aria-label="播放已完成视频"
-              className="h-11 px-2 text-xs sm:h-8"
-              disabled={!playableFilePath || activeFileAction !== null}
-              onClick={() => void runFileAction("play")}
-              title={playableFilePath ? "播放已完成视频" : "未找到可播放的视频文件"}
-              variant="outline"
+              className="w-full sm:mr-auto sm:w-auto"
+              onClick={onRequestRemove}
+              size="compact"
+              variant="destructive"
             >
-              <Play data-icon="inline-start" />
-              播放
+              <Trash2 data-icon="inline-start" />
+              删除资源
             </Button>
-            {supportsReveal && (
+          )}
+          {!isCollection && (
+            <div className={cn(
+              "grid w-full gap-2 sm:ml-auto sm:flex sm:w-auto",
+              supportsReveal ? "grid-cols-2" : "grid-cols-1"
+            )}>
               <Button
-                aria-label={androidRuntime ? "打开系统目录" : "打开文件目录"}
+                aria-label="播放已完成视频"
                 className="h-11 px-2 text-xs sm:h-8"
-                disabled={!revealFilePath || activeFileAction !== null}
-                onClick={() => void runFileAction("reveal")}
-                title={revealFilePath ? (androidRuntime ? "打开系统目录" : "打开文件所在目录") : "未找到已完成文件"}
+                disabled={!playableFilePath || activeFileAction !== null}
+                onClick={() => void runFileAction("play")}
+                title={playableFilePath ? "播放已完成视频" : "未找到可播放的视频文件"}
                 variant="outline"
               >
-                <FolderOpen data-icon="inline-start" />
-                {androidRuntime ? "系统目录" : "打开目录"}
+                <Play data-icon="inline-start" />
+                播放
               </Button>
-            )}
-          </div>
+              {supportsReveal && (
+                <Button
+                  aria-label={androidRuntime ? "打开系统目录" : "打开文件目录"}
+                  className="h-11 px-2 text-xs sm:h-8"
+                  disabled={!revealFilePath || activeFileAction !== null}
+                  onClick={() => void runFileAction("reveal")}
+                  title={revealFilePath ? (androidRuntime ? "打开系统目录" : "打开文件所在目录") : "未找到已完成文件"}
+                  variant="outline"
+                >
+                  <FolderOpen data-icon="inline-start" />
+                  {androidRuntime ? "系统目录" : "打开目录"}
+                </Button>
+              )}
+            </div>
+          )}
         </div>
       )}
     </article>

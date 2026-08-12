@@ -29,6 +29,8 @@ import type {
   AppWindowState,
   AutomationRunResult,
   AutomationSchedulerStatus,
+  BangumiBrowseQuery,
+  BangumiBrowseResult,
   ConfirmAnimeSourceBindingInput,
   DesktopPlayerWindowDragInput,
   DesktopPlayerWindowInput,
@@ -146,6 +148,10 @@ export interface AppClient {
   listAnimeCatalog(year?: number, month?: number): Promise<Anime[]>;
   /** 搜索本地与在线番剧目录。 */
   searchAnimeCatalog(keyword: string): Promise<AnimeDiscoverySearchResult>;
+  /** 直接在线浏览 Bangumi，不读取或写入季度目录缓存。 */
+  browseBangumiAnime(query: BangumiBrowseQuery): Promise<BangumiBrowseResult>;
+  /** 保存 Bangumi 追番并在后台补全 AniList、Mikan 元数据。 */
+  followBangumiAnime(item: MyAnime): Promise<MyAnime[]>;
   /** 采集指定月份番剧。 */
   collectAnimeMonth(query: AnimeDiscoveryQuery): Promise<AnimeDiscoveryResult>;
   /** 采集指定季度番剧。 */

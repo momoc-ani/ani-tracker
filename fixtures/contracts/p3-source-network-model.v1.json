@@ -27,7 +27,8 @@
       "requestHost": "indexer.example",
       "lastRequestAt": "2026-07-25T00:00:00.000Z",
       "failureCount": 2,
-      "backoffUntil": "2026-07-25T00:02:00.000Z"
+      "backoffUntil": "2026-07-25T00:02:00.000Z",
+      "networkContext": "fixture-network"
     }
   }
 }

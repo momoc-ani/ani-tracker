@@ -102,6 +102,27 @@ impl DownloadTaskService {
         Ok(filter_tasks_by_engine(self.store.list_downloads()?, engine))
     }
 
+    /// 读取任务创建时所属的下载引擎，供宿主准备对应引擎生命周期。
+    pub fn task_engine(&self, task_id: &str) -> Result<TorrentEngineKind, DownloadServiceError> {
+        Ok(self.require_task(task_id)?.engine)
+    }
+
+    /// 按单集标识或番剧集数读取当前持久化任务，供提交前幂等复查。
+    pub fn find_episode_download(
+        &self,
+        anime_id: &str,
+        episode_id: &str,
+        episode_no: f64,
+    ) -> Result<Option<DownloadTask>, DownloadServiceError> {
+        Ok(self.store.list_downloads()?.into_iter().find(|task| {
+            task.anime_id.as_deref() == Some(anime_id)
+                && (task.episode_id.as_deref() == Some(episode_id)
+                    || task
+                        .episode_no
+                        .is_some_and(|number| (number - episode_no).abs() < 1e-9))
+        }))
+    }
+
     /// 通过指定引擎添加任务，附加业务元数据后原子持久化。
     pub async fn add(
         &self,
@@ -204,9 +225,8 @@ impl DownloadTaskService {
         &self,
         task_id: &str,
         delete_files: bool,
-        active_engine: &TorrentEngineKind,
     ) -> Result<Vec<DownloadTask>, DownloadServiceError> {
-        let task = self.require_active_task(task_id, active_engine)?;
+        let task = self.require_task(task_id)?;
         let engine = self.registry.require(&task.engine)?;
         match engine.remove(engine_task_id(&task), delete_files).await {
             Ok(()) => {}
@@ -225,10 +245,16 @@ impl DownloadTaskService {
                 ));
             }
         }
-        Ok(filter_tasks_by_engine(
+        let tasks = filter_tasks_by_engine(
             self.store.remove_download_task(&task.id, delete_files)?,
             &task.engine,
-        ))
+        );
+        log::info!(
+            "下载任务已从原属引擎移除：task_id={}, engine={:?}, delete_files={delete_files}",
+            task.id,
+            task.engine
+        );
+        Ok(tasks)
     }
 
     /// 更新文件优先级并同步本地选择状态。

@@ -1,5 +1,6 @@
 import { formatSubtitleLanguages, formatVideoBitDepth, getSubtitleCoverage, resolveSubtitleLanguages } from "@shared/release-metadata";
 import { classifyAnimeRelease } from "@shared/anime-release-search";
+import { compareReleaseEpisodeDescending, getReleaseEpisodeContentKey } from "@shared/release-identity";
 import type { MyAnime, Release } from "@shared/domain";
 
 export interface ReleaseVersionFamily {
@@ -14,10 +15,6 @@ export interface ReleaseEpisodeFamilyGroup {
   key: string;
   label: string;
   families: ReleaseVersionFamily[];
-}
-
-export interface ReleaseVersionGroupingOptions {
-  preserveInputOrder?: boolean;
 }
 
 /** 按 episode 将资源族归组。 */
@@ -49,8 +46,7 @@ export function isCollectionRelease(release: Release): boolean {
 export function groupReleaseVersions(
   releases: Release[],
   preferences: MyAnime,
-  selections: Record<string, string> = {},
-  options: ReleaseVersionGroupingOptions = {}
+  selections: Record<string, string> = {}
 ): ReleaseVersionFamily[] {
   const families = new Map<string, ReleaseVersionFamily>();
   for (const release of releases) {
@@ -62,18 +58,13 @@ export function groupReleaseVersions(
 
   const groupedFamilies = [...families.values()]
     .map((family) => {
-      const ordered = options.preserveInputOrder
-        ? [...family.releases]
-        : sortReleaseVersions(family.releases, preferences);
+      const ordered = sortReleaseVersions(family.releases, preferences);
       const selectedRelease = family.releases.find((item) => releaseKey(item) === selections[family.key]) ?? ordered[0] ?? family.releases[0];
       return { ...family, releases: ordered, selectedRelease };
     });
-  if (options.preserveInputOrder) {
-    return groupedFamilies;
-  }
 
   return groupedFamilies.sort((left, right) => {
-    const episodeDelta = releaseEpisodeOrder(right.selectedRelease) - releaseEpisodeOrder(left.selectedRelease);
+    const episodeDelta = compareReleaseEpisodeDescending(left.selectedRelease, right.selectedRelease);
     return episodeDelta || right.selectedRelease.publishedAt.localeCompare(left.selectedRelease.publishedAt);
   });
 }
@@ -93,7 +84,7 @@ export function getReleaseVersionLabel(release: Release, preferences: MyAnime, a
 
 /** 生成稳定的资源主键，用于批量选择和任务关联。 */
 export function releaseKey(release: Release): string {
-  return release.infoHash ?? release.magnetUrl ?? release.torrentUrl ?? `${release.sourceId}:${release.title}`;
+  return getReleaseEpisodeContentKey(release);
 }
 
 /** 判断资源是否可被批量选择下载。 */
@@ -151,10 +142,6 @@ function getReleaseEpisodeLabel(release: Release): string {
   if (release.episodeRange) return `第 ${formatEpisodeNumber(release.episodeRange.start)}-${formatEpisodeNumber(release.episodeRange.end)} 集`;
   if (release.episodeNo === undefined) return release.contentKind === "batch" ? "合集" : "未识别集数";
   return `第 ${formatEpisodeNumber(release.episodeNo)} 集`;
-}
-
-function releaseEpisodeOrder(release: Release): number {
-  return release.episodeRange?.end ?? release.episodeNo ?? -1;
 }
 
 function sortReleaseVersions(releases: Release[], preferences: MyAnime): Release[] {

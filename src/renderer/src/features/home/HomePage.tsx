@@ -16,6 +16,7 @@ import { formatDuration, formatPercent, formatSpeed } from "@/lib/format";
 import { getAppCapabilities } from "@/lib/runtime";
 import { useAsyncData } from "@/lib/use-async-data";
 import type { AutomationSchedulerStatus } from "@shared/contracts";
+import { localizeDashboardAnimeTitles } from "@shared/dashboard-title";
 import type { AnimeStatus, MediaFile, MyAnime } from "@shared/domain";
 import type { MediaPlaybackTarget } from "@shared/player-selection";
 
@@ -31,7 +32,11 @@ async function loadHomeData() {
       return [];
     })
   ]);
-  return { dashboard, myAnime, notifications };
+  return {
+    dashboard: localizeDashboardAnimeTitles(dashboard, myAnime),
+    myAnime,
+    notifications
+  };
 }
 
 /** 渲染首页追番、下载与提醒概览。 */

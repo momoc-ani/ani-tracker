@@ -47,6 +47,7 @@ interface AnimeDetailOrigin {
 
 interface AnimeDetailState {
   animeId: string;
+  previewAnime?: Anime;
   origin: AnimeDetailOrigin;
 }
 
@@ -79,11 +80,12 @@ function RemoteApplication() {
   discoveryScheduleRef.current = discoverySchedule;
 
   /** 记录来源上下文并进入番剧详情。 */
-  function openAnimeDetail(animeId: string): void {
+  function openAnimeDetail(animeId: string, previewAnime?: Anime): void {
     const originItem = remoteNavItems.find((item) => item.id === activePage);
     window.history.pushState({ aniView: "animeDetail", animeId }, "");
     setDetailView({
       animeId,
+      previewAnime,
       origin: {
         pageId: activePage,
         label: discoverySchedule ? "新番时间表" : originItem?.label ?? "上一页",
@@ -247,6 +249,7 @@ function RemoteApplication() {
           onBack={() => window.history.back()}
           onOpenLibraryAction={openLibraryAction}
           onOpenReleaseSearch={openReleaseSearch}
+          previewAnime={detailView.previewAnime}
           sourceLabel={detailView.origin.label}
         />
       )}
@@ -259,7 +262,7 @@ function renderRemotePage(page: RemotePageId, options: {
   myAnimeIntent: MyAnimePageIntent | null;
   onDiscoverySchedule: (target: SeasonTarget) => void;
   onMyAnimeIntentHandled: () => void;
-  onOpenAnimeDetail: (animeId: string) => void;
+  onOpenAnimeDetail: (animeId: string, previewAnime?: Anime) => void;
   onOpenDownloads: () => void;
   onPlayMedia: (target: MediaPlaybackTarget) => Promise<void>;
   releaseSearchIntent: { keyword: string; key: number } | null;

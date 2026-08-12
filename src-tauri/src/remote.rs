@@ -419,6 +419,17 @@ impl RemoteRpcHandler for TauriRemoteRpcHandler {
                 })
                 .await
             }
+            "followBangumiAnime" => {
+                let item: MyAnime = value_arg(&args, 0)?;
+                command_value(
+                    crate::commands::data::follow_bangumi_anime(
+                        item,
+                        self.app.state(),
+                        self.app.state(),
+                    )
+                    .await,
+                )
+            }
             "removeMyAnime" => {
                 let id = string_arg(&args, 0)?;
                 self.query(move |repository| repository.remove_my_anime(&id))
@@ -459,6 +470,17 @@ impl RemoteRpcHandler for TauriRemoteRpcHandler {
                 command_value(
                     crate::commands::data::search_anime_catalog(
                         keyword,
+                        self.app.state(),
+                        self.app.state(),
+                    )
+                    .await,
+                )
+            }
+            "browseBangumiAnime" => {
+                let query = value_arg(&args, 0)?;
+                command_value(
+                    crate::commands::data::browse_bangumi_anime(
+                        query,
                         self.app.state(),
                         self.app.state(),
                     )
@@ -688,6 +710,7 @@ impl RemoteRpcHandler for TauriRemoteRpcHandler {
             }
             "removeDownload" => {
                 let id = string_arg(&args, 0)?;
+                let delete_files: bool = value_arg(&args, 1)?;
                 let settings = self.downloads.settings()?;
                 let engine = self
                     .downloads
@@ -695,8 +718,7 @@ impl RemoteRpcHandler for TauriRemoteRpcHandler {
                     .map_err(|error| error.to_string())?;
                 serde_json::to_value(
                     self.downloads
-                        .service()
-                        .remove(&id, false, &engine)
+                        .remove_task(&id, delete_files, &engine)
                         .await
                         .map_err(|error| error.to_string())?,
                 )

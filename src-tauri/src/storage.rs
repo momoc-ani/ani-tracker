@@ -483,7 +483,7 @@ fn default_release_sources() -> Vec<ReleaseSourceSeed> {
             "rss",
             false,
             true,
-            1_500,
+            800,
             None,
             Some("https://mikanani.me/RSS/Bangumi"),
             &["anime", "rss"],
@@ -494,7 +494,7 @@ fn default_release_sources() -> Vec<ReleaseSourceSeed> {
             "site_adapter",
             false,
             true,
-            1_500,
+            800,
             Some("https://share.dmhy.org/"),
             None,
             &["anime", "bt"],
@@ -505,7 +505,7 @@ fn default_release_sources() -> Vec<ReleaseSourceSeed> {
             "site_adapter",
             false,
             true,
-            1_500,
+            800,
             Some("https://mikanani.me/"),
             None,
             &["anime", "bt", "mikan"],
@@ -527,7 +527,7 @@ fn default_release_sources() -> Vec<ReleaseSourceSeed> {
             "site_adapter",
             false,
             true,
-            1_500,
+            800,
             Some("https://share.acgnx.se/"),
             None,
             &["anime", "bt", "acgnx"],
@@ -538,7 +538,7 @@ fn default_release_sources() -> Vec<ReleaseSourceSeed> {
             "site_adapter",
             false,
             true,
-            3_000,
+            500,
             Some("https://nyaa.si/"),
             None,
             &["anime", "bt", "nyaa", "rss"],
@@ -549,7 +549,7 @@ fn default_release_sources() -> Vec<ReleaseSourceSeed> {
             "site_adapter",
             false,
             true,
-            3_000,
+            500,
             Some("https://acg.rip/"),
             None,
             &["anime", "bt", "acg-rip", "rss"],
@@ -591,6 +591,7 @@ fn path_text(path: &Path) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::path::PathBuf;
 
     #[cfg(not(target_os = "android"))]
@@ -633,14 +634,17 @@ mod tests {
         );
         let release_sources = default_release_sources();
         assert_eq!(release_sources.len(), 7);
-        assert_eq!(
-            release_sources
-                .iter()
-                .find(|source| source.id == "anibt")
-                .expect("AniBT 默认下载源")
-                .request_interval_ms,
-            500
-        );
+        let source_intervals = release_sources
+            .iter()
+            .map(|source| (source.id.as_str(), source.request_interval_ms))
+            .collect::<HashMap<_, _>>();
+        assert_eq!(source_intervals["mikan"], 800);
+        assert_eq!(source_intervals["dmhy"], 800);
+        assert_eq!(source_intervals["mikan-site"], 800);
+        assert_eq!(source_intervals["anibt"], 500);
+        assert_eq!(source_intervals["acgnx"], 800);
+        assert_eq!(source_intervals["nyaa"], 500);
+        assert_eq!(source_intervals["acg-rip"], 500);
     }
 
     /// 验证旧 Electron 数据库候选稳定去重且不包含活动库。

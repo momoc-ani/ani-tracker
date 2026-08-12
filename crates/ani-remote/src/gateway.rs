@@ -381,7 +381,13 @@ async fn handle_request(
     peer: SocketAddr,
     request: Request,
 ) -> Result<Response<Body>, GatewayHttpError> {
-    validate_host_origin(core, request.headers()).await?;
+    let host = request_authority(&request).map(str::to_owned);
+    let origin = request
+        .headers()
+        .get(ORIGIN)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    validate_host_origin(core, host.as_deref(), origin.as_deref()).await?;
     let method = request.method().clone();
     let path = request.uri().path().to_owned();
     if method == Method::GET && path == "/api/health" {
@@ -615,12 +621,12 @@ async fn handle_request(
 
 async fn validate_host_origin(
     core: &GatewayCore,
-    headers: &HeaderMap,
+    host: Option<&str>,
+    origin: Option<&str>,
 ) -> Result<(), GatewayHttpError> {
     let runtime = core.runtime.read().await;
     let mut allowed = vec!["127.0.0.1".to_owned(), "localhost".to_owned()];
     allowed.extend(runtime.addresses.iter().map(ToString::to_string));
-    let host = headers.get(HOST).and_then(|value| value.to_str().ok());
     if !is_trusted_host(host, runtime.port, &allowed, &core.trusted_origins) {
         return Err(GatewayHttpError::new(
             403,
@@ -628,7 +634,6 @@ async fn validate_host_origin(
             "请求 Host 不受信任",
         ));
     }
-    let origin = headers.get(ORIGIN).and_then(|value| value.to_str().ok());
     if !is_trusted_origin(
         origin,
         runtime.protocol,
@@ -643,6 +648,20 @@ async fn validate_host_origin(
         ));
     }
     Ok(())
+}
+
+/// 返回 HTTP/2 `:authority`，并为 HTTP/1.1 请求回退读取 `Host`。
+fn request_authority(request: &Request) -> Option<&str> {
+    request
+        .uri()
+        .authority()
+        .map(|authority| authority.as_str())
+        .or_else(|| {
+            request
+                .headers()
+                .get(HOST)
+                .and_then(|value| value.to_str().ok())
+        })
 }
 
 async fn authenticate(
@@ -1396,6 +1415,43 @@ mod tests {
         ))
         .expect("named media route");
         assert_eq!(named.asset_name, "测试 SP01.mkv");
+    }
+
+    /// 验证 HTTPS 的 HTTP/2 authority 与 HTTP/1.1 Host 都进入同一白名单校验。
+    #[test]
+    fn resolves_http2_authority_and_http1_host() {
+        let http2_request = Request::builder()
+            .uri("https://192.168.60.36:18083/api/health")
+            .body(Body::empty())
+            .expect("HTTP/2 request");
+        assert_eq!(
+            request_authority(&http2_request),
+            Some("192.168.60.36:18083")
+        );
+
+        let http1_request = Request::builder()
+            .uri("/api/health")
+            .header(HOST, "192.168.60.36:18083")
+            .body(Body::empty())
+            .expect("HTTP/1.1 request");
+        assert_eq!(
+            request_authority(&http1_request),
+            Some("192.168.60.36:18083")
+        );
+
+        let allowed = vec!["192.168.60.36".to_owned()];
+        assert!(is_trusted_host(
+            request_authority(&http2_request),
+            18_083,
+            &allowed,
+            &[]
+        ));
+        assert!(is_trusted_host(
+            request_authority(&http1_request),
+            18_083,
+            &allowed,
+            &[]
+        ));
     }
 
     /// 验证真实 HTTP 监听器上的 PWA、Host 防护、配对、RPC、媒体会话和 Range 闭环。

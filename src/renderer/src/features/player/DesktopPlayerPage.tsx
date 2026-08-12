@@ -23,9 +23,11 @@ import {
   type PlayerSnapshot,
   type PlayerSubtitleScale
 } from "@shared/player-contract";
+import { resolvePlayerShortcut } from "@shared/player-shortcuts";
 import {
   buildRemotePlaylist,
   playlistItemLabel,
+  resolveAdjacentPlaylistItem,
   resolveInitialPlaylistItem,
   type RemotePlaylistItem
 } from "@/features/player/playback-list-model";
@@ -180,14 +182,14 @@ function DesktopVlcControls({
   const [panelOpen, setPanelOpen] = useState(false);
   const windowDrag = useDesktopWindowDrag();
 
-  const activeIndex = useMemo(
-    () => activeItem ? playlist.findIndex((item) => item.id === activeItem.id) : -1,
+  const previousItem = useMemo(
+    () => resolveAdjacentPlaylistItem(playlist, activeItem, "previous"),
     [activeItem, playlist]
   );
-  const previousItem = activeIndex > 0 ? playlist[activeIndex - 1] : undefined;
-  const nextItem = activeIndex >= 0 && activeIndex < playlist.length - 1
-    ? playlist[activeIndex + 1]
-    : undefined;
+  const nextItem = useMemo(
+    () => resolveAdjacentPlaylistItem(playlist, activeItem, "next"),
+    [activeItem, playlist]
+  );
   const playing = snapshot?.status === "playing";
   const buffering = !snapshot || snapshot.status === "loading" || snapshot.status === "buffering";
   const animeTitle = anime?.title ?? activeItem?.task.animeTitle ?? "Ani Tracker";
@@ -431,12 +433,12 @@ function DesktopVlcControls({
     if (command) void dispatchCommand(command);
   };
 
-  /** 快捷键只在播放器表面自身获得焦点时生效。 */
+  /** 在播放器非编辑态处理空格和既有播放快捷键。 */
   const handleKeyDown = (event: ReactKeyboardEvent<HTMLElement>): void => {
-    if (event.target !== event.currentTarget) return;
-    const key = event.key.toLowerCase();
-    if ([" ", "arrowleft", "arrowright", "arrowup", "arrowdown"].includes(key)) event.preventDefault();
-    if (key === " ") togglePlayback();
+    const key = resolvePlayerShortcut(event);
+    if (!key) return;
+    if (["space", "arrowleft", "arrowright", "arrowup", "arrowdown"].includes(key)) event.preventDefault();
+    if (key === "space") togglePlayback();
     if (key === "arrowleft") seekTo((snapshot?.positionSeconds ?? 0) - 10);
     if (key === "arrowright") seekTo((snapshot?.positionSeconds ?? 0) + 10);
     if (key === "arrowup") setVolume(Math.min(1, (snapshot?.volume ?? 0.7) + 0.05));
@@ -481,6 +483,7 @@ function DesktopVlcControls({
 
   return (
     <main
+      autoFocus
       className="player-page player-page-desktop"
       data-player-environment="desktop"
       onClick={handleSurfaceClick}

@@ -10,7 +10,7 @@ use ani_domain::{
 };
 use ani_repository::RepositoryResult;
 use ani_sources::{
-    evaluate_automatic_download, normalize_fansub_name, rank_releases,
+    evaluate_automatic_download, normalize_fansub_name, parse_release_title, rank_releases,
     release_satisfies_subtitle_requirement, ReleaseSearchService, ReleaseSearchStore, SourceError,
     SourceNetworkService,
 };
@@ -23,11 +23,12 @@ const RELEASE_SEARCH_LIMIT: usize = 80;
 const COMPLETED_CACHE_TTL_MS: u64 = 7 * 24 * 60 * 60 * 1_000;
 
 /// 自动扫描用于判重的下载任务最小快照。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct AutomationDownloadReference {
     pub task_id: String,
     pub anime_id: Option<String>,
     pub episode_id: Option<String>,
+    pub episode_no: Option<f64>,
 }
 
 /// 自动下载执行器接收的完整业务上下文。
@@ -145,11 +146,7 @@ impl AutomationRunService {
             return Ok(result);
         }
 
-        let downloads = store.list_automation_downloads()?;
-        let mut download_keys = downloads
-            .into_iter()
-            .filter_map(|task| Some((task.anime_id?, task.episode_id?)))
-            .collect::<HashSet<_>>();
+        let mut downloads = store.list_automation_downloads()?;
         log::info!(
             "Rust 自动扫描开始：anime_count={}, fallback={}, candidate_count={}",
             anime_items.len(),
@@ -225,7 +222,10 @@ impl AutomationRunService {
 
             for episode in actionable {
                 result.checked_episodes += 1;
-                if download_keys.contains(&(anime.anime.id.clone(), episode.id.clone())) {
+                if downloads
+                    .iter()
+                    .any(|task| automation_download_matches(task, &anime.anime.id, &episode))
+                {
                     push_episode_skip(&mut result, &anime, &episode, "已有下载任务");
                     continue;
                 }
@@ -243,7 +243,12 @@ impl AutomationRunService {
                     .await
                 {
                     Ok(EpisodeScanOutcome::Downloaded(item)) => {
-                        download_keys.insert((anime.anime.id.clone(), episode.id.clone()));
+                        downloads.push(AutomationDownloadReference {
+                            task_id: item.download_task_id.clone(),
+                            anime_id: Some(anime.anime.id.clone()),
+                            episode_id: Some(episode.id.clone()),
+                            episode_no: Some(episode.episode_no),
+                        });
                         result.downloaded.push(item);
                     }
                     Ok(EpisodeScanOutcome::Skipped(reason)) => {
@@ -382,7 +387,22 @@ impl AutomationRunService {
             ),
             candidate_fansub_names: policy.candidate_names.clone(),
         };
-        let rss_ranked = rank_releases(rss_releases, &context, &options.fansubs);
+        // RSS 订阅可能各自配置了不同字幕偏好，扫描单集时必须再次以番剧规则为准。
+        let (eligible_rss_releases, rss_rejected) = filter_automatic_releases_by_subtitle(
+            rss_releases.to_vec(),
+            &anime.preferred_subtitle_languages,
+            anime.preferred_subtitle.as_deref(),
+        );
+        if rss_rejected > 0 {
+            log::info!(
+                "Rust 自动扫描单集字幕门禁：anime_id={}, episode_id={}, rejected={}, required={:?}",
+                anime.anime.id,
+                episode.id,
+                rss_rejected,
+                anime.preferred_subtitle_languages
+            );
+        }
+        let rss_ranked = rank_releases(&eligible_rss_releases, &context, &options.fansubs);
         let rss_candidates = apply_fansub_policy(
             &rss_ranked,
             preferred_fansub.map(String::as_str),
@@ -463,6 +483,23 @@ impl AutomationRunService {
             return Ok(EpisodeScanOutcome::Skipped(decision.reason));
         }
         let release = candidates[0].release.clone();
+        if let Some(reason) = automatic_subtitle_rejection_reason(
+            &release,
+            &anime.preferred_subtitle_languages,
+            anime.preferred_subtitle.as_deref(),
+        ) {
+            log::info!(
+                "Rust 自动扫描提交前字幕硬门禁拒绝：anime_id={}, episode_id={}, reason={}, title={:?}, actual={:?}, required={:?}",
+                anime.anime.id,
+                episode.id,
+                reason,
+                release.title,
+                release.subtitle_languages,
+                anime.preferred_subtitle_languages
+            );
+            save_episode_status(store, episode, EpisodeStatus::Matched)?;
+            return Ok(EpisodeScanOutcome::Skipped("字幕规则不满足".to_owned()));
+        }
         if release.magnet_url.is_none() && release.torrent_url.is_none() {
             return Ok(EpisodeScanOutcome::Skipped(
                 "最佳资源没有下载地址".to_owned(),
@@ -488,6 +525,19 @@ impl AutomationRunService {
             download_task_id: receipt.task_id,
         }))
     }
+}
+
+/// 同时按稳定单集标识和番剧集数识别已有下载任务。
+fn automation_download_matches(
+    task: &AutomationDownloadReference,
+    anime_id: &str,
+    episode: &Episode,
+) -> bool {
+    task.anime_id.as_deref() == Some(anime_id)
+        && (task.episode_id.as_deref() == Some(episode.id.as_str())
+            || task
+                .episode_no
+                .is_some_and(|number| (number - episode.episode_no).abs() < 1e-9))
 }
 
 enum EpisodeScanOutcome {
@@ -735,12 +785,132 @@ fn filter_automatic_releases_by_subtitle(
     let total = releases.len();
     let eligible = releases
         .into_iter()
-        .filter(|release| {
-            release_satisfies_subtitle_requirement(release, preferred_languages, legacy_preference)
+        .filter_map(|release| {
+            let rejection = automatic_subtitle_rejection_reason(
+                &release,
+                preferred_languages,
+                legacy_preference,
+            );
+            let Some(reason) = rejection else {
+                return Some(release);
+            };
+            let source_claimed_match = release_satisfies_subtitle_requirement(
+                &release,
+                preferred_languages,
+                legacy_preference,
+            );
+            if source_claimed_match {
+                log::info!(
+                    "Rust 自动扫描拒绝来源字幕声明：source_id={}, release_id={}, reason={}, title={:?}, actual={:?}, required={:?}",
+                    release.source_id,
+                    release.id,
+                    reason,
+                    release.title,
+                    release.subtitle_languages,
+                    preferred_languages
+                );
+            } else {
+                log::debug!(
+                    "Rust 自动扫描字幕候选拒绝：source_id={}, release_id={}, reason={}, title={:?}",
+                    release.source_id,
+                    release.id,
+                    reason,
+                    release.title
+                );
+            }
+            None
         })
         .collect::<Vec<_>>();
     let rejected = total.saturating_sub(eligible.len());
     (eligible, rejected)
+}
+
+/// 返回自动扫描的字幕拒绝原因；用户未配置字幕规则时不启用标题证据门禁。
+fn automatic_subtitle_rejection_reason(
+    release: &Release,
+    preferred_languages: &[String],
+    legacy_preference: Option<&str>,
+) -> Option<&'static str> {
+    if !has_subtitle_requirement(preferred_languages, legacy_preference) {
+        return None;
+    }
+    if title_declares_no_subtitles(&release.title) {
+        return Some("标题明确标记无字幕");
+    }
+
+    let parsed = parse_release_title(&release.title, &[]);
+    if !parsed.subtitle_languages.is_empty() {
+        let mut title_evidence = release.clone();
+        title_evidence.subtitle_languages = parsed.subtitle_languages;
+        title_evidence.subtitle = parsed.subtitle;
+        return (!release_satisfies_subtitle_requirement(
+            &title_evidence,
+            preferred_languages,
+            legacy_preference,
+        ))
+        .then_some("标题字幕语言不满足");
+    }
+    if title_has_subtitle_track_evidence(&release.title) {
+        return (!release_satisfies_subtitle_requirement(
+            release,
+            preferred_languages,
+            legacy_preference,
+        ))
+        .then_some("字幕轨存在但语言不满足");
+    }
+    Some("标题缺少字幕证据")
+}
+
+/// 判断当前追番是否配置了有效字幕语言要求。
+fn has_subtitle_requirement(
+    preferred_languages: &[String],
+    legacy_preference: Option<&str>,
+) -> bool {
+    preferred_languages
+        .iter()
+        .any(|value| matches!(value.as_str(), "chs" | "cht" | "jpn" | "eng"))
+        || legacy_preference
+            .is_some_and(|value| matches!(value, "chs" | "cht" | "jpn" | "eng" | "multi"))
+}
+
+/// 识别标题中明确声明无字幕或无中文的否定标记。
+fn title_declares_no_subtitles(title: &str) -> bool {
+    let lower = title.to_lowercase();
+    ["无中字", "無中字", "无字幕", "無字幕", "无中文", "無中文"]
+        .iter()
+        .any(|marker| title.contains(marker))
+        || ["no sub", "no subs", "no subtitle", "no subtitles"]
+            .iter()
+            .any(|marker| lower.contains(marker))
+}
+
+/// 识别字幕轨格式或内封标记，语言仍以来源字段进行二次确认。
+fn title_has_subtitle_track_evidence(title: &str) -> bool {
+    title.contains("字幕")
+        || title.contains("内封")
+        || title.contains("內封")
+        || title.contains("内嵌")
+        || title.contains("內嵌")
+        || [
+            "ass",
+            "ssa",
+            "srt",
+            "vtt",
+            "pgs",
+            "sub",
+            "subs",
+            "subtitle",
+            "subtitles",
+        ]
+        .iter()
+        .any(|marker| contains_ascii_title_token(title, marker))
+}
+
+/// 按标题分隔符匹配 ASCII 标记，避免把字幕组名称中的子串当成字幕轨。
+fn contains_ascii_title_token(title: &str, expected: &str) -> bool {
+    title
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .any(|token| token.eq_ignore_ascii_case(expected))
 }
 
 fn empty_result(now: DateTime<Utc>) -> AutomationRunResult {
@@ -1029,6 +1199,7 @@ mod tests {
         )
         .expect("decode release");
         release.anime_id = Some(anime.anime.id.clone());
+        release.title = "[测试字幕组] P3 契约番剧 - 03 [1080p][简繁内封]".to_owned();
         release.fansub_group_id = None;
         release.subtitle_languages = vec![SubtitleLanguage::Chs, SubtitleLanguage::Cht];
         let store = MemoryStore {
@@ -1099,6 +1270,82 @@ mod tests {
             .any(|item| item.id == "episode-auto-3" && item.status == EpisodeStatus::Downloading));
     }
 
+    /// 验证续作不会自动下载未标季数的同名旧季度资源。
+    #[tokio::test]
+    async fn skips_unmarked_sequel_release_before_download() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../fixtures/contracts/p3-following-write-model.v1.json"
+        )))
+        .expect("decode following fixture");
+        let mut anime: MyAnime =
+            serde_json::from_value(fixture["payload"]["myAnime"].clone()).expect("decode my anime");
+        anime.auto_download = true;
+        anime.anime.title = "地狱模式 第二季".to_owned();
+        anime.anime.original_title = Some("Hell Mode 2nd Season".to_owned());
+        anime.anime.detail = Some(serde_json::json!({ "episodeCount": 8 }));
+
+        let release_fixture: serde_json::Value = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../fixtures/contracts/p3-release-search-model.v1.json"
+        )))
+        .expect("decode release fixture");
+        let mut release: Release = serde_json::from_value(
+            release_fixture["payload"]["searchResult"]["releases"][0].clone(),
+        )
+        .expect("decode release");
+        release.title = "[LoliHouse] 地狱模式～喜欢速通游戏的玩家在废设定异世界无双～ / Hell Mode - 08 [WebRip 1080p HEVC-10bit AAC][简繁内封字幕]".to_owned();
+        release.anime_id = Some(anime.anime.id.clone());
+        release.episode_no = Some(8.0);
+        release.series_season_no = None;
+        release.fansub_group_id = None;
+        release.subtitle_languages = vec![SubtitleLanguage::Chs, SubtitleLanguage::Cht];
+
+        let store = MemoryStore {
+            anime: vec![anime.clone()],
+            episodes: Mutex::new(vec![Episode {
+                id: "episode-hell-mode-8".to_owned(),
+                anime_id: anime.anime.id.clone(),
+                episode_no: 8.0,
+                title: None,
+                air_time: None,
+                status: EpisodeStatus::Aired,
+            }]),
+            preferences: Vec::new(),
+            bindings: Vec::new(),
+            releases: vec![release],
+            downloads: Vec::new(),
+            notifications: Mutex::new(Vec::new()),
+        };
+        let executor = Arc::new(RecordingExecutor {
+            requests: Mutex::new(Vec::new()),
+        });
+        let result = AutomationRunService::new(test_network(), executor.clone())
+            .run(
+                &store,
+                AutomationRunOptions {
+                    now: Some(
+                        Utc.with_ymd_and_hms(2026, 8, 3, 12, 0, 0)
+                            .single()
+                            .expect("fixed time"),
+                    ),
+                    settings: automation_settings(),
+                    sources: Vec::new(),
+                    fansubs: Vec::new(),
+                },
+            )
+            .await
+            .expect("run automation");
+
+        assert_eq!(result.checked_episodes, 1);
+        assert!(result.downloaded.is_empty());
+        assert!(result.skipped.iter().any(|item| {
+            item.episode_id.as_deref() == Some("episode-hell-mode-8")
+                && item.reason == "未找到匹配资源"
+        }));
+        assert!(executor.requests.lock().expect("lock requests").is_empty());
+    }
+
     /// 验证已存在任务时不调用下载执行器。
     #[tokio::test]
     async fn skips_duplicate_download_task() {
@@ -1109,6 +1356,7 @@ mod tests {
                 task_id: "existing".to_owned(),
                 anime_id: Some(store.anime[0].anime.id.clone()),
                 episode_id: Some(episode.id),
+                episode_no: None,
             }],
             ..store
         };
@@ -1128,6 +1376,43 @@ mod tests {
             .await
             .expect("run automation");
         assert_eq!(result.checked_episodes, 1);
+        assert!(result
+            .skipped
+            .iter()
+            .any(|item| item.reason == "已有下载任务"));
+        assert!(executor.requests.lock().expect("lock requests").is_empty());
+    }
+
+    /// 验证历史任务缺少单集标识时仍可按番剧和集数阻止重复下载。
+    #[tokio::test]
+    async fn skips_duplicate_download_task_by_episode_number() {
+        let store = memory_store_with_episode();
+        let episode = store.episodes.lock().expect("lock episodes")[0].clone();
+        let store = MemoryStore {
+            downloads: vec![AutomationDownloadReference {
+                task_id: "existing-without-episode-id".to_owned(),
+                anime_id: Some(store.anime[0].anime.id.clone()),
+                episode_id: None,
+                episode_no: Some(episode.episode_no),
+            }],
+            ..store
+        };
+        let executor = Arc::new(RecordingExecutor {
+            requests: Mutex::new(Vec::new()),
+        });
+        let result = AutomationRunService::new(test_network(), executor.clone())
+            .run(
+                &store,
+                AutomationRunOptions {
+                    now: None,
+                    settings: automation_settings(),
+                    sources: Vec::new(),
+                    fansubs: Vec::new(),
+                },
+            )
+            .await
+            .expect("run automation");
+
         assert!(result
             .skipped
             .iter()
@@ -1174,12 +1459,15 @@ mod tests {
                 .expect("decode release");
         let mut complete = base.clone();
         complete.id = "complete".to_owned();
+        complete.title = "[NIX-RAWS] 测试番 - 01 [简繁内封]".to_owned();
         complete.subtitle_languages = vec![SubtitleLanguage::Chs, SubtitleLanguage::Cht];
         let mut partial = base.clone();
         partial.id = "partial".to_owned();
+        partial.title = "[字幕组] 测试番 - 01 [简中]".to_owned();
         partial.subtitle_languages = vec![SubtitleLanguage::Chs];
         let mut unknown_multi = base;
         unknown_multi.id = "unknown-multi".to_owned();
+        unknown_multi.title = "[字幕组] 测试番 - 01 [Multi-Subs]".to_owned();
         unknown_multi.subtitle_languages.clear();
         unknown_multi.subtitle = Some(SubtitlePreference::Multi);
 
@@ -1191,6 +1479,114 @@ mod tests {
         assert_eq!(eligible.len(), 1);
         assert_eq!(eligible[0].id, "complete");
         assert_eq!(rejected, 2);
+    }
+
+    /// 验证自动扫描不能只依据来源声明接受无标题字幕证据的资源。
+    #[test]
+    fn requires_title_subtitle_evidence_for_automatic_download() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../fixtures/contracts/p3-release-search-model.v1.json"
+        )))
+        .expect("decode release fixture");
+        let mut source_only: Release =
+            serde_json::from_value(fixture["payload"]["searchResult"]["releases"][0].clone())
+                .expect("decode release");
+        source_only.id = "source-only-chs".to_owned();
+        source_only.title = "[LoliHouse] Kokoore - 05 [WebRip 1080p HEVC-10bit AAC].mkv".to_owned();
+        source_only.subtitle_languages = vec![SubtitleLanguage::Chs];
+        source_only.subtitle = Some(SubtitlePreference::Chs);
+
+        let mut explicit_none = source_only.clone();
+        explicit_none.id = "explicit-no-chs".to_owned();
+        explicit_none.title = format!("{}[无中字]", explicit_none.title);
+        let mut ass_with_language = source_only.clone();
+        ass_with_language.id = "ass-with-chs".to_owned();
+        ass_with_language.title = "[字幕组] 测试番 - 05 [ASS]".to_owned();
+        let mut title_chs = source_only.clone();
+        title_chs.id = "title-chs".to_owned();
+        title_chs.title = "[字幕组] 测试番 - 05 [简中内封]".to_owned();
+        title_chs.subtitle_languages.clear();
+        title_chs.subtitle = None;
+
+        let (eligible, rejected) = filter_automatic_releases_by_subtitle(
+            vec![
+                source_only.clone(),
+                explicit_none,
+                ass_with_language,
+                title_chs,
+            ],
+            &["chs".to_owned()],
+            None,
+        );
+        assert_eq!(
+            eligible
+                .iter()
+                .map(|release| release.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["ass-with-chs", "title-chs"]
+        );
+        assert_eq!(rejected, 2);
+
+        let (eligible_without_rule, rejected_without_rule) =
+            filter_automatic_releases_by_subtitle(vec![source_only], &[], None);
+        assert_eq!(eligible_without_rule.len(), 1);
+        assert_eq!(rejected_without_rule, 0);
+    }
+
+    /// 验证 AniBT 错标简体的无中字资源不会进入排序或下载执行器。
+    #[tokio::test]
+    async fn rejects_anibt_false_chs_before_download() {
+        let store = memory_store_with_episode();
+        let mut anime = store.anime[0].clone();
+        anime.anime.title = "Kokoore".to_owned();
+        anime.anime.original_title = None;
+        anime.preferred_subtitle_languages = vec!["chs".to_owned()];
+        let episode = store.episodes.lock().expect("lock episodes")[0].clone();
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../fixtures/contracts/p3-release-search-model.v1.json"
+        )))
+        .expect("decode release fixture");
+        let mut release: Release =
+            serde_json::from_value(fixture["payload"]["searchResult"]["releases"][0].clone())
+                .expect("decode release");
+        release.title = "[LoliHouse] 『你们先走我断后』，于是10年后我成为了传说 / Kokoore - 05 [WebRip 1080p HEVC-10bit AAC][无中字]".to_owned();
+        release.source_id = "anibt".to_owned();
+        release.anime_id = Some(anime.anime.id.clone());
+        release.episode_no = Some(episode.episode_no);
+        release.subtitle_languages = vec![SubtitleLanguage::Chs];
+        release.subtitle = Some(SubtitlePreference::Chs);
+
+        let executor = Arc::new(RecordingExecutor {
+            requests: Mutex::new(Vec::new()),
+        });
+        let service = AutomationRunService::new(test_network(), executor.clone());
+        let options = AutomationRunOptions {
+            now: None,
+            settings: automation_settings(),
+            sources: Vec::new(),
+            fansubs: Vec::new(),
+        };
+        let policy = ScanPolicy::from_settings(&options.settings);
+        let outcome = service
+            .scan_episode(
+                &store,
+                &anime,
+                &episode,
+                &[],
+                &[],
+                &[release],
+                &options,
+                &policy,
+            )
+            .await
+            .expect("scan rss candidate");
+
+        assert!(
+            matches!(outcome, EpisodeScanOutcome::Skipped(reason) if reason == "未找到匹配资源")
+        );
+        assert!(executor.requests.lock().expect("lock requests").is_empty());
     }
 
     fn memory_store_with_episode() -> MemoryStore {

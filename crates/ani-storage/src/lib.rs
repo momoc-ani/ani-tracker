@@ -18,13 +18,14 @@ pub use error::{SecureStoreError, StorageError};
 use migration::{initialize_database, read_database_versions};
 pub use repository::SqliteRepository;
 
-/// 当前与 Electron 共用的 SQLite 结构版本。
-pub const SQLITE_SCHEMA_VERSION: u32 = 22;
+/// 当前与 TypeScript 共用的 SQLite 结构版本。
+pub const SQLITE_SCHEMA_VERSION: u32 = 23;
 /// 当前与 TypeScript 共用的应用数据版本。
 pub const APP_DATA_VERSION: u32 = 25;
 
 /// 首次启动写入的最小应用数据。
 #[derive(Debug, Clone)]
+
 pub struct StorageSeed {
     pub settings: Value,
     pub dashboard: Value,

@@ -9,6 +9,7 @@ license.workspace = true
 ani-domain = { path = "../ani-domain" }
 ani-repository = { path = "../ani-repository" }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
+data-encoding = "2"
 futures-util = "0.3"
 log = "0.4"
 quick-xml = "0.41"

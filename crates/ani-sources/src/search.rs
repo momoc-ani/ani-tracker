@@ -2,10 +2,10 @@ use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 
 use ani_domain::{
-    Anime, AnimeReleaseQuery, AnimeSourceBinding, FansubGroup, MyAnime, Release, ReleaseQuery,
-    ReleaseSearchError, ReleaseSearchResult, ReleaseSourceConfig, ReleaseSourceSearchResult,
-    ReleaseSourceSyncState, RssSubscriptionReleaseQuery, RssSubscriptionReleaseResult, SourceKind,
-    SubtitleLanguage, SubtitlePreference,
+    Anime, AnimeReleaseQuery, AnimeSourceBinding, FansubGroup, MyAnime, Release,
+    ReleaseContentKind, ReleaseQuery, ReleaseSearchError, ReleaseSearchResult, ReleaseSourceConfig,
+    ReleaseSourceSearchResult, ReleaseSourceSyncState, RssSubscriptionReleaseQuery,
+    RssSubscriptionReleaseResult, SourceKind, SubtitleLanguage, SubtitlePreference,
 };
 use ani_repository::{
     CachedReleaseQuery, ReleaseCacheRepository, ReleaseSearchCacheEntry, ReleaseSourceRepository,
@@ -18,6 +18,7 @@ use sha2::{Digest, Sha256};
 use url::Url;
 
 use crate::parsers::{
+    extract_info_hash, extract_torrent_url_info_hash, normalize_info_hash,
     parse_acgnx_api_response, parse_acgnx_html, parse_anibt_rss, parse_dmhy_list,
     parse_mikan_release_list, parse_rss_releases, parse_torznab_releases,
 };
@@ -34,7 +35,7 @@ use crate::{
 pub const MAX_RELEASE_SOURCE_FETCH_LIMIT: usize = 50;
 pub const MAX_RELEASE_SOURCE_RESULT_LIMIT: usize = 200;
 pub const COMPLETED_ANIME_RELEASE_CACHE_TTL_MS: u64 = 7 * 24 * 60 * 60 * 1_000;
-const RELEASE_SEARCH_CACHE_VERSION: u32 = 3;
+const RELEASE_SEARCH_CACHE_VERSION: u32 = 5;
 const MAX_ANIBT_BGM_FEEDS_PER_SEARCH: usize = 3;
 const DESKTOP_BROWSER_USER_AGENT: &str =
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/138.0 Safari/537.36";
@@ -1008,7 +1009,9 @@ impl ReleaseSearchService {
                             break;
                         }
                     }
-                    Err(SourceError::HttpStatus { status: 404 | 405 }) => continue,
+                    Err(SourceError::HttpStatus {
+                        status: 404 | 405, ..
+                    }) => continue,
                     Err(error) => last_error = Some(error),
                 }
             }
@@ -1574,24 +1577,94 @@ fn matches_keyword(release: &Release, keyword: &str) -> bool {
 }
 
 fn dedupe_releases(releases: Vec<Release>) -> Vec<Release> {
+    let input_count = releases.len();
     let mut seen = HashSet::new();
-    releases
+    let releases = releases
         .into_iter()
-        .filter(|release| {
-            let key = release
-                .info_hash
-                .as_ref()
-                .or(release.magnet_url.as_ref())
-                .or(release.torrent_url.as_ref())
-                .unwrap_or(&release.title);
-            seen.insert(key.clone())
-        })
-        .collect()
+        .filter(|release| seen.insert(release_episode_content_key(release)))
+        .collect::<Vec<_>>();
+    if releases.len() < input_count {
+        log::debug!(
+            "资源搜索已按集数和种子内容合并重复项：input={}, output={}",
+            input_count,
+            releases.len()
+        );
+    }
+    releases
 }
 
 fn sort_releases(mut releases: Vec<Release>) -> Vec<Release> {
-    releases.sort_by(|left, right| right.published_at.cmp(&left.published_at));
+    releases.sort_by(|left, right| {
+        release_episode_order(right)
+            .partial_cmp(&release_episode_order(left))
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| right.published_at.cmp(&left.published_at))
+    });
     releases
+}
+
+/// 生成包含集数边界的资源内容键，避免相同 BTIH 跨集误合并。
+fn release_episode_content_key(release: &Release) -> String {
+    let episode = if let Some(range) = &release.episode_range {
+        format!(
+            "range:{}-{}",
+            format_episode_key(range.start),
+            format_episode_key(range.end)
+        )
+    } else if let Some(episode_no) = release.episode_no.filter(|value| value.is_finite()) {
+        format!("episode:{}", format_episode_key(episode_no))
+    } else if release.content_kind == Some(ReleaseContentKind::Batch) {
+        format!(
+            "batch:{}",
+            release
+                .series_season_no
+                .map_or_else(|| "unknown".to_owned(), |value| value.to_string())
+        )
+    } else {
+        "unknown".to_owned()
+    };
+    let content = normalize_info_hash(release.info_hash.as_deref())
+        .or_else(|| extract_info_hash(release.magnet_url.as_deref()))
+        .or_else(|| extract_torrent_url_info_hash(release.torrent_url.as_deref()))
+        .map(|hash| format!("btih:{hash}"))
+        .or_else(|| {
+            release
+                .magnet_url
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(|value| format!("magnet:{value}"))
+        })
+        .or_else(|| {
+            release
+                .torrent_url
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(|value| format!("torrent:{value}"))
+        })
+        .unwrap_or_else(|| format!("release:{}:{}", release.source_id, release.id));
+    format!("{episode}|{content}")
+}
+
+/// 返回资源排序使用的集数上界，未识别资源排在普通单集之后。
+fn release_episode_order(release: &Release) -> f64 {
+    release
+        .episode_range
+        .as_ref()
+        .map(|range| range.end)
+        .or(release.episode_no)
+        .filter(|value| value.is_finite())
+        .unwrap_or(-1.0)
+}
+
+/// 规范化集数键中的负零表示。
+fn format_episode_key(value: f64) -> String {
+    if value == 0.0 {
+        "0".to_owned()
+    } else {
+        value.to_string()
+    }
 }
 
 fn format_source_error(error: &SourceError) -> String {
@@ -1690,6 +1763,7 @@ mod tests {
         ReleaseQuery, ReleaseSourceConfig, RequestCircuitState, SourceKind,
     };
     use ani_repository::{CachedReleaseQuery, ReleaseSearchCacheEntry, RepositoryResult};
+    use data_encoding::BASE32_NOPAD;
     use serde_json::json;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
@@ -1697,7 +1771,8 @@ mod tests {
     use super::{
         build_acgrip_rss_url, build_anibt_anime_rss_url, build_dmhy_list_url,
         build_mikan_anime_rss_url, build_mikan_search_url, build_nyaa_rss_url,
-        create_anibt_headers, ReleaseSearchService, ReleaseSearchStore,
+        create_anibt_headers, dedupe_releases, sort_releases, ReleaseSearchService,
+        ReleaseSearchStore,
     };
     use crate::{CircuitStateStore, NativeHttpConfig, ProxyMode, SourceNetworkService};
 
@@ -1812,6 +1887,57 @@ mod tests {
         assert_eq!(
             build_acgrip_rss_url("https://acg.rip/", "测试番", 1).expect("ACG.RIP URL"),
             "https://acg.rip/.xml?term=%E6%B5%8B%E8%AF%95%E7%95%AA"
+        );
+    }
+
+    /// 验证同集同 BTIH 跨来源合并，并保留复用同一 Hash 的其他集数。
+    #[test]
+    fn dedupes_releases_by_episode_and_normalized_btih() {
+        let bytes = [
+            0x54, 0x48, 0xae, 0x0e, 0xd3, 0x69, 0x12, 0xeb, 0x0d, 0xfb, 0xa5, 0x3c, 0x3e, 0x49,
+            0x5b, 0x99, 0x88, 0x84, 0x1e, 0x68,
+        ];
+        let hex_hash = "5448ae0ed36912eb0dfba53c3e495b9988841e68";
+        let mut mikan_release = test_release("mikan", 8.0, None, None);
+        mikan_release.torrent_url = Some(format!(
+            "https://mikanani.me/Download/20260730/{hex_hash}.torrent"
+        ));
+        let releases = dedupe_releases(vec![
+            test_release("source-a", 8.0, Some(&hex_hash.to_ascii_uppercase()), None),
+            test_release(
+                "source-b",
+                8.0,
+                None,
+                Some(&format!(
+                    "magnet:?xt=urn:btih:{}&tr=udp%3A%2F%2Ftracker",
+                    BASE32_NOPAD.encode(&bytes)
+                )),
+            ),
+            mikan_release,
+            test_release("source-c", 9.0, Some(hex_hash), None),
+        ]);
+
+        assert_eq!(releases.len(), 2);
+        assert_eq!(releases[0].source_id, "source-a");
+        assert_eq!(releases[1].episode_no, Some(9.0));
+    }
+
+    /// 验证聚合结果以集数倒序为主、发布时间倒序为同集次序。
+    #[test]
+    fn sorts_releases_by_episode_then_published_at() {
+        let mut episode_8_old = test_release("episode-8-old", 8.0, None, None);
+        episode_8_old.published_at = "2026-08-01T00:00:00.000Z".to_owned();
+        let mut episode_8_new = test_release("episode-8-new", 8.0, None, None);
+        episode_8_new.published_at = "2026-08-03T00:00:00.000Z".to_owned();
+        let episode_12 = test_release("episode-12", 12.0, None, None);
+
+        let releases = sort_releases(vec![episode_8_old, episode_12, episode_8_new]);
+        assert_eq!(
+            releases
+                .iter()
+                .map(|release| release.source_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["episode-12", "episode-8-new", "episode-8-old"]
         );
     }
 
@@ -1984,6 +2110,27 @@ mod tests {
             rss_url: None,
             tags: Vec::new(),
         }
+    }
+
+    /// 创建资源聚合测试所需的最小发布数据。
+    fn test_release(
+        source_id: &str,
+        episode_no: f64,
+        info_hash: Option<&str>,
+        magnet_url: Option<&str>,
+    ) -> Release {
+        serde_json::from_value(json!({
+            "id": format!("release-{source_id}"),
+            "title": format!("测试番 - {episode_no}"),
+            "episodeNo": episode_no,
+            "contentKind": "episode",
+            "sourceId": source_id,
+            "sourceName": source_id,
+            "magnetUrl": magnet_url,
+            "infoHash": info_hash,
+            "publishedAt": "2026-08-02T00:00:00.000Z"
+        }))
+        .expect("create test release")
     }
 
     /// 创建指向本地测试服务的 RSS 来源。

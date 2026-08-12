@@ -39,9 +39,13 @@ import { Page, PageBreadcrumb, PageHeader } from "@/components/page-layout";
 import { ReleaseMetadataBadges } from "@/components/release-metadata-badges";
 import { appApi } from "@/lib/api";
 import { formatBytes, formatDateTime } from "@/lib/format";
-import { isAnimeSearchTerm, matchesAnimeSearchKeyword } from "@shared/anime-release-search";
+import { classifyAnimeRelease, isAnimeSearchTerm, matchesAnimeSearchKeyword } from "@shared/anime-release-search";
 import { resolveAnimeTitleDisplay } from "@shared/anime-title";
 import { parseReleaseSearchInput } from "@shared/release-search-input";
+import {
+  compareReleaseEpisodeDescending,
+  dedupeReleasesByEpisodeContent
+} from "@shared/release-identity";
 import type { ReleaseSearchResult } from "@shared/contracts";
 import type { MyAnime, Release } from "@shared/domain";
 
@@ -481,6 +485,8 @@ export function ReleaseSearchPage({ initialIntent }: ReleaseSearchPageProps = {}
                       <div className="min-w-0 divide-y bg-card">
                         {visibleReleases.map((release) => {
                           const added = addedReleaseIds.has(release.id);
+                          const seasonCompatible = !searchedContext?.myAnime
+                            || classifyAnimeRelease(release, searchedContext.myAnime.anime) === "current";
                           return (
                             <article
                               className="flex min-w-0 flex-col gap-3 p-4 transition-colors hover:bg-muted/50 sm:flex-row sm:items-center sm:justify-between"
@@ -498,6 +504,7 @@ export function ReleaseSearchPage({ initialIntent }: ReleaseSearchPageProps = {}
                                     </Badge>
                                   )}
                                   {release.episodeNo !== undefined && <Badge>第 {release.episodeNo} 集</Badge>}
+                                  {!seasonCompatible && <Badge tone="amber">季度待确认</Badge>}
                                   <ReleaseMetadataBadges metadata={release} />
                                   {release.size && <Badge>{formatBytes(release.size)}</Badge>}
                                   {typeof release.seeders === "number" && (
@@ -518,12 +525,12 @@ export function ReleaseSearchPage({ initialIntent }: ReleaseSearchPageProps = {}
                               </div>
                               <Button
                                 className="w-full shrink-0 sm:w-auto"
-                                variant={added ? "secondary" : "primary"}
+                                variant={added || !seasonCompatible ? "secondary" : "primary"}
                                 onClick={() => void addDownload(release.id)}
-                                disabled={addingId === release.id || added}
+                                disabled={addingId === release.id || added || !seasonCompatible}
                               >
                                 <Download data-icon="inline-start" />
-                                {addingId === release.id ? "添加中" : added ? "已加入" : "添加下载"}
+                                {!seasonCompatible ? "季度待确认" : addingId === release.id ? "添加中" : added ? "已加入" : "添加下载"}
                               </Button>
                             </article>
                           );
@@ -643,14 +650,15 @@ function ReleaseSearchSkeleton() {
   );
 }
 
-/** 按用户选择的规则排列资源，同时保留匹配排序的原始顺序。 */
+/** 先按集数倒序，再按用户选择的规则排列同集资源。 */
 function sortReleases(releases: Release[], sortKey: ReleaseSortKey): Release[] {
-  if (sortKey === "match") return [...releases];
-  if (sortKey === "seeders") {
-    return [...releases].sort((left, right) => (right.seeders ?? -1) - (left.seeders ?? -1));
-  }
-
-  return [...releases].sort((left, right) => comparePublishedAt(right.publishedAt, left.publishedAt));
+  return dedupeReleasesByEpisodeContent(releases).sort((left, right) => {
+    const episodeDelta = compareReleaseEpisodeDescending(left, right);
+    if (episodeDelta) return episodeDelta;
+    if (sortKey === "match") return 0;
+    if (sortKey === "seeders") return (right.seeders ?? -1) - (left.seeders ?? -1);
+    return comparePublishedAt(right.publishedAt, left.publishedAt);
+  });
 }
 
 /** 比较两个来源发布时间，并在日期无效时退回字符串排序。 */

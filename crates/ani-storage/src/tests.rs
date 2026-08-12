@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use ani_domain::{
-    AnimeDetailRefreshState, AnimeSeasonSyncState, AnimeSourceBinding,
+    AnimeAliasLanguage, AnimeDetailRefreshState, AnimeSeasonSyncState, AnimeSourceBinding,
     AnimeSourceBindingMatchMethod, AnimeSourceExclusion, AnimeSourceExclusionScope, AnimeStatus,
     DownloadStatus, DownloadTask, Episode, EpisodePreference, EpisodeStatus, MediaFile, MyAnime,
     NotificationKind, NotificationRecord, NotificationSeverity, PlaybackCheckpoint,
@@ -254,6 +254,38 @@ fn stores_sensitive_fields_through_secure_store() {
     assert_eq!(
         secure_store.read_text("sources.anibt.api-key"),
         Some("source-secret".to_owned())
+    );
+}
+
+/// 验证下载源采集间隔保存后重新打开数据库仍保持新值。
+#[test]
+fn persists_source_request_interval_across_restart() {
+    let directory = TestDirectory::new("source-request-interval");
+    {
+        let storage = Storage::open(test_options(&directory, "active.sqlite"))
+            .expect("open source interval database");
+        let mut source = storage
+            .repository()
+            .list_sources()
+            .expect("list seeded sources")
+            .remove(0);
+        source.request_interval_ms = 800;
+        let saved = storage
+            .repository()
+            .upsert_source(&source)
+            .expect("save source request interval");
+        assert_eq!(saved[0].request_interval_ms, 800);
+    }
+
+    let reopened = Storage::open(test_options(&directory, "active.sqlite"))
+        .expect("reopen source interval database");
+    assert_eq!(
+        reopened
+            .repository()
+            .list_sources()
+            .expect("list reopened sources")[0]
+            .request_interval_ms,
+        800
     );
 }
 
@@ -1012,6 +1044,85 @@ fn reads_p2_business_views_from_sqlite() {
     assert_eq!(dashboard.source_health[0].status, "warning");
 }
 
+/// 验证首页追番视图会使用已确认来源绑定的中文标题，但不写回目录别名。
+#[test]
+fn uses_confirmed_binding_chinese_title_for_followed_anime() {
+    let directory = TestDirectory::new("confirmed-binding-title");
+    let storage = Storage::open(test_options(&directory, "active.sqlite"))
+        .expect("create confirmed binding title database");
+    let anime_id = "bangumi-565701";
+    let now = "2026-08-06T05:46:30.000Z";
+    let japanese_title = "片田舎の剣聖、剣士になる 第二季";
+    let chinese_title = "乡下大叔成为剑圣 第二季";
+    storage
+        .connection
+        .execute(
+            "INSERT INTO anime_catalog (
+               id, title, original_title, premiere_year, premiere_month,
+               external_ids_json, detail_json, created_at, updated_at
+             ) VALUES (?1, ?2, ?3, 2026, 7, '{\"bangumi\":\"565701\"}', '{}', ?4, ?4)",
+            params![anime_id, japanese_title, japanese_title, now],
+        )
+        .expect("insert japanese anime");
+    storage
+        .connection
+        .execute(
+            "INSERT INTO my_anime (
+               id, anime_id, status, auto_download, preferred_subtitle_languages_json,
+               added_at, updated_at
+             ) VALUES ('my-anime-confirmed-binding-title', ?1, 'watching', 0, '[]', ?2, ?2)",
+            params![anime_id, now],
+        )
+        .expect("insert followed anime");
+
+    let repository = storage.repository();
+    let binding = AnimeSourceBinding {
+        id: "source-binding:bangumi-565701:anibt".to_owned(),
+        anime_id: anime_id.to_owned(),
+        source_id: "anibt".to_owned(),
+        source_anime_id: "565701".to_owned(),
+        source_anime_title: Some(chinese_title.to_owned()),
+        source_url: Some("https://anibt.example/subject/565701".to_owned()),
+        match_method: AnimeSourceBindingMatchMethod::ExternalId,
+        confidence: 1.0,
+        confirmed: true,
+        created_at: now.to_owned(),
+        updated_at: now.to_owned(),
+    };
+    AnimeSourceBindingRepository::upsert_anime_source_binding(&repository, &binding)
+        .expect("save confirmed source binding");
+
+    let followed = repository.list_my_anime().expect("list followed anime");
+    assert_eq!(followed.len(), 1);
+    assert_eq!(followed[0].anime.title, japanese_title);
+    assert_eq!(followed[0].anime.aliases.len(), 1);
+    assert_eq!(followed[0].anime.aliases[0].alias, chinese_title);
+    assert_eq!(
+        followed[0].anime.aliases[0].language,
+        AnimeAliasLanguage::Zh
+    );
+    assert_eq!(followed[0].anime.aliases[0].priority, 80);
+    assert_eq!(
+        storage
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM anime_alias WHERE anime_id = ?1",
+                [anime_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("count persisted aliases"),
+        0
+    );
+
+    let mut unconfirmed = binding;
+    unconfirmed.confirmed = false;
+    unconfirmed.updated_at = "2026-08-06T05:47:30.000Z".to_owned();
+    AnimeSourceBindingRepository::upsert_anime_source_binding(&repository, &unconfirmed)
+        .expect("cancel source binding confirmation");
+    let followed = repository.list_my_anime().expect("list after cancellation");
+    assert!(followed[0].anime.aliases.is_empty());
+}
+
 /// 验证 P3 追番、单集、偏好、观看进度和续播写入形成完整事务闭环。
 #[test]
 fn writes_p3_following_business_transactionally() {
@@ -1214,6 +1325,61 @@ fn writes_download_snapshot_and_syncs_episode_statuses() {
         .expect("list completed episodes")
         .iter()
         .all(|episode| episode.status == EpisodeStatus::Downloaded));
+}
+
+/// 验证下载任务早于单集创建时会回填关联并同步完成状态。
+#[test]
+fn backfills_download_link_when_episode_is_created_later() {
+    let directory = TestDirectory::new("p4-download-late-episode-link");
+    let storage = Storage::open(test_options(&directory, "active.sqlite"))
+        .expect("create late episode link database");
+    let fixture: ContractFixture<P3FollowingWriteModelFixture> =
+        serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../fixtures/contracts/p3-following-write-model.v1.json"
+        )))
+        .expect("decode p3 following fixture");
+    let repository = storage.repository();
+    repository
+        .upsert_my_anime(fixture.payload.my_anime.clone())
+        .expect("save late-link anime");
+
+    let mut task = p4_download_task();
+    task.episode_id = None;
+    task.episode_no = Some(fixture.payload.episode.episode_no);
+    task.status = DownloadStatus::Completed;
+    task.progress = 1.0;
+    task.completed_at = Some("2026-07-25T01:00:00.000Z".to_owned());
+    task.files.truncate(1);
+    task.files[0].episode_id = None;
+    task.files[0].episode_no = Some(fixture.payload.episode.episode_no);
+    task.files[0].progress = 1.0;
+    DownloadRepository::upsert_download_task(&repository, &task).expect("save task before episode");
+
+    repository
+        .upsert_episode(&fixture.payload.episode)
+        .expect("save episode after task");
+
+    let saved_task = DownloadRepository::list_downloads(&repository)
+        .expect("list backfilled task")
+        .into_iter()
+        .find(|item| item.id == task.id)
+        .expect("find backfilled task");
+    assert_eq!(
+        saved_task.episode_id.as_deref(),
+        Some(fixture.payload.episode.id.as_str())
+    );
+    assert_eq!(
+        saved_task.files[0].episode_id.as_deref(),
+        Some(fixture.payload.episode.id.as_str())
+    );
+    assert_eq!(
+        repository
+            .list_episodes(&fixture.payload.episode.anime_id)
+            .expect("list linked episode")[0]
+            .status,
+        EpisodeStatus::Downloaded
+    );
 }
 
 /// 验证删除下载任务会恢复单集状态，且外键失败不会留下半条任务。
@@ -2057,14 +2223,12 @@ fn persists_p3_source_network_state() {
     repository
         .upsert_request_circuit_state(&fixture.payload.circuit_state)
         .expect("save request circuit state");
-    assert_eq!(
-        repository
-            .get_request_circuit_state(&fixture.payload.circuit_state.key)
-            .expect("read request circuit state")
-            .expect("saved request circuit state")
-            .failure_count,
-        2
-    );
+    let circuit = repository
+        .get_request_circuit_state(&fixture.payload.circuit_state.key)
+        .expect("read request circuit state")
+        .expect("saved request circuit state");
+    assert_eq!(circuit.failure_count, 2);
+    assert_eq!(circuit.network_context.as_deref(), Some("fixture-network"));
     repository
         .clear_request_circuit_state(&fixture.payload.circuit_state.key)
         .expect("clear request circuit state");
@@ -2072,6 +2236,53 @@ fn persists_p3_source_network_state() {
         .get_request_circuit_state(&fixture.payload.circuit_state.key)
         .expect("read cleared request circuit state")
         .is_none());
+}
+
+/// 验证 v22 升级会补齐网络上下文列并清除范围未知的旧熔断状态。
+#[test]
+fn migrates_v22_request_circuit_context() {
+    let directory = TestDirectory::new("request-circuit-context-migration");
+    let options = test_options(&directory, "active.sqlite");
+    let database_path = options.database_path.clone();
+    drop(Storage::open(options.clone()).expect("create current database"));
+
+    let legacy = Connection::open(&database_path).expect("open legacy circuit database");
+    legacy
+        .execute_batch(
+            "ALTER TABLE request_circuit_state DROP COLUMN network_context;
+             UPDATE app_meta SET value = '22' WHERE key = 'schema_version';
+             INSERT INTO request_circuit_state (
+               circuit_key, circuit_group, request_host, last_request_at,
+               failure_count, backoff_until, updated_at
+             ) VALUES (
+               'release-source:metadata-bangumi', 'release-source', 'api.bgm.tv',
+               '2026-08-06T05:46:30.000Z', 3, '2099-01-01T00:00:00.000Z',
+               '2026-08-06T05:46:30.000Z'
+             );",
+        )
+        .expect("prepare v22 circuit database");
+    drop(legacy);
+
+    let storage = Storage::open(options).expect("migrate v22 circuit database");
+
+    assert!(column_exists(
+        &storage.connection,
+        "request_circuit_state",
+        "network_context"
+    ));
+    assert_eq!(
+        storage
+            .connection
+            .query_row("SELECT COUNT(*) FROM request_circuit_state", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .expect("count migrated circuit states"),
+        0
+    );
+    assert_eq!(
+        read_meta(&storage.connection, "schema_version"),
+        SQLITE_SCHEMA_VERSION.to_string()
+    );
 }
 
 /// 验证来源绑定和排除记录通过公共 Repository 端口完整持久化并校验输入。

@@ -69,6 +69,7 @@ export type AnimeDetailLibraryAction = "rules" | "resources" | "tasks";
 interface AnimeDetailPageProps {
   allowLibraryManagement?: boolean;
   animeId: string;
+  previewAnime?: Anime;
   refreshKey?: number;
   sourceLabel: string;
   onBack: () => void;
@@ -105,6 +106,7 @@ function resolveActiveSectionId(
 export function AnimeDetailPage({
   allowLibraryManagement,
   animeId,
+  previewAnime,
   refreshKey = 0,
   sourceLabel,
   onBack,
@@ -117,6 +119,7 @@ export function AnimeDetailPage({
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [tracking, setTracking] = useState(false);
+  const [previewingOnline, setPreviewingOnline] = useState(false);
   const [removeDialogOpen, setRemoveDialogOpen] = useState(false);
   const [removing, setRemoving] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -131,7 +134,7 @@ export function AnimeDetailPage({
 
   useEffect(() => {
     void loadDetail();
-  }, [animeId, refreshKey]);
+  }, [animeId, previewAnime, refreshKey]);
 
   useEffect(() => {
     const updateOnline = () => setOnline(navigator.onLine);
@@ -264,6 +267,9 @@ export function AnimeDetailPage({
   /** 从本地聚合接口加载详情首屏。 */
   async function loadDetail() {
     setLoading(true);
+    setResult(null);
+    setMediaFiles([]);
+    setPreviewingOnline(false);
     setError(null);
     console.info("[anime-detail] load requested", { animeId });
     try {
@@ -278,8 +284,16 @@ export function AnimeDetailPage({
       ]);
       setResult(detailResult);
       setMediaFiles(registeredMedia.filter((media) => media.animeId === animeId));
+      setPreviewingOnline(false);
       setSummaryExpanded(false);
     } catch (loadError) {
+      if (previewAnime?.id === animeId && isMissingAnimeDetailError(loadError)) {
+        setResult(createOnlinePreviewResult(previewAnime));
+        setPreviewingOnline(true);
+        setSummaryExpanded(false);
+        console.info("[anime-detail] Bangumi 在线预览已启用", { animeId });
+        return;
+      }
       const message = loadError instanceof Error ? loadError.message : "加载番剧详情失败";
       console.error("[anime-detail] load failed", { animeId, error: loadError });
       setError(message);
@@ -290,7 +304,7 @@ export function AnimeDetailPage({
 
   /** 主动补全外部详情，并保留当前页面内容。 */
   async function refreshDetail() {
-    if (!online || !localClient) return;
+    if (!online || !localClient || previewingOnline) return;
     setRefreshing(true);
     try {
       const refreshed = await appApi.refreshAnimeDetail(animeId);
@@ -311,10 +325,19 @@ export function AnimeDetailPage({
     setTracking(true);
     try {
       const now = new Date().toISOString();
-      await appApi.upsertMyAnime(createDefaultMyAnime(result.anime, now));
+      const item = createDefaultMyAnime(result.anime, now);
+      if (previewingOnline) {
+        await appApi.followBangumiAnime(item);
+      } else {
+        await appApi.upsertMyAnime(item);
+      }
       setResult(await appApi.getAnimeDetail(animeId));
+      setPreviewingOnline(false);
       toast.success(`已添加「${viewModel?.title ?? result.anime.title}」到我的追番`);
-      console.info("[anime-detail] tracker added", { animeId });
+      console.info("[anime-detail] tracker added", {
+        animeId,
+        source: previewingOnline ? "bangumi" : "catalog"
+      });
     } catch (trackingError) {
       toast.error(trackingError instanceof Error ? trackingError.message : "添加追番失败");
     } finally {
@@ -407,7 +430,7 @@ export function AnimeDetailPage({
           </div>
         </div>
         <div className="flex shrink-0 items-center gap-2">
-          {localClient && (
+          {localClient && !previewingOnline && (
             <Button
               disabled={refreshing || !online}
               onClick={() => void refreshDetail()}
@@ -442,7 +465,11 @@ export function AnimeDetailPage({
         <Alert>
           <Info />
           <AlertTitle>当前处于离线状态</AlertTitle>
-          <AlertDescription>已显示本地缓存，恢复网络后可主动刷新详情。</AlertDescription>
+          <AlertDescription>
+            {previewingOnline
+              ? "已显示进入详情前加载的 Bangumi 数据，恢复网络后可继续追番。"
+              : "已显示本地缓存，恢复网络后可主动刷新详情。"}
+          </AlertDescription>
         </Alert>
       )}
 
@@ -464,6 +491,7 @@ export function AnimeDetailPage({
 
           <div className="min-w-0 pt-1 md:pt-2">
             <div className="flex min-w-0 flex-wrap gap-2">
+              {previewingOnline && <Badge tone="blue">Bangumi 在线</Badge>}
               {viewModel.followed && <Badge tone="green"><CheckCircle2 className="mr-1 size-3" />已追番</Badge>}
               {viewModel.airingStatus && <Badge tone="primary">{viewModel.airingStatus}</Badge>}
               {result.stale && <Badge tone="amber">缓存较旧</Badge>}
@@ -495,7 +523,11 @@ export function AnimeDetailPage({
 
           <Card className="col-span-2 min-w-0 bg-primary/5 shadow-none xl:col-span-1 xl:self-start">
             <CardContent className="flex flex-col gap-2 p-4 sm:p-4">
-              {!libraryManagement ? (
+              {previewingOnline ? (
+                <Button disabled={tracking || !online} onClick={() => void addTracker()}>
+                  <Plus data-icon="inline-start" />{tracking ? "添加中" : "添加追番"}
+                </Button>
+              ) : !libraryManagement ? (
                 result.myAnime ? (
                   <Button onClick={() => onOpenLibraryAction(animeId, "tasks")} variant="outline">
                     <ListTodo data-icon="inline-start" />查看追番
@@ -911,6 +943,23 @@ function createDefaultMyAnime(anime: Anime, timestamp: string): MyAnime {
     addedAt: timestamp,
     updatedAt: timestamp
   };
+}
+
+/** 使用 Bangumi 在线快照构造不依赖本地业务数据的详情结果。 */
+function createOnlinePreviewResult(anime: Anime): AnimeDetailResult {
+  return {
+    anime,
+    episodes: [],
+    fansubGroups: [],
+    stale: false,
+    partialErrors: []
+  };
+}
+
+/** 仅将明确的本地记录缺失错误降级为在线预览。 */
+function isMissingAnimeDetailError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return message.includes("番剧不存在") || message.includes("record_not_found");
 }
 
 /** 调用统一播放入口打开已登记的特别内容。 */

@@ -79,6 +79,7 @@ interface AnimeDetailOrigin {
 
 interface AnimeDetailState {
   animeId: string;
+  previewAnime?: Anime;
   origin: AnimeDetailOrigin;
 }
 
@@ -94,7 +95,8 @@ interface ReleaseSearchIntent {
 }
 
 interface RenderPageOptions {
-  onOpenAnimeDetail: (animeId: string) => void;
+  discoveryWorkspaceTabs: boolean;
+  onOpenAnimeDetail: (animeId: string, previewAnime?: Anime) => void;
   onOpenDownloads: () => void;
   onOpenLibraryAction: (animeId: string, action: AnimeDetailLibraryAction) => void;
   onOpenReleaseSearch: (anime: Anime) => void;
@@ -181,6 +183,7 @@ function renderPage(page: PageId, options: RenderPageOptions) {
         <DiscoveryPage
           onOpenAnimeDetail={options.onOpenAnimeDetail}
           onOpenSchedule={options.onOpenDiscoverySchedule}
+          workspaceTabs={options.discoveryWorkspaceTabs}
         />
       );
     case "releaseSearch":
@@ -259,7 +262,7 @@ function MainApplication() {
     && isTauriClient();
 
   /** 记录来源页面上下文并进入详情二级视图。 */
-  function openAnimeDetail(animeId: string) {
+  function openAnimeDetail(animeId: string, previewAnime?: Anime) {
     const originItem = navItems.find((item) => item.id === activePage);
     const origin: AnimeDetailOrigin = {
       pageId: activePage,
@@ -272,7 +275,7 @@ function MainApplication() {
     setDetailActionHostActive(false);
     setDetailRevision(0);
     setMyAnimeIntent(null);
-    setDetailView({ animeId, origin });
+    setDetailView({ animeId, previewAnime, origin });
     window.requestAnimationFrame(() => contentRef.current?.scrollTo({ top: 0, behavior: "auto" }));
   }
 
@@ -607,6 +610,7 @@ function MainApplication() {
       >
         <div className={detailView || discoverySchedule ? "hidden" : undefined}>
           {renderPage(activePage, {
+            discoveryWorkspaceTabs: runtime !== "android" && runtime !== "ios",
             onOpenAnimeDetail: openAnimeDetail,
             onOpenDownloads: () => navigatePage("downloads"),
             onOpenLibraryAction: openLibraryAction,
@@ -641,6 +645,7 @@ function MainApplication() {
             onOpenLibraryAction={openLibraryAction}
             onOpenReleaseSearch={openReleaseSearch}
             onPlayMedia={(filePath) => playMedia({ filePath })}
+            previewAnime={detailView.previewAnime}
             refreshKey={detailRevision}
             sourceLabel={detailView.origin.label}
           />

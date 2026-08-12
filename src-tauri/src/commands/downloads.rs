@@ -8,6 +8,7 @@ use ani_domain::{resolve_anime_download_path, DownloadTask, MyAnime, Release, To
 use ani_downloads::{
     AddTorrentOptions, DownloadAddRequest, DownloadServiceError, DownloadTaskContext,
 };
+use ani_sources::{classify_anime_release, AnimeReleaseCompatibility};
 use serde::Deserialize;
 use serde_json::Value;
 use tauri::{AppHandle, Emitter, State};
@@ -207,6 +208,8 @@ pub(crate) struct AddReleaseDownloadInput {
     save_path: Option<String>,
     #[serde(default)]
     paused: bool,
+    #[serde(default)]
+    confirm_unknown_season: bool,
 }
 
 /// 读取全部本地下载任务快照。
@@ -302,8 +305,7 @@ pub(crate) async fn remove_download(
 ) -> Result<Vec<DownloadTask>, AppCommandError> {
     let engine = current_engine(&state, "删除下载任务")?;
     state
-        .service()
-        .remove(&task_id, delete_files, &engine)
+        .remove_task(&task_id, delete_files, &engine)
         .await
         .map_err(|error| map_download_error("删除下载任务", error))
 }
@@ -433,6 +435,21 @@ pub(crate) async fn add_release_download(
     let engine = state
         .default_engine(&settings)
         .map_err(|error| map_download_error("添加资源下载", error))?;
+    let anime_id = input
+        .anime_id
+        .clone()
+        .or_else(|| input.release.anime_id.clone());
+    let tracked_anime = match anime_id.as_deref() {
+        Some(anime_id) => state
+            .find_my_anime(anime_id)
+            .map_err(|error| runtime_error("读取追番下载目录", error))?,
+        None => None,
+    };
+    ensure_release_matches_tracked_anime(
+        &input.release,
+        tracked_anime.as_ref(),
+        input.confirm_unknown_season,
+    )?;
     let source_url =
         release_download_source_url(&input.release).map_err(|message| AppCommandError {
             code: "invalid_input".to_owned(),
@@ -442,17 +459,10 @@ pub(crate) async fn add_release_download(
         .prepare_source(&source_url, &settings)
         .await
         .map_err(|error| runtime_error("准备资源下载", error))?;
-    let anime_id = input.anime_id.or_else(|| input.release.anime_id.clone());
     let episode_no = input.episode_no.or(input.release.episode_no);
     let fansub_group_id = input
         .fansub_group_id
         .or_else(|| input.release.fansub_group_id.clone());
-    let tracked_anime = match anime_id.as_deref() {
-        Some(anime_id) => state
-            .find_my_anime(anime_id)
-            .map_err(|error| runtime_error("读取追番下载目录", error))?,
-        None => None,
-    };
     let save_path = resolve_release_save_path(
         input.save_path.as_deref(),
         &settings,
@@ -644,6 +654,45 @@ fn build_correlation_tag(
     )
 }
 
+/// 阻止季度不兼容资源，并仅允许人工确认一条未知季度资源。
+fn ensure_release_matches_tracked_anime(
+    release: &Release,
+    tracked_anime: Option<&MyAnime>,
+    confirm_unknown_season: bool,
+) -> Result<(), AppCommandError> {
+    let Some(tracked_anime) = tracked_anime else {
+        return Ok(());
+    };
+    let compatibility = classify_anime_release(release, &tracked_anime.anime);
+    match compatibility {
+        AnimeReleaseCompatibility::Current => return Ok(()),
+        AnimeReleaseCompatibility::Other if confirm_unknown_season => {
+            log::info!(
+                "Tauri 单条未知季度资源已人工确认 anime_id={} release_id={}",
+                tracked_anime.anime.id,
+                release.id
+            );
+            return Ok(());
+        }
+        AnimeReleaseCompatibility::Other | AnimeReleaseCompatibility::Mismatch => {}
+    }
+
+    log::warn!(
+        "Tauri 资源下载季度门禁拒绝 anime_id={} release_id={} compatibility={compatibility:?}",
+        tracked_anime.anime.id,
+        release.id
+    );
+    let reason = match compatibility {
+        AnimeReleaseCompatibility::Other => "资源未标明当前季度",
+        AnimeReleaseCompatibility::Mismatch => "资源季度与当前追番不一致",
+        AnimeReleaseCompatibility::Current => unreachable!(),
+    };
+    Err(AppCommandError {
+        code: "invalid_input".to_owned(),
+        message: format!("{reason}，已阻止关联到「{}」", tracked_anime.anime.title),
+    })
+}
+
 /// 将下载服务错误映射为 Renderer 可处理的稳定命令错误。
 fn map_download_error(action: &str, error: DownloadServiceError) -> AppCommandError {
     log::error!("Tauri 下载命令失败 action={action} error={error}");
@@ -694,5 +743,89 @@ mod tests {
             build_correlation_tag(Some("anime-1"), None, Some(2.0), "release-1"),
             "ani:anime-1:2:release-1"
         );
+    }
+
+    /// 验证后端下载命令拒绝续作中未标季数的资源。
+    #[test]
+    fn rejects_unmarked_release_for_tracked_sequel() {
+        let tracked_anime = tracked_anime("地狱模式 第二季", "Hell Mode 2nd Season");
+        let release = release_with_season(None);
+
+        let error = ensure_release_matches_tracked_anime(&release, Some(&tracked_anime), false)
+            .expect_err("unmarked sequel release must be rejected");
+
+        assert_eq!(error.code, "invalid_input");
+        assert!(error.message.contains("资源未标明当前季度"));
+    }
+
+    /// 验证后端下载命令接受明确标注当前季的资源。
+    #[test]
+    fn accepts_marked_release_for_tracked_sequel() {
+        let tracked_anime = tracked_anime("地狱模式 第二季", "Hell Mode 2nd Season");
+        let release = release_with_season(Some(2));
+
+        assert!(
+            ensure_release_matches_tracked_anime(&release, Some(&tracked_anime), false).is_ok()
+        );
+    }
+
+    /// 验证人工确认只放行当前这一条未知季度资源。
+    #[test]
+    fn accepts_confirmed_unknown_season_release() {
+        let tracked_anime = tracked_anime("地狱模式 第二季", "Hell Mode 2nd Season");
+        let release = release_with_season(None);
+
+        assert!(ensure_release_matches_tracked_anime(&release, Some(&tracked_anime), true).is_ok());
+    }
+
+    /// 验证明确季度不匹配的资源即使携带确认标志也会被拒绝。
+    #[test]
+    fn rejects_mismatched_release_even_when_confirmed() {
+        let tracked_anime = tracked_anime("地狱模式 第二季", "Hell Mode 2nd Season");
+        let release = release_with_season(Some(1));
+
+        let error = ensure_release_matches_tracked_anime(&release, Some(&tracked_anime), true)
+            .expect_err("explicit season mismatch must stay blocked");
+
+        assert_eq!(error.code, "invalid_input");
+        assert!(error.message.contains("资源季度与当前追番不一致"));
+    }
+
+    /// 创建下载季度门禁测试所需的追番记录。
+    fn tracked_anime(title: &str, original_title: &str) -> MyAnime {
+        serde_json::from_value(serde_json::json!({
+            "id": "my-anime-hell-mode-2",
+            "anime": {
+                "id": "anime-hell-mode-2",
+                "title": title,
+                "originalTitle": original_title,
+                "aliases": [],
+                "premiereYear": 2026,
+                "premiereMonth": 7,
+                "externalIds": {}
+            },
+            "status": "watching",
+            "autoDownload": true,
+            "addedAt": "2026-08-03T00:00:00.000Z",
+            "updatedAt": "2026-08-03T00:00:00.000Z"
+        }))
+        .expect("decode tracked anime")
+    }
+
+    /// 创建带可选季数标记的下载资源。
+    fn release_with_season(series_season_no: Option<i64>) -> Release {
+        let mut release: Release = serde_json::from_value(serde_json::json!({
+            "id": "nyaa:https://nyaa.si/view/2081273",
+            "title": "[LoliHouse] 地狱模式～喜欢速通游戏的玩家在废设定异世界无双～ / Hell Mode - 08 [WebRip 1080p HEVC-10bit AAC][简繁内封字幕]",
+            "episodeNo": 8,
+            "contentKind": "episode",
+            "sourceId": "nyaa",
+            "sourceName": "Nyaa",
+            "magnetUrl": "magnet:?xt=urn:btih:365cc4e818e5c9073fe53c72fa2319dad3708b5d",
+            "publishedAt": "2026-08-03T00:00:00.000Z"
+        }))
+        .expect("decode release");
+        release.series_season_no = series_season_no;
+        release
     }
 }

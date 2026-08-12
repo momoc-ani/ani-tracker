@@ -15,9 +15,10 @@ use ani_domain::{
     Anime, AnimeDetailResult, AnimeDiscoveryQuery, AnimeDiscoveryResult,
     AnimeDiscoverySearchResult, AnimeDiscoverySeasonQuery, AnimeDiscoverySeasonResult,
     AnimeDiscoverySyncTaskStatus, AnimeSeasonSyncState, AnimeWatchProgress, AppSettings,
-    DashboardData, Episode, EpisodePreference, FansubGroup, MyAnime, NotificationRecord,
-    PlaybackCheckpoint, ReleaseSourceConfig, ReportPlaybackProgressInput,
-    SavePlaybackCheckpointInput, SetAnimeWatchProgressInput,
+    BangumiBrowseQuery, BangumiBrowseResult, BangumiBrowseYearRange, DashboardData, Episode,
+    EpisodePreference, FansubGroup, MyAnime, NotificationRecord, PlaybackCheckpoint,
+    ReleaseSourceConfig, ReportPlaybackProgressInput, SavePlaybackCheckpointInput,
+    SetAnimeWatchProgressInput,
 };
 use ani_repository::{prelude::*, RepositoryError};
 use ani_sources::{
@@ -405,6 +406,123 @@ pub(crate) async fn upsert_my_anime(
     .await
 }
 
+/// 保存 Bangumi 追番，并在不阻塞界面的后台补全 AniList 与 Mikan 元数据。
+#[tauri::command]
+pub(crate) async fn follow_bangumi_anime(
+    item: MyAnime,
+    state: State<'_, AppStorageState>,
+    source_state: State<'_, AppSourceState>,
+) -> Result<Vec<MyAnime>, AppCommandError> {
+    let anime = item.anime.clone();
+    let storage = Arc::clone(state.storage());
+    let defaults = state.platform_defaults().clone();
+    let updated = run_query(
+        "保存 Bangumi 追番",
+        Arc::clone(&storage),
+        move |storage| storage.repository().upsert_my_anime(item),
+    )
+    .await?;
+    start_follow_metadata_enrichment(storage, defaults, source_state.inner().clone(), anime);
+    Ok(updated)
+}
+
+/// 启动追番后的在线补全任务，失败只记录日志，不回滚已保存的追番。
+fn start_follow_metadata_enrichment(
+    storage: Arc<Mutex<Storage>>,
+    defaults: AppSettings,
+    source_state: AppSourceState,
+    anime: Anime,
+) {
+    tauri::async_runtime::spawn(async move {
+        if let Err(error) = enrich_followed_anime(storage, defaults, source_state, anime).await {
+            log::warn!("Bangumi 追番后台补全失败 error={}", error.message);
+        }
+    });
+}
+
+/// 使用同一 Bangumi 标识锁定聚合结果，避免相似标题被错误合并。
+async fn enrich_followed_anime(
+    storage: Arc<Mutex<Storage>>,
+    defaults: AppSettings,
+    source_state: AppSourceState,
+    anime: Anime,
+) -> Result<(), AppCommandError> {
+    let bangumi_id = anime
+        .external_ids
+        .get("bangumi")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .ok_or_else(|| AppCommandError {
+            code: "invalid_input".to_owned(),
+            message: "Bangumi 追番缺少来源标识".to_owned(),
+        })?;
+    let settings = run_query(
+        "读取追番补全设置",
+        Arc::clone(&storage),
+        move |storage| storage.repository().get_settings(&defaults),
+    )
+    .await?;
+    let network = source_state
+        .network_service(&settings)
+        .await
+        .map_err(|error| map_metadata_error("初始化追番补全网络", error))?;
+    let online = AnimeMetadataService::new(network)
+        .search(
+            &SharedReleaseSearchStore::new(Arc::clone(&storage)),
+            &anime.title,
+        )
+        .await;
+    for error in online.errors {
+        log::warn!(
+            "Bangumi 追番补全来源失败 anime_id={} error={error}",
+            anime.id
+        );
+    }
+    let Some(candidate) = online.items.into_iter().find(|item| {
+        item.external_ids
+            .get("bangumi")
+            .and_then(Value::as_str)
+            .is_some_and(|value| value == bangumi_id)
+    }) else {
+        log::info!(
+            "Bangumi 追番补全未找到同源候选 anime_id={} bangumi_id={}",
+            anime.id,
+            bangumi_id
+        );
+        return Ok(());
+    };
+    let mut merged = merge_anime_metadata_batches(&[
+        AnimeMetadataBatch {
+            source: "follow-local".to_owned(),
+            items: vec![anime.clone()],
+        },
+        AnimeMetadataBatch {
+            source: "follow-online".to_owned(),
+            items: vec![candidate],
+        },
+    ])
+    .into_iter()
+    .next()
+    .unwrap_or_else(|| anime.clone());
+    merged.id.clone_from(&anime.id);
+    for (index, alias) in merged.aliases.iter_mut().enumerate() {
+        alias.id = format!("{}-alias-{}", merged.id, index + 1);
+        alias.anime_id.clone_from(&merged.id);
+    }
+    let anime_id = merged.id.clone();
+    run_query("保存追番在线补全", storage, move |storage| {
+        storage
+            .repository()
+            .upsert_anime_catalog_details(&[merged])
+            .map(|_| ())
+    })
+    .await?;
+    log::info!("Bangumi 追番后台补全完成 anime_id={anime_id}");
+    Ok(())
+}
+
 /// 删除追番及其单集业务数据。
 #[tauri::command]
 pub(crate) async fn remove_my_anime(
@@ -623,6 +741,66 @@ pub(crate) async fn search_anime_catalog(
         },
         errors,
     })
+}
+
+/// 直接在线浏览 Bangumi，结果不写入季度目录缓存。
+#[tauri::command]
+pub(crate) async fn browse_bangumi_anime(
+    query: BangumiBrowseQuery,
+    state: State<'_, AppStorageState>,
+    source_state: State<'_, AppSourceState>,
+) -> Result<BangumiBrowseResult, AppCommandError> {
+    if query.page == 0 || !(1..=50).contains(&query.page_size) {
+        return Err(AppCommandError {
+            code: "invalid_input".to_owned(),
+            message: "Bangumi 分页参数无效".to_owned(),
+        });
+    }
+    if query.keyword.chars().count() > 120 || query.keyword.chars().any(char::is_control) {
+        return Err(AppCommandError {
+            code: "invalid_input".to_owned(),
+            message: "Bangumi 搜索关键词长度或格式无效".to_owned(),
+        });
+    }
+    let invalid_year_range = query.filters.year_range.as_ref().is_some_and(|range| {
+        let boundary = match range {
+            BangumiBrowseYearRange::Future { start_year } => start_year,
+            BangumiBrowseYearRange::Earlier { end_year } => end_year,
+        };
+        !(1900..=2200).contains(boundary)
+    });
+    if query.filters.years.len() > 1
+        || (!query.filters.years.is_empty() && query.filters.year_range.is_some())
+        || query
+            .filters
+            .years
+            .iter()
+            .any(|year| !(1900..=2200).contains(year))
+        || invalid_year_range
+        || !query.filters.min_rating.is_finite()
+        || !(0.0..=10.0).contains(&query.filters.min_rating)
+    {
+        return Err(AppCommandError {
+            code: "invalid_input".to_owned(),
+            message: "Bangumi 筛选参数无效".to_owned(),
+        });
+    }
+    let storage = Arc::clone(state.storage());
+    let defaults = state.platform_defaults().clone();
+    let settings = run_query(
+        "读取 Bangumi 浏览设置",
+        Arc::clone(&storage),
+        move |storage| storage.repository().get_settings(&defaults),
+    )
+    .await?;
+    let network = source_state
+        .network_service(&settings)
+        .await
+        .map_err(|error| map_metadata_error("初始化 Bangumi 浏览网络", error))?;
+    AnimeMetadataService::new(network)
+        .browse_bangumi(&SharedReleaseSearchStore::new(storage), query)
+        .await
+        .map_err(|error| map_metadata_error("浏览 Bangumi", error))
 }
 
 /// 采集并保存指定月份的新番目录。

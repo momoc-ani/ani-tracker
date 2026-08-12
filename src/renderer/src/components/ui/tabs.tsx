@@ -20,7 +20,7 @@ const TabsList = React.forwardRef<
     className={cn(
       "inline-flex h-11 items-center justify-center rounded-md bg-muted p-1 text-muted-foreground md:h-9",
       variant === "line" &&
-        "h-auto justify-start gap-5 rounded-none border-b bg-transparent p-0 md:h-auto [&_[role=tab]]:rounded-none [&_[role=tab]]:border-b-2 [&_[role=tab]]:border-transparent [&_[role=tab]]:bg-transparent [&_[role=tab]]:px-0 [&_[role=tab]]:pb-3 [&_[role=tab]]:pt-2 [&_[role=tab]]:shadow-none [&_[role=tab][data-state=active]]:border-primary [&_[role=tab][data-state=active]]:bg-transparent [&_[role=tab][data-state=active]]:text-primary [&_[role=tab][data-state=active]]:shadow-none",
+        "h-auto justify-start gap-5 rounded-none bg-transparent p-0 md:h-auto [&_[role=tab]]:rounded-none [&_[role=tab]]:border-b-2 [&_[role=tab]]:border-transparent [&_[role=tab]]:bg-transparent [&_[role=tab]]:px-0 [&_[role=tab]]:pb-3 [&_[role=tab]]:pt-2 [&_[role=tab]]:shadow-none [&_[role=tab][data-state=active]]:border-primary [&_[role=tab][data-state=active]]:bg-transparent [&_[role=tab][data-state=active]]:text-primary [&_[role=tab][data-state=active]]:shadow-none",
       className
     )}
     {...props}

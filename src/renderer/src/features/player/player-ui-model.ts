@@ -2,6 +2,7 @@ import { formatBytes } from "@/lib/format";
 import type { DownloadTask, Episode } from "@shared/domain";
 import type { RemotePlaybackSession } from "@shared/contracts";
 import { isSpecialMediaContent } from "@shared/media-content";
+import { groupEpisodePlaylistItems } from "@shared/player-playlist-policy";
 import type { RemotePlaylistItem } from "@/features/player/playback-list-model";
 
 export type PlayerEpisodeUiStatus = "playing" | "watched" | "ready" | "downloading" | "unavailable";
@@ -55,22 +56,22 @@ export function buildPlayerEpisodeItems(input: BuildPlayerEpisodeItemsInput): Pl
     ];
   }
 
-  const episodeItems = [...episodeNumbers]
-    .sort((left, right) => left - right)
-    .map((episodeNo) => buildEpisodeItem(episodeNo, input));
+  const episodeItems = groupEpisodePlaylistItems(episodeNumbers, regularPlaylist)
+    .flatMap(({ episodeNo, items }) => items.length > 0
+      ? items.map((item) => buildEpisodeItem(episodeNo, input, item))
+      : [buildEpisodeItem(episodeNo, input)]);
   return [...episodeItems, ...specialItems];
 }
 
 /** 为有明确集数的条目生成状态、规格与观看进度。 */
 function buildEpisodeItem(
   episodeNo: number,
-  input: BuildPlayerEpisodeItemsInput
+  input: BuildPlayerEpisodeItemsInput,
+  playlistItem?: RemotePlaylistItem
 ): PlayerEpisodeUiItem {
   const episode = input.episodes.find((item) => item.episodeNo === episodeNo);
-  const task = input.downloadTasks.find((item) => item.episodeNo === episodeNo);
-  const playlistItem = input.playlist.find((item) =>
-    !isSpecialMediaContent(item.contentKind) && item.episodeNo === episodeNo
-  );
+  const task = playlistItem?.task
+    ?? input.downloadTasks.find((item) => item.episodeNo === episodeNo);
   const resolvedTask = playlistItem?.task ?? task;
   const active = playlistItem?.id === input.activeItem?.id;
   const state = resolveEpisodeState(active, episode, resolvedTask, playlistItem);
@@ -79,7 +80,7 @@ function buildEpisodeItem(
     : state.status === "watched" ? 1 : resolvedTask?.progress ?? 0;
 
   return {
-    id: episode?.id ?? playlistItem?.id ?? task?.id ?? `episode-${episodeNo}`,
+    id: playlistItem?.id ?? episode?.id ?? task?.id ?? `episode-${episodeNo}`,
     episodeNo,
     numberLabel: String(episodeNo).padStart(2, "0"),
     title: playlistItem?.displayTitle || episode?.title?.trim() || resolvedTask?.name || `第 ${episodeNo} 集`,
@@ -159,6 +160,7 @@ function formatEpisodeMeta(
   task: DownloadTask | undefined
 ): string {
   return [
+    task?.fansubName?.trim(),
     item?.fileName,
     session?.durationSeconds ? formatPlaybackTime(session.durationSeconds) : undefined,
     task?.resolution?.toUpperCase(),

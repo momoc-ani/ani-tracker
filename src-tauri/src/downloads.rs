@@ -32,6 +32,7 @@ use tauri::AppHandle;
 use tauri::Manager;
 #[cfg(any(target_os = "android", target_os = "ios"))]
 use tauri_plugin_ani_torrent::{AniTorrentExt, MobileTorrentCoreTransport};
+use tokio::sync::Mutex as AsyncMutex;
 
 use crate::qbittorrent_managed::{managed_credentials, AppManagedQbittorrentState};
 use crate::sources::native_http_config;
@@ -264,6 +265,7 @@ pub(crate) struct AppDownloadState {
     qbittorrent: Arc<QbittorrentEngine>,
     managed_qbittorrent: AppManagedQbittorrentState,
     embedded_lifecycle: Arc<Mutex<EmbeddedLifecycle>>,
+    embedded_operation: Arc<AsyncMutex<()>>,
     #[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
     embedded_transport: Arc<ProcessTorrentCoreTransport>,
     #[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
@@ -336,6 +338,7 @@ impl AppDownloadState {
             qbittorrent,
             managed_qbittorrent: AppManagedQbittorrentState::new(app),
             embedded_lifecycle: Arc::new(Mutex::new(EmbeddedLifecycle::default())),
+            embedded_operation: Arc::new(AsyncMutex::new(())),
             #[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
             embedded_transport,
             #[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
@@ -598,8 +601,72 @@ impl AppDownloadState {
         Ok(status)
     }
 
+    /// 按任务原属引擎删除，并在需要时临时唤起已停用的内置核心。
+    pub(crate) async fn remove_task(
+        &self,
+        task_id: &str,
+        delete_files: bool,
+        visible_engine: &TorrentEngineKind,
+    ) -> Result<Vec<DownloadTask>, DownloadServiceError> {
+        let task_engine = self.service.task_engine(task_id)?;
+        let removed_engine_tasks = if task_engine == TorrentEngineKind::Embedded {
+            let _operation = self.embedded_operation.lock().await;
+            let settings = self
+                .settings()
+                .map_err(|error| embedded_remove_error("readSettingsForRemove", error))?;
+            let embedded_running = self
+                .embedded_status(&settings)
+                .await
+                .map_err(|error| embedded_remove_error("readStatusForRemove", error))?
+                .running;
+            let temporarily_started =
+                should_temporarily_start_embedded(&task_engine, embedded_running);
+            if temporarily_started {
+                log::info!("删除历史任务前临时启动内置核心：task_id={task_id}");
+                if let Err(error) = self.start_embedded_unlocked(&settings).await {
+                    if let Err(stop_error) = self.stop_embedded_unlocked().await {
+                        log::error!(
+                            "内置核心临时启动失败后恢复停用失败：task_id={task_id}, error={stop_error}"
+                        );
+                    }
+                    return Err(embedded_remove_error("startForRemove", error));
+                }
+            }
+
+            let removal = self.service.remove(task_id, delete_files).await;
+            if temporarily_started {
+                match self.stop_embedded_unlocked().await {
+                    Ok(()) => log::info!("历史任务删除后内置核心已恢复停用：task_id={task_id}"),
+                    Err(stop_error) => {
+                        log::error!(
+                            "历史任务删除后内置核心恢复停用失败：task_id={task_id}, error={stop_error}"
+                        );
+                        if removal.is_ok() {
+                            return Err(embedded_remove_error("restoreAfterRemove", stop_error));
+                        }
+                    }
+                }
+            }
+            removal?
+        } else {
+            self.service.remove(task_id, delete_files).await?
+        };
+
+        if &task_engine == visible_engine {
+            Ok(removed_engine_tasks)
+        } else {
+            self.service.list_for_engine(visible_engine)
+        }
+    }
+
     /// 启动或重配桌面 torrent-core，并记录生命周期结果。
     pub(crate) async fn start_embedded(&self, settings: &AppSettings) -> Result<(), String> {
+        let _operation = self.embedded_operation.lock().await;
+        self.start_embedded_unlocked(settings).await
+    }
+
+    /// 在持有内置核心操作锁时启动或重配核心。
+    async fn start_embedded_unlocked(&self, settings: &AppSettings) -> Result<(), String> {
         let result = async {
             let engine = self
                 .registry
@@ -626,6 +693,12 @@ impl AppDownloadState {
 
     /// 请求 torrent-core 保存恢复数据并停止。
     pub(crate) async fn stop_embedded(&self) -> Result<(), String> {
+        let _operation = self.embedded_operation.lock().await;
+        self.stop_embedded_unlocked().await
+    }
+
+    /// 在持有内置核心操作锁时保存恢复数据并停止核心。
+    async fn stop_embedded_unlocked(&self) -> Result<(), String> {
         if let Ok(engine) = self.registry.require(&TorrentEngineKind::Embedded) {
             engine.shutdown().await.map_err(|error| error.to_string())?;
             if let Ok(mut lifecycle) = self.embedded_lifecycle.lock() {
@@ -878,6 +951,26 @@ impl AppDownloadState {
         for (kind, error) in self.registry.shutdown_all().await {
             log::error!("Tauri 下载引擎关闭失败 engine={kind:?} error={error}");
         }
+    }
+}
+
+/// 判断删除任务是否需要临时启动当前未运行的内置核心。
+fn should_temporarily_start_embedded(
+    task_engine: &TorrentEngineKind,
+    embedded_running: bool,
+) -> bool {
+    task_engine == &TorrentEngineKind::Embedded && !embedded_running
+}
+
+/// 将宿主侧内置核心生命周期错误映射到稳定下载错误模型。
+fn embedded_remove_error(
+    operation: &'static str,
+    error: impl Into<String>,
+) -> DownloadServiceError {
+    DownloadServiceError::Engine {
+        engine: TorrentEngineKind::Embedded,
+        operation,
+        source: ani_downloads::DownloadEngineError::Unavailable(error.into()),
     }
 }
 
@@ -1331,6 +1424,23 @@ mod tests {
         assert_eq!(config.max_upload_speed, 128);
         assert_eq!(config.seeding_limits.ratio_limit, 1.5);
         assert_eq!(config.seeding_limits.time_limit_minutes, 90);
+    }
+
+    /// 验证仅删除已停用内置核心的历史任务时执行临时启停。
+    #[test]
+    fn decides_temporary_embedded_lifecycle_for_removal() {
+        assert!(should_temporarily_start_embedded(
+            &TorrentEngineKind::Embedded,
+            false
+        ));
+        assert!(!should_temporarily_start_embedded(
+            &TorrentEngineKind::Embedded,
+            true
+        ));
+        assert!(!should_temporarily_start_embedded(
+            &TorrentEngineKind::Qbittorrent,
+            false
+        ));
     }
 
     /// 验证历史 AniBT 磁链恢复 dn、xl 和 tracker 参数分隔符。

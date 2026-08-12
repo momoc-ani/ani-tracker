@@ -200,6 +200,7 @@ test("Tauri P3 来源网络契约金样可被 TypeScript 接受", () => {
   assert.equal(fixture.payload.source.requestIntervalMs, 1_750);
   assert.equal(fixture.payload.syncState.requestFailureCount, 2);
   assert.equal(fixture.payload.circuitState.key, `release-source:${fixture.payload.source.id}`);
+  assert.equal(fixture.payload.circuitState.networkContext, "fixture-network");
 });
 
 /** 读取 P3 来源同步金样，验证调度器和执行结果字段一致。 */

@@ -144,7 +144,7 @@ impl AnimeSourceBindingService {
         let anime = find_anime(store, anime_id)?;
         let sources = store.list_binding_sources()?;
         let episodes = store.list_binding_episodes(anime_id)?;
-        let bindings = sync_external_id_bindings(store, &anime, &sources)?;
+        let mut bindings = sync_external_id_bindings(store, &anime, &sources)?;
         let exclusions = store.list_exclusions(anime_id)?;
         let excluded_source_ids = exclusions
             .iter()
@@ -209,12 +209,27 @@ impl AnimeSourceBindingService {
         for (source, result) in discovered {
             match result {
                 Ok(source_candidates) => {
-                    candidates.extend(source_candidates.into_iter().filter(|candidate| {
-                        !excluded_candidate_keys.contains(&candidate_key(
-                            &candidate.source_id,
-                            &candidate.source_anime_id,
-                        ))
-                    }))
+                    let source_candidates = source_candidates
+                        .into_iter()
+                        .filter(|candidate| {
+                            !excluded_candidate_keys.contains(&candidate_key(
+                                &candidate.source_id,
+                                &candidate.source_anime_id,
+                            ))
+                        })
+                        .collect::<Vec<_>>();
+                    let has_binding_record = bindings
+                        .iter()
+                        .any(|binding| binding.source_id == source.id);
+                    if !has_binding_record {
+                        if let Some(candidate) =
+                            safe_auto_binding_candidate(&anime, &source_candidates)
+                        {
+                            bindings = save_scored_binding(store, &anime, candidate)?;
+                            continue;
+                        }
+                    }
+                    candidates.extend(source_candidates);
                 }
                 Err(error) => {
                     log::warn!(
@@ -658,6 +673,63 @@ fn score_candidate(
     candidate
 }
 
+/// 仅返回同来源唯一且标题、年份、季度均可确认的高分候选。
+fn safe_auto_binding_candidate<'candidate>(
+    anime: &Anime,
+    candidates: &'candidate [AnimeSourceCandidate],
+) -> Option<&'candidate AnimeSourceCandidate> {
+    let mut safe_candidates = candidates.iter().filter(|candidate| {
+        candidate.score >= 90
+            && candidate_titles(candidate).any(|title| {
+                let normalized = normalize_title(title);
+                !normalized.is_empty()
+                    && anime_titles(anime)
+                        .into_iter()
+                        .any(|local| normalize_title(local) == normalized)
+            })
+            && candidate.premiere_year == Some(anime.premiere_year)
+            && candidate.premiere_month.is_some_and(|month| {
+                (1..=12).contains(&month)
+                    && season_index(month) == season_index(anime.premiere_month)
+            })
+    });
+    let candidate = safe_candidates.next()?;
+    safe_candidates.next().is_none().then_some(candidate)
+}
+
+/// 将安全评分候选保存为已确认绑定。
+fn save_scored_binding<S>(
+    store: &S,
+    anime: &Anime,
+    candidate: &AnimeSourceCandidate,
+) -> Result<Vec<AnimeSourceBinding>, SourceError>
+where
+    S: AnimeSourceBindingStore,
+{
+    let timestamp = now_iso();
+    let bindings = store.save_binding(&AnimeSourceBinding {
+        id: binding_id(&anime.id, &candidate.source_id),
+        anime_id: anime.id.clone(),
+        source_id: candidate.source_id.clone(),
+        source_anime_id: candidate.source_anime_id.clone(),
+        source_anime_title: normalized_optional_text(Some(candidate.title.clone())),
+        source_url: normalized_optional_text(candidate.source_url.clone()),
+        match_method: AnimeSourceBindingMatchMethod::Scored,
+        confidence: (candidate.score as f64 / 100.0).clamp(0.0, 1.0),
+        confirmed: true,
+        created_at: timestamp.clone(),
+        updated_at: timestamp,
+    })?;
+    log::info!(
+        "Rust 高置信来源候选已自动绑定：anime_id={}, source_id={}, source_anime_id={}, score={}",
+        anime.id,
+        candidate.source_id,
+        candidate.source_anime_id,
+        candidate.score
+    );
+    Ok(bindings)
+}
+
 fn best_title_similarity(anime: &Anime, candidate: &AnimeSourceCandidate) -> f64 {
     let local = anime_titles(anime);
     let source = std::iter::once(candidate.title.as_str())
@@ -899,6 +971,14 @@ fn anime_titles(anime: &Anime) -> Vec<&str> {
         .chain(anime.aliases.iter().map(|alias| alias.alias.as_str()))
         .filter(|value| !value.trim().is_empty())
         .collect()
+}
+
+/// 返回来源候选可用于精确匹配的全部标题。
+fn candidate_titles(candidate: &AnimeSourceCandidate) -> impl Iterator<Item = &str> {
+    std::iter::once(candidate.title.as_str())
+        .chain(candidate.original_title.as_deref())
+        .chain(candidate.aliases.iter().map(String::as_str))
+        .filter(|value| !value.trim().is_empty())
 }
 
 fn candidate_key(source_id: &str, source_anime_id: &str) -> String {
@@ -1226,13 +1306,103 @@ mod tests {
             .any(|binding| binding.source_id == "mikan-rss" && binding.source_anime_id == "3941"));
     }
 
+    /// 验证唯一安全高分候选会自动保存为评分绑定。
+    #[tokio::test]
+    async fn auto_binds_unique_safe_scored_candidate() {
+        let base_url = serve_repeated(
+            2,
+            "200 OK",
+            r#"{"ok":true,"data":[{"bgmId":"528828","nameCn":"来源绑定测试番","year":2026,"month":7,"episodeCount":12}]}"#,
+        )
+        .await;
+        let mut anime = test_anime();
+        anime.external_ids = Value::Object(Default::default());
+        let store = MemoryBindingStore {
+            followed: vec![followed(anime)],
+            sources: vec![anibt_source(&base_url)],
+            episodes: test_episodes(12),
+            ..MemoryBindingStore::default()
+        };
+
+        let state = AnimeSourceBindingService::new(test_network())
+            .get_state(&store, "anime-binding-test", true)
+            .await
+            .expect("auto bind unique safe candidate");
+
+        assert!(state.candidates.is_empty());
+        assert_eq!(state.bindings.len(), 1);
+        assert_eq!(
+            state.bindings[0].match_method,
+            AnimeSourceBindingMatchMethod::Scored
+        );
+        assert_eq!(state.bindings[0].confidence, 1.0);
+        assert!(state.bindings[0].confirmed);
+    }
+
+    /// 验证同来源存在多个安全候选时仍交由用户确认。
+    #[tokio::test]
+    async fn keeps_ambiguous_safe_candidates_unbound() {
+        let base_url = serve_repeated(
+            2,
+            "200 OK",
+            r#"{"ok":true,"data":[{"bgmId":"528828","nameCn":"来源绑定测试番","year":2026,"month":7,"episodeCount":12},{"bgmId":"528829","nameCn":"来源绑定测试番","year":2026,"month":7,"episodeCount":12}]}"#,
+        )
+        .await;
+        let mut anime = test_anime();
+        anime.external_ids = Value::Object(Default::default());
+        let store = MemoryBindingStore {
+            followed: vec![followed(anime)],
+            sources: vec![anibt_source(&base_url)],
+            episodes: test_episodes(12),
+            ..MemoryBindingStore::default()
+        };
+
+        let state = AnimeSourceBindingService::new(test_network())
+            .get_state(&store, "anime-binding-test", true)
+            .await
+            .expect("keep ambiguous candidates");
+
+        assert!(state.bindings.is_empty());
+        assert_eq!(state.candidates.len(), 2);
+    }
+
+    /// 验证用户解除过的绑定记录不会被高分候选再次自动启用。
+    #[tokio::test]
+    async fn does_not_rebind_user_removed_candidate() {
+        let base_url = serve_repeated(
+            2,
+            "200 OK",
+            r#"{"ok":true,"data":[{"bgmId":"528828","nameCn":"来源绑定测试番","year":2026,"month":7,"episodeCount":12}]}"#,
+        )
+        .await;
+        let mut anime = test_anime();
+        anime.external_ids = Value::Object(Default::default());
+        let store = MemoryBindingStore {
+            followed: vec![followed(anime)],
+            sources: vec![anibt_source(&base_url)],
+            episodes: test_episodes(12),
+            bindings: Mutex::new(vec![inactive_binding()]),
+            ..MemoryBindingStore::default()
+        };
+
+        let state = AnimeSourceBindingService::new(test_network())
+            .get_state(&store, "anime-binding-test", true)
+            .await
+            .expect("preserve removed binding state");
+
+        assert_eq!(state.bindings.len(), 1);
+        assert!(!state.bindings[0].confirmed);
+        assert_eq!(state.bindings[0].confidence, 0.0);
+        assert_eq!(state.candidates.len(), 1);
+    }
+
     /// 验证单来源候选发现失败不会丢失其他来源的候选。
     #[tokio::test]
     async fn preserves_candidates_when_one_binding_source_fails() {
         let mikan_base = serve_repeated(
             1,
             "200 OK",
-            r#"<a href="/Home/Bangumi/3941" title="来源绑定测试番"></a>"#,
+            r#"<a href="/Home/Bangumi/3941" title="来源绑定候选测试番"></a>"#,
         )
         .await;
         let anibt_base = serve_repeated(2, "503 Service Unavailable", "busy").await;
@@ -1346,6 +1516,38 @@ mod tests {
             preferred_subtitle: None,
             added_at: "2026-07-25T00:00:00.000Z".to_owned(),
             updated_at: "2026-07-25T00:00:00.000Z".to_owned(),
+        }
+    }
+
+    /// 创建指定数量的绑定评分测试单集。
+    fn test_episodes(count: i64) -> Vec<Episode> {
+        (1..=count)
+            .map(|episode_no| {
+                serde_json::from_value(json!({
+                    "id": format!("episode-binding-test-{episode_no}"),
+                    "animeId": "anime-binding-test",
+                    "episodeNo": episode_no,
+                    "status": "aired"
+                }))
+                .expect("decode binding test episode")
+            })
+            .collect()
+    }
+
+    /// 创建一条代表用户已解除的未确认绑定。
+    fn inactive_binding() -> AnimeSourceBinding {
+        AnimeSourceBinding {
+            id: "source-binding:anime-binding-test:anibt".to_owned(),
+            anime_id: "anime-binding-test".to_owned(),
+            source_id: "anibt".to_owned(),
+            source_anime_id: "528828".to_owned(),
+            source_anime_title: Some("来源绑定测试番".to_owned()),
+            source_url: Some("https://bgm.tv/subject/528828".to_owned()),
+            match_method: AnimeSourceBindingMatchMethod::Scored,
+            confidence: 0.0,
+            confirmed: false,
+            created_at: "2026-08-05T00:00:00.000Z".to_owned(),
+            updated_at: "2026-08-05T00:01:00.000Z".to_owned(),
         }
     }
 

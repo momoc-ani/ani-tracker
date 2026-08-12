@@ -12,6 +12,7 @@ use ani_domain::{
 };
 use ani_downloads::{AddTorrentOptions, DownloadAddRequest};
 use ani_repository::prelude::*;
+use ani_sources::release_satisfies_subtitle_requirement;
 use ani_storage::Storage;
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, SecondsFormat, Utc};
@@ -402,6 +403,40 @@ impl AutomaticDownloadExecutor for TauriAutomaticDownloadExecutor {
         &self,
         request: AutomaticDownloadRequest,
     ) -> Result<AutomaticDownloadReceipt, String> {
+        if !release_satisfies_subtitle_requirement(
+            &request.release,
+            &request.anime.preferred_subtitle_languages,
+            request.anime.preferred_subtitle.as_deref(),
+        ) {
+            log::warn!(
+                "Tauri 自动下载执行器拒绝字幕不满足资源：anime_id={}, episode_id={}, title={:?}, actual={:?}, required={:?}",
+                request.anime.anime.id,
+                request.episode.id,
+                request.release.title,
+                request.release.subtitle_languages,
+                request.anime.preferred_subtitle_languages
+            );
+            return Err("字幕规则不满足，已阻止自动下载".to_owned());
+        }
+        if let Some(task) = self
+            .downloads
+            .service()
+            .find_episode_download(
+                &request.anime.anime.id,
+                &request.episode.id,
+                request.episode.episode_no,
+            )
+            .map_err(|error| error.to_string())?
+        {
+            log::info!(
+                "Tauri 自动下载提交前命中已有任务：anime_id={}, episode_id={}, episode_no={}, task_id={}",
+                request.anime.anime.id,
+                request.episode.id,
+                request.episode.episode_no,
+                task.id
+            );
+            return Ok(AutomaticDownloadReceipt { task_id: task.id });
+        }
         let settings = self.downloads.settings()?;
         let engine = self
             .downloads

@@ -25,7 +25,10 @@ export function PlayerPlaylistSheet({
   open
 }: PlayerPlaylistSheetProps) {
   const episodeItems = items.filter((item) => item.section === "episodes");
-  const playableCount = episodeItems.filter((item) => Boolean(item.playlistItem)).length;
+  const episodeKeys = new Set(episodeItems.map((item) => item.episodeNo ?? item.id));
+  const playableKeys = new Set(episodeItems
+    .filter((item) => Boolean(item.playlistItem))
+    .map((item) => item.episodeNo ?? item.id));
 
   return (
     <Sheet open={open} onOpenChange={onOpenChange}>
@@ -33,7 +36,7 @@ export function PlayerPlaylistSheet({
         <SheetHeader className="border-b px-4 py-4 pr-14 text-left">
           <SheetTitle>播放列表</SheetTitle>
           <SheetDescription className="truncate">
-            {animeTitle} · {playableCount}/{episodeItems.length} 集正片
+            {animeTitle} · {playableKeys.size}/{episodeKeys.size} 集正片
           </SheetDescription>
         </SheetHeader>
         <div className="min-h-0 flex-1 py-1">

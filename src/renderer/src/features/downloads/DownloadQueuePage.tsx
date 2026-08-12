@@ -53,7 +53,6 @@ export type DownloadQueueClient = Pick<
 >>;
 
 interface DownloadQueuePageProps {
-  allowDeleteFiles?: boolean;
   client: DownloadQueueClient;
   logScope: "local" | "remote";
   showLocalPaths?: boolean;
@@ -76,7 +75,6 @@ const downloadStatusText: Record<DownloadStatus, string> = {
 
 /** 渲染本地与远端共用的下载队列页面。 */
 export function DownloadQueuePage({
-  allowDeleteFiles = true,
   client,
   logScope,
   showLocalPaths = true
@@ -472,7 +470,7 @@ export function DownloadQueuePage({
       {client.removeDownload && (
         <ConfirmActionDialog
           confirmLabel={deleteFilesOnRemove ? "删除任务和文件" : "移除任务"}
-          content={allowDeleteFiles && removeTarget?.files.some((file) => file.progress > 0) ? (
+          content={removeTarget ? (
             <div
               className={cn(
                 "flex items-start gap-3 rounded-md border p-3",
@@ -485,23 +483,23 @@ export function DownloadQueuePage({
                 onCheckedChange={(checked) => setDeleteFilesOnRemove(checked === true)}
               />
               <label className="min-w-0 cursor-pointer" htmlFor="downloads-delete-files">
-                <span className="block text-sm font-medium">同时删除已下载文件</span>
+                <span className="block text-sm font-medium">同时删除原文件</span>
                 <span className="mt-1 block text-xs text-muted-foreground">
-                  文件删除后无法从应用内恢复。
+                  会删除任务已写入的完整或部分文件，且无法从应用内恢复。
                 </span>
               </label>
             </div>
           ) : undefined}
           description={removeTarget
             ? deleteFilesOnRemove
-              ? `下载任务「${removeTarget.name}」及其已下载文件将被永久删除。`
+              ? `下载任务「${removeTarget.name}」及其原文件将被永久删除。`
               : `下载任务「${removeTarget.name}」将从队列中移除，已下载文件会保留。`
             : "该下载任务将从队列中移除。"}
           onConfirm={async () => {
             if (removeTarget && !(await mutateTask(removeTarget.id, "remove", deleteFilesOnRemove))) {
               throw new Error("下载任务移除失败");
             }
-            toast.success(deleteFilesOnRemove ? "任务和已下载文件已删除" : "任务已移除，文件已保留");
+            toast.success(deleteFilesOnRemove ? "任务和原文件已删除" : "任务已移除，文件已保留");
           }}
           onOpenChange={(open) => {
             if (!open) {

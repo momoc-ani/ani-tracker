@@ -8,7 +8,7 @@ use crate::{
     now_iso, ReleaseSourceSeed, StorageError, StorageSeed, APP_DATA_VERSION, SQLITE_SCHEMA_VERSION,
 };
 
-const CURRENT_SCHEMA: &str = include_str!("schema_v22.sql");
+const CURRENT_SCHEMA: &str = include_str!("schema_v23.sql");
 const MAX_RELEASE_ID_BYTES: usize = 200;
 
 /// 数据库中记录的结构和应用数据版本。
@@ -173,6 +173,11 @@ fn ensure_legacy_columns(transaction: &Transaction<'_>) -> Result<(), StorageErr
             "request_host",
             "request_host TEXT",
         ),
+        (
+            "request_circuit_state",
+            "network_context",
+            "network_context TEXT",
+        ),
         ("torrent_file", "episode_id", "episode_id TEXT"),
         ("torrent_file", "episode_no", "episode_no REAL"),
         (
@@ -306,6 +311,10 @@ fn migrate_schema_data(
             [],
         )?;
         info!("SQLite 媒体内容类型迁移完成：episode_count={updated}");
+    }
+    if current_schema_version < 23 {
+        let cleared = transaction.execute("DELETE FROM request_circuit_state", [])?;
+        info!("SQLite 旧版熔断状态迁移完成：cleared={cleared}");
     }
     Ok(())
 }

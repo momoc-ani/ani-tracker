@@ -6,6 +6,7 @@ use std::time::Duration;
 use ani_domain::{DownloadStatus, DownloadTask, TorrentEngineKind, TorrentFile};
 use async_trait::async_trait;
 use chrono::{SecondsFormat, TimeZone, Utc};
+use data_encoding::BASE32_NOPAD;
 use futures_util::future::try_join_all;
 use reqwest::header::{COOKIE, SET_COOKIE};
 use reqwest::{RequestBuilder, Response, StatusCode};
@@ -233,8 +234,11 @@ impl QbittorrentEngine {
         Ok(response)
     }
 
-    /// 执行 API 请求并要求成功状态，正文用于 JSON 或添加回执解析。
-    async fn response_text<F>(&self, build: F) -> Result<String, DownloadEngineError>
+    /// 执行 API 请求并返回状态与正文，供幂等冲突处理保留协议信息。
+    async fn response_status_text<F>(
+        &self,
+        build: F,
+    ) -> Result<(StatusCode, String), DownloadEngineError>
     where
         F: Fn(
             &reqwest::Client,
@@ -244,11 +248,20 @@ impl QbittorrentEngine {
         let response = self.send_authenticated(build).await?;
         let status = response.status();
         let body = response.text().await.map_err(transport_error)?;
+        Ok((status, body))
+    }
+
+    /// 执行 API 请求并要求成功状态，正文用于 JSON 或添加回执解析。
+    async fn response_text<F>(&self, build: F) -> Result<String, DownloadEngineError>
+    where
+        F: Fn(
+            &reqwest::Client,
+            &QbittorrentConnectionConfig,
+        ) -> Result<RequestBuilder, DownloadEngineError>,
+    {
+        let (status, body) = self.response_status_text(build).await?;
         if !status.is_success() {
-            return Err(DownloadEngineError::Protocol(format!(
-                "qBittorrent 请求失败：HTTP {status} {}",
-                body.trim()
-            )));
+            return Err(qbittorrent_status_error(status, &body));
         }
         Ok(body)
     }
@@ -265,6 +278,35 @@ impl QbittorrentEngine {
         serde_json::from_str(&body).map_err(|error| {
             DownloadEngineError::Protocol(format!("qBittorrent 任务响应无效：{error}"))
         })
+    }
+
+    /// 在添加冲突时按磁链 BTIH 恢复 qBittorrent 已存在任务。
+    async fn recover_existing_magnet(
+        &self,
+        magnet_url: &str,
+    ) -> Result<Option<DownloadTask>, DownloadEngineError> {
+        let Some(expected_hash) = magnet_btih_hash(magnet_url) else {
+            return Ok(None);
+        };
+        let Some(torrent) = self
+            .list_torrent_info()
+            .await?
+            .into_iter()
+            .find(|torrent| torrent.hash.eq_ignore_ascii_case(&expected_hash))
+        else {
+            return Ok(None);
+        };
+        let files = self
+            .get_files_internal(&torrent.hash)
+            .await
+            .unwrap_or_else(|error| {
+                log::warn!(
+                    "qBittorrent 已有任务文件读取失败，按空文件快照恢复 hash={} error={error}",
+                    torrent.hash
+                );
+                Vec::new()
+            });
+        map_torrent(torrent, files).map(Some)
     }
 
     /// 读取单个任务文件并归一化选择状态。
@@ -506,8 +548,8 @@ impl DownloadEngine for QbittorrentEngine {
         let save_path = options.save_path.clone();
         let paused = options.paused.to_string();
         let tag = correlation_tag.clone();
-        let response = self
-            .response_text(|client, config| {
+        let (status, response) = self
+            .response_status_text(|client, config| {
                 Ok(client
                     .post(endpoint(config, "/api/v2/torrents/add")?)
                     .timeout(config.request_timeout)
@@ -519,6 +561,24 @@ impl DownloadEngine for QbittorrentEngine {
                     ]))
             })
             .await?;
+        if status == StatusCode::CONFLICT {
+            match self.recover_existing_magnet(&url).await {
+                Ok(Some(task)) => {
+                    log::info!(
+                        "qBittorrent 磁链已存在，按 BTIH 幂等恢复：hash={}, tag={correlation_tag}",
+                        task.torrent_hash.as_deref().unwrap_or(task.id.as_str())
+                    );
+                    return Ok(task);
+                }
+                Ok(None) => {}
+                Err(error) => log::warn!(
+                    "qBittorrent 添加冲突后恢复已有任务失败：tag={correlation_tag}, error={error}"
+                ),
+            }
+        }
+        if !status.is_success() {
+            return Err(qbittorrent_status_error(status, &response));
+        }
         log::info!("qBittorrent 磁链已提交 tag={correlation_tag}");
         self.finish_add(response, &correlation_tag, options).await
     }
@@ -783,6 +843,43 @@ fn parse_add_response(body: &str) -> Result<Vec<String>, DownloadEngineError> {
     Ok(response.added_torrent_ids)
 }
 
+/// 从磁链提取并规范为 qBittorrent 使用的 40 位十六进制 BTIH。
+fn magnet_btih_hash(magnet_url: &str) -> Option<String> {
+    let url = Url::parse(magnet_url.trim()).ok()?;
+    url.query_pairs().find_map(|(key, value)| {
+        if !key.eq_ignore_ascii_case("xt") {
+            return None;
+        }
+        let value = value.as_ref();
+        if !value
+            .get(..9)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("urn:btih:"))
+        {
+            return None;
+        }
+        let raw = value.get(9..)?;
+        if raw.len() == 40 && raw.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Some(raw.to_ascii_lowercase());
+        }
+        if raw.len() != 32 {
+            return None;
+        }
+        let bytes = BASE32_NOPAD
+            .decode(raw.to_ascii_uppercase().as_bytes())
+            .ok()?;
+        if bytes.len() != 20 {
+            return None;
+        }
+        let mut hash = String::with_capacity(40);
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        for byte in bytes {
+            hash.push(HEX[(byte >> 4) as usize] as char);
+            hash.push(HEX[(byte & 0x0f) as usize] as char);
+        }
+        Some(hash)
+    })
+}
+
 fn extract_correlation_tag(tags: &str) -> Option<String> {
     tags.split(',')
         .map(str::trim)
@@ -829,6 +926,13 @@ fn now_iso() -> String {
 
 fn transport_error(error: impl std::fmt::Display) -> DownloadEngineError {
     DownloadEngineError::Transport(error.to_string())
+}
+
+fn qbittorrent_status_error(status: StatusCode, body: &str) -> DownloadEngineError {
+    DownloadEngineError::Protocol(format!(
+        "qBittorrent 请求失败：HTTP {status} {}",
+        body.trim()
+    ))
 }
 
 #[cfg(test)]
@@ -881,6 +985,32 @@ mod tests {
             vec!["abc"]
         );
         assert!(parse_add_response("Fails.").is_err());
+    }
+
+    /// 验证十六进制和 Base32 磁链均规范为相同 BTIH。
+    #[test]
+    fn parses_magnet_btih_hashes() {
+        let bytes = [
+            0x54, 0x48, 0xae, 0x0e, 0xd3, 0x69, 0x12, 0xeb, 0x0d, 0xfb, 0xa5, 0x3c, 0x3e, 0x49,
+            0x5b, 0x99, 0x88, 0x84, 0x1e, 0x68,
+        ];
+        let expected = "5448ae0ed36912eb0dfba53c3e495b9988841e68";
+        assert_eq!(
+            magnet_btih_hash(&format!(
+                "magnet:?xt=URN:BTIH:{}",
+                expected.to_ascii_uppercase()
+            ))
+            .as_deref(),
+            Some(expected)
+        );
+        assert_eq!(
+            magnet_btih_hash(&format!(
+                "magnet:?xt=urn:btih:{}",
+                BASE32_NOPAD.encode(&bytes)
+            ))
+            .as_deref(),
+            Some(expected)
+        );
     }
 
     /// 验证连接地址不会携带凭据、查询参数或非 HTTP 协议。
@@ -981,6 +1111,81 @@ mod tests {
         assert_eq!(task.files.len(), 1);
         assert_eq!(task.correlation_tag.as_deref(), Some("ani:test"));
         server.await.expect("finish qBittorrent mock");
+    }
+
+    /// 验证相同 BTIH 的 409 冲突会恢复已有任务而不是上报失败。
+    #[tokio::test]
+    async fn recovers_existing_magnet_after_conflict() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind qBittorrent conflict mock");
+        let address = listener.local_addr().expect("read conflict mock address");
+        let expected_hash = "5448ae0ed36912eb0dfba53c3e495b9988841e68";
+        let server = tokio::spawn(async move {
+            for _ in 0..4 {
+                let (mut stream, _) = listener.accept().await.expect("accept conflict request");
+                let request = read_http_request(&mut stream).await;
+                let first_line = request.lines().next().unwrap_or_default();
+                let (status, body, extra_headers) = if first_line.contains("/api/v2/auth/login") {
+                    (
+                        "200 OK",
+                        "Ok.".to_owned(),
+                        "Set-Cookie: SID=conflict-session\r\n",
+                    )
+                } else if first_line.contains("/api/v2/torrents/add") {
+                    assert!(request.contains(expected_hash));
+                    ("409 Conflict", "Conflict".to_owned(), "")
+                } else if first_line.contains("/api/v2/torrents/info") {
+                    (
+                        "200 OK",
+                        format!(
+                            r#"[{{"hash":"{expected_hash}","name":"Existing Episode","state":"stoppedUP","progress":1.0,"dlspeed":0,"upspeed":0,"eta":0,"save_path":"C:/Downloads","tags":"ani:old","added_on":1700000000,"completion_on":1700000100}}]"#
+                        ),
+                        "",
+                    )
+                } else if first_line.contains("/api/v2/torrents/files") {
+                    (
+                            "200 OK",
+                            r#"[{"index":0,"name":"episode.mkv","size":4096,"progress":1.0,"priority":1}]"#
+                                .to_owned(),
+                            "",
+                        )
+                } else {
+                    panic!("unexpected qBittorrent conflict request: {first_line}");
+                };
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\n{extra_headers}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream
+                    .write_all(response.as_bytes())
+                    .await
+                    .expect("write conflict response");
+            }
+        });
+        let engine = QbittorrentEngine::new(QbittorrentConnectionConfig::new(
+            format!("http://{address}"),
+            "admin".to_owned(),
+            Some("secret".to_owned()),
+        ))
+        .expect("create conflict qBittorrent engine");
+
+        let task = engine
+            .add_magnet(
+                &format!("magnet:?xt=urn:btih:{expected_hash}&dn=Existing%20Episode"),
+                &AddTorrentOptions {
+                    save_path: "C:/Downloads".to_owned(),
+                    correlation_tag: Some("ani:new".to_owned()),
+                    ..AddTorrentOptions::default()
+                },
+            )
+            .await
+            .expect("recover existing qBittorrent magnet");
+
+        assert_eq!(task.id, expected_hash);
+        assert_eq!(task.status, DownloadStatus::Completed);
+        assert_eq!(task.files.len(), 1);
+        server.await.expect("finish qBittorrent conflict mock");
     }
 
     /// 读取一条带 Content-Length 的测试 HTTP 请求。

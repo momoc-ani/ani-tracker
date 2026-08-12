@@ -9,7 +9,7 @@ const remoteDownloadQueueClient: DownloadQueueClient = {
   addDownloadUrl: (input) => appApi.addDownloadUrl(input),
   listDownloads: () => appApi.listDownloads(),
   listMyAnime: () => appApi.listMyAnime(),
-  removeDownload: (taskId) => appApi.removeDownload(taskId, false),
+  removeDownload: (taskId, deleteFiles) => appApi.removeDownload(taskId, deleteFiles),
   refreshDownloads: () => appApi.refreshDownloads(),
   pauseDownload: (taskId) => appApi.pauseDownload(taskId),
   resumeDownload: (taskId) => appApi.resumeDownload(taskId),
@@ -21,10 +21,8 @@ const remoteDownloadQueueClient: DownloadQueueClient = {
 export function RemoteDownloadsPage() {
   return (
     <DownloadQueuePage
-      allowDeleteFiles={false}
       client={remoteDownloadQueueClient}
       logScope="remote"
-      showLocalPaths={false}
     />
   );
 }

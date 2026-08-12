@@ -1,4 +1,4 @@
-use std::cmp::Ordering;
+use std::cmp::{Ordering, Reverse};
 use std::collections::{HashMap, HashSet};
 
 use ani_domain::{
@@ -899,10 +899,11 @@ impl<'connection> SqliteRepository<'connection> {
             ],
         )?;
         info!(
-            "Rust 下载源保存完成：source_id={}, kind={}, enabled={}",
+            "Rust 下载源保存完成：source_id={}, kind={}, enabled={}, request_interval_ms={}",
             source.id,
             source_kind_value(&source.kind),
-            source.enabled
+            source.enabled,
+            normalize_source_request_interval(source.request_interval_ms)
         );
         self.list_sources()
     }
@@ -980,12 +981,13 @@ impl<'connection> SqliteRepository<'connection> {
         self.connection.execute(
             "INSERT INTO request_circuit_state (
                circuit_key, circuit_group, request_host, last_request_at,
-               failure_count, backoff_until, updated_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+               failure_count, backoff_until, network_context, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
              ON CONFLICT(circuit_key) DO UPDATE SET
                circuit_group = excluded.circuit_group, request_host = excluded.request_host,
                last_request_at = excluded.last_request_at, failure_count = excluded.failure_count,
-               backoff_until = excluded.backoff_until, updated_at = excluded.updated_at",
+               backoff_until = excluded.backoff_until,
+               network_context = excluded.network_context, updated_at = excluded.updated_at",
             params![
                 &state.key,
                 &state.group,
@@ -993,6 +995,7 @@ impl<'connection> SqliteRepository<'connection> {
                 state.last_request_at.as_deref(),
                 state.failure_count.max(0),
                 state.backoff_until.as_deref(),
+                state.network_context.as_deref(),
                 now_iso(),
             ],
         )?;
@@ -1187,12 +1190,17 @@ impl<'connection> SqliteRepository<'connection> {
             .into_iter()
             .map(|item| (item.id.clone(), item))
             .collect::<HashMap<_, _>>();
+        let binding_aliases = self.list_confirmed_binding_title_aliases_by_anime()?;
         let subscriptions = self.list_rss_subscriptions_by_my_anime()?;
         let rows = query_all(self.connection, "SELECT * FROM my_anime", map_my_anime_row)?;
         let mut items = rows
             .into_iter()
             .filter_map(|row| {
-                let anime = anime_by_id.get(&row.anime_id)?.clone();
+                let mut anime = anime_by_id.get(&row.anime_id)?.clone();
+                if let Some(aliases) = binding_aliases.get(&row.anime_id) {
+                    anime.aliases = merge_anime_aliases(&anime.aliases, aliases, &anime.id);
+                    anime.aliases.sort_by_key(|alias| Reverse(alias.priority));
+                }
                 let rss_subscriptions = subscriptions.get(&row.id).cloned().unwrap_or_default();
                 Some(row.into_domain(anime, rss_subscriptions))
             })
@@ -1269,7 +1277,20 @@ impl<'connection> SqliteRepository<'connection> {
     /// 新增或更新一条单集记录。
     pub(crate) fn upsert_episode(&self, episode: &Episode) -> Result<Vec<Episode>, StorageError> {
         validate_episode(episode)?;
-        upsert_episode_row(self.connection, episode, &now_iso())?;
+        let timestamp = now_iso();
+        let (linked_tasks, linked_files) = self.with_transaction(|connection| {
+            let (linked_tasks, linked_files) = upsert_episode_row(connection, episode, &timestamp)?;
+            if linked_tasks > 0 || linked_files > 0 {
+                sync_episode_statuses_from_downloads(connection, [episode.id.clone()])?;
+            }
+            Ok((linked_tasks, linked_files))
+        })?;
+        if linked_tasks > 0 || linked_files > 0 {
+            info!(
+                "Rust 单集写入后回填历史下载关联：episode_id={}, linked_tasks={}, linked_files={}",
+                episode.id, linked_tasks, linked_files
+            );
+        }
         self.list_episodes(&episode.anime_id)
     }
 
@@ -1645,6 +1666,48 @@ impl<'connection> SqliteRepository<'connection> {
                 .entry(anime_id)
                 .or_default()
                 .push(row.into_domain()?);
+        }
+        Ok(aliases)
+    }
+
+    /// 读取已确认来源绑定中的中文标题，作为追番视图的临时别名。
+    fn list_confirmed_binding_title_aliases_by_anime(
+        &self,
+    ) -> Result<HashMap<String, Vec<AnimeAlias>>, StorageError> {
+        let mut statement = self.connection.prepare(
+            "SELECT id, anime_id, source_id, source_anime_title
+             FROM anime_source_binding
+             WHERE confirmed = 1
+               AND TRIM(COALESCE(source_anime_title, '')) <> ''
+             ORDER BY anime_id, source_id",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>("id")?,
+                row.get::<_, String>("anime_id")?,
+                row.get::<_, String>("source_id")?,
+                row.get::<_, Option<String>>("source_anime_title")?,
+            ))
+        })?;
+        let mut aliases = HashMap::<String, Vec<AnimeAlias>>::new();
+        for row in rows {
+            let (binding_id, anime_id, source_id, title) = row?;
+            let Some(title) = title.map(|value| value.trim().to_owned()) else {
+                continue;
+            };
+            if !is_likely_chinese_title(&title) {
+                continue;
+            }
+            aliases
+                .entry(anime_id.clone())
+                .or_default()
+                .push(AnimeAlias {
+                    id: format!("source-binding-title:{anime_id}:{source_id}:{binding_id}"),
+                    anime_id,
+                    alias: title,
+                    language: AnimeAliasLanguage::Zh,
+                    priority: CONFIRMED_BINDING_TITLE_ALIAS_PRIORITY,
+                });
         }
         Ok(aliases)
     }
@@ -3443,12 +3506,12 @@ fn find_episode_id(
         .map_err(StorageError::from)
 }
 
-/// 写入一条单集记录并保留首次创建时间。
+/// 写入单集并回填同番剧同集数的历史下载关联。
 fn upsert_episode_row(
     connection: &Connection,
     episode: &Episode,
     timestamp: &str,
-) -> Result<(), StorageError> {
+) -> Result<(usize, usize), StorageError> {
     validate_episode(episode)?;
     connection.execute(
         "INSERT INTO episode (
@@ -3468,7 +3531,30 @@ fn upsert_episode_row(
             timestamp,
         ],
     )?;
-    Ok(())
+    let linked_tasks = connection.execute(
+        "UPDATE download_task
+            SET episode_id = ?1, updated_at = ?2
+          WHERE episode_id IS NULL
+            AND anime_id = ?3
+            AND episode_no = ?4",
+        params![
+            &episode.id,
+            timestamp,
+            &episode.anime_id,
+            episode.episode_no
+        ],
+    )?;
+    let linked_files = connection.execute(
+        "UPDATE torrent_file
+            SET episode_id = ?1
+          WHERE episode_id IS NULL
+            AND episode_no = ?2
+            AND download_task_id IN (
+              SELECT id FROM download_task WHERE anime_id = ?3
+            )",
+        params![&episode.id, episode.episode_no, &episode.anime_id],
+    )?;
+    Ok((linked_tasks, linked_files))
 }
 
 /// 写入单集偏好并维护番剧与字幕组的发现关联。
@@ -3676,6 +3762,26 @@ fn is_playback_seconds(value: f64) -> bool {
 /// 使用 -1 表示未指定文件索引，确保复合主键稳定去重。
 fn normalize_checkpoint_file_index(file_index: Option<i64>) -> i64 {
     file_index.unwrap_or(-1)
+}
+
+/// 已确认来源标题的临时别名优先级，低于官方目录别名。
+const CONFIRMED_BINDING_TITLE_ALIAS_PRIORITY: i64 = 80;
+
+/// 判断标题是否更接近中文，避免把带日文假名的来源标题注入为中文别名。
+fn is_likely_chinese_title(value: &str) -> bool {
+    let has_han = value.chars().any(|character| {
+        matches!(
+            character as u32,
+            0x3400..=0x4DBF
+                | 0x4E00..=0x9FFF
+                | 0xF900..=0xFAFF
+                | 0x20000..=0x2FA1F
+        )
+    });
+    let has_kana = value
+        .chars()
+        .any(|character| matches!(character as u32, 0x3040..=0x30FF | 0x31F0..=0x31FF));
+    has_han && !has_kana
 }
 
 /// 写库前按别名文本去重并重建番剧内稳定标识。
@@ -5256,6 +5362,7 @@ fn map_request_circuit_state_row(row: &Row<'_>) -> rusqlite::Result<RequestCircu
         last_request_at: row.get("last_request_at")?,
         failure_count: row.get("failure_count")?,
         backoff_until: row.get("backoff_until")?,
+        network_context: row.get("network_context")?,
     })
 }
 

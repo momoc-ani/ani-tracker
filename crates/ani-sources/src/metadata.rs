@@ -4,7 +4,8 @@ use std::time::Instant;
 
 use ani_domain::{
     Anime, AnimeAlias, AnimeAliasLanguage, AnimeDetailPartialError, AnimeRating,
-    ReleaseSourceConfig, SourceKind,
+    BangumiBrowseFilters, BangumiBrowseQuery, BangumiBrowseResult, BangumiBrowseSort,
+    BangumiBrowseYearRange, ReleaseSourceConfig, SourceKind,
 };
 use chrono::{Datelike, NaiveDate, SecondsFormat, TimeZone, Utc};
 use futures_util::stream::{self, StreamExt};
@@ -249,6 +250,85 @@ impl AnimeMetadataService {
             ("anilist", results.1),
             ("mikan", results.2),
         ])
+    }
+
+    /// 直接请求 Bangumi 在线检索，不读取或写入本地季度目录。
+    pub async fn browse_bangumi<S: CircuitStateStore + Sync>(
+        &self,
+        store: &S,
+        query: BangumiBrowseQuery,
+    ) -> Result<BangumiBrowseResult, SourceError> {
+        let started = Instant::now();
+        let offset = query.page.saturating_sub(1).saturating_mul(query.page_size);
+        let mut url = endpoint_url(&self.endpoints.bangumi, "v0/search/subjects")?;
+        url.query_pairs_mut()
+            .append_pair("limit", &query.page_size.to_string())
+            .append_pair("offset", &offset.to_string());
+
+        let mut filter = Map::from_iter([("type".to_owned(), json!([2]))]);
+        let tags = bangumi_browse_tags(&query.filters);
+        if !tags.is_empty() {
+            filter.insert("tag".to_owned(), json!(tags));
+        }
+        if let Some(air_date) = bangumi_browse_air_date(&query.filters) {
+            filter.insert("air_date".to_owned(), json!(air_date));
+        }
+        if query.filters.min_rating > 0.0 {
+            filter.insert(
+                "rating".to_owned(),
+                json!([format!(">={:.1}", query.filters.min_rating)]),
+            );
+        }
+        let sort = match query.sort {
+            BangumiBrowseSort::BangumiRank => "rank",
+            BangumiBrowseSort::Recent => "heat",
+            BangumiBrowseSort::Rating => "score",
+        };
+        let response: BangumiPage = self
+            .post_json(
+                store,
+                "bangumi",
+                true,
+                url,
+                json!({
+                    "keyword": query.keyword.trim(),
+                    "sort": sort,
+                    "filter": Value::Object(filter)
+                }),
+            )
+            .await?;
+        let subjects = response
+            .data
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|item| item.subject_type == 2)
+            .collect::<Vec<_>>();
+        let returned_count = subjects.len();
+        let total = response
+            .total
+            .unwrap_or(offset.saturating_add(returned_count));
+        let items = subjects
+            .into_iter()
+            .map(|item| {
+                let (year, month) = date_or_now(item.date.as_deref());
+                map_bangumi(item, year, month)
+            })
+            .collect::<Vec<_>>();
+        log::info!(
+            "Bangumi 在线浏览完成 page={} page_size={} items={} total={} duration_ms={}",
+            query.page,
+            query.page_size,
+            items.len(),
+            total,
+            started.elapsed().as_millis()
+        );
+        Ok(BangumiBrowseResult {
+            has_more: offset.saturating_add(returned_count) < total,
+            query,
+            items,
+            total,
+            source: "bangumi".to_owned(),
+        })
     }
 
     /// 采集指定月份，并保留单来源失败信息。
@@ -1368,8 +1448,8 @@ fn preserve_catalog_cover(local: &Anime, enriched: &mut Anime) {
 fn detail_retry_after_ms(error: &SourceError) -> Option<u64> {
     match error {
         SourceError::Transport(_) => Some(DETAIL_TRANSIENT_RETRY_DELAY_MS),
-        SourceError::HttpStatus { status: 429 } => Some(DETAIL_RATE_LIMIT_RETRY_DELAY_MS),
-        SourceError::HttpStatus { status } if *status >= 500 => {
+        SourceError::HttpStatus { status: 429, .. } => Some(DETAIL_RATE_LIMIT_RETRY_DELAY_MS),
+        SourceError::HttpStatus { status, .. } if *status >= 500 => {
             Some(DETAIL_TRANSIENT_RETRY_DELAY_MS)
         }
         SourceError::CircuitOpen { backoff_until } => {
@@ -2001,6 +2081,107 @@ fn union(parents: &mut [usize], left: usize, right: usize) {
     }
 }
 
+/// 将界面语义筛选映射为 Bangumi 搜索 API 使用的标签。
+fn bangumi_browse_tags(filters: &BangumiBrowseFilters) -> Vec<String> {
+    let mut tags = BTreeSet::new();
+    for value in &filters.formats {
+        if let Some(tag) = match value.as_str() {
+            "tv" => Some("TV"),
+            "movie" => Some("剧场版"),
+            "ova" => Some("OVA"),
+            "ona" => Some("WEB动画"),
+            _ => None,
+        } {
+            tags.insert(tag.to_owned());
+        }
+    }
+    for value in &filters.source_materials {
+        if let Some(tag) = match value.as_str() {
+            "original" => Some("原创"),
+            "manga" => Some("漫画改"),
+            "lightNovel" => Some("轻小说改"),
+            "game" => Some("游戏改"),
+            "other" => Some("小说改"),
+            _ => None,
+        } {
+            tags.insert(tag.to_owned());
+        }
+    }
+    for value in &filters.genres {
+        if let Some(tag) = match value.as_str() {
+            "reasoning" => Some("推理"),
+            "harem" => Some("后宫"),
+            "sciFi" => Some("科幻"),
+            "girlsLove" => Some("百合"),
+            "horror" => Some("恐怖"),
+            "romance" => Some("恋爱"),
+            "music" => Some("音乐"),
+            "school" => Some("校园"),
+            "timeTravel" => Some("穿越"),
+            "action" => Some("战斗"),
+            "sports" => Some("运动"),
+            "martialArts" => Some("武侠"),
+            "fantasy" => Some("奇幻"),
+            "thriller" => Some("惊悚"),
+            "comedy" => Some("搞笑"),
+            "sliceOfLife" => Some("日常"),
+            "mystery" => Some("悬疑"),
+            "adventure" => Some("冒险"),
+            "history" => Some("历史"),
+            "otome" => Some("乙女"),
+            "food" => Some("美食"),
+            "workplace" => Some("职场"),
+            "xuanhuan" => Some("玄幻"),
+            "mecha" => Some("机战"),
+            _ => None,
+        } {
+            tags.insert(tag.to_owned());
+        }
+    }
+    for value in &filters.demographics {
+        if let Some(tag) = match value.as_str() {
+            "shounen" => Some("少年"),
+            "shoujo" => Some("少女"),
+            "seinen" => Some("青年"),
+            "josei" => Some("女性"),
+            "kids" => Some("儿童"),
+            _ => None,
+        } {
+            tags.insert(tag.to_owned());
+        }
+    }
+    for value in &filters.regions {
+        if let Some(tag) = match value.as_str() {
+            "japan" => Some("日本"),
+            "china" => Some("中国"),
+            "korea" => Some("韩国"),
+            "western" => Some("欧美"),
+            _ => None,
+        } {
+            tags.insert(tag.to_owned());
+        }
+    }
+    tags.into_iter().collect()
+}
+
+/// 将单年、未来年份和更早年份转换为 Bangumi air_date 条件。
+fn bangumi_browse_air_date(filters: &BangumiBrowseFilters) -> Option<Vec<String>> {
+    if let Some(year) = filters.years.first() {
+        return Some(vec![
+            format!(">={year}-01-01"),
+            format!("<{}-01-01", year + 1),
+        ]);
+    }
+    filters.year_range.map(|range| match range {
+        BangumiBrowseYearRange::Future { start_year } => {
+            vec![format!(">={start_year}-01-01")]
+        }
+        BangumiBrowseYearRange::Earlier { end_year } => {
+            vec![format!("<{end_year}-01-01")]
+        }
+    })
+}
+
 #[derive(Debug, Default, Deserialize)]
 struct BangumiPage {
     data: Option<Vec<BangumiSubject>>,
@@ -2064,6 +2245,7 @@ struct BangumiInfoboxItem {
 
 #[derive(Debug, Clone, Deserialize)]
 struct BangumiRating {
+    rank: Option<i64>,
     score: Option<f64>,
     total: Option<i64>,
 }
@@ -2286,6 +2468,9 @@ fn build_bangumi_detail(
         "sourceMaterial": infobox.values(&["原作", "原案"]).into_iter().next(),
         "durationMinutes": duration_minutes,
         "contentRating": infobox.first_value(&["分级", "等级"]),
+        "demographic": infobox.first_value(&["受众", "读者对象"]),
+        "countryOfOrigin": infobox.first_value(&["国家/地区", "制片国家/地区", "国家", "地区"]),
+        "ranking": item.rating.as_ref().and_then(|rating| rating.rank.filter(|rank| *rank > 0).map(|rank| json!({"rank": rank, "source": "bangumi", "category": "Bangumi 排名"}))),
         "metadataSources": ["bangumi"],
         "refreshedAt": Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)
     });
@@ -2400,6 +2585,7 @@ struct AniListMedia {
     genres: Vec<String>,
     duration: Option<i64>,
     source: Option<String>,
+    country_of_origin: Option<String>,
     is_adult: Option<bool>,
     studios: Option<AniListStudios>,
     staff: Option<AniListStaff>,
@@ -2480,7 +2666,7 @@ struct AniListRanking {
 }
 
 fn anilist_fields() -> &'static str {
-    "id idMal averageScore bannerImage format episodes status title { native romaji english } startDate { year month day } endDate { year month day } nextAiringEpisode { airingAt episode } season description(asHtml: false) synonyms coverImage { large extraLarge } genres duration source isAdult studios(isMain: true) { nodes { name isAnimationStudio } } staff(perPage: 12, sort: RELEVANCE) { edges { role node { name { full } } } } rankings { rank type context allTime }"
+    "id idMal averageScore bannerImage format episodes status title { native romaji english } startDate { year month day } endDate { year month day } nextAiringEpisode { airingAt episode } season description(asHtml: false) synonyms coverImage { large extraLarge } genres duration source countryOfOrigin isAdult studios(isMain: true) { nodes { name isAnimationStudio } } staff(perPage: 12, sort: RELEVANCE) { edges { role node { name { full } } } } rankings { rank type context allTime }"
 }
 
 fn map_anilist(item: AniListMedia) -> Anime {
@@ -2575,6 +2761,7 @@ fn map_anilist(item: AniListMedia) -> Anime {
         "studios": item.studios.as_ref().into_iter().flat_map(|studios| &studios.nodes).filter_map(|studio| studio.name.clone()).collect::<Vec<_>>(),
         "staff": staff,
         "sourceMaterial": item.source,
+        "countryOfOrigin": item.country_of_origin,
         "durationMinutes": item.duration.filter(|value| *value > 0),
         "contentRating": item.is_adult.filter(|value| *value).map(|_| "18+"),
         "ranking": ranking.and_then(|ranking| ranking.rank.filter(|value| *value > 0).map(|rank| json!({"rank": rank, "source": "anilist", "category": ranking.context.clone().filter(|value| !value.is_empty()).unwrap_or_else(|| "评分排行".to_owned())}))),
@@ -3146,11 +3333,14 @@ fn remove_nulls(value: &mut Value) {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::collections::{BTreeSet, HashMap};
     use std::sync::{Arc, Mutex};
 
     use ani_domain::RequestCircuitState;
-    use ani_domain::{Anime, AnimeAlias, AnimeAliasLanguage};
+    use ani_domain::{
+        Anime, AnimeAlias, AnimeAliasLanguage, BangumiBrowseFilters, BangumiBrowseQuery,
+        BangumiBrowseSort, BangumiBrowseYearRange,
+    };
     use ani_repository::{RepositoryError, RepositoryResult};
     use chrono::Utc;
     use serde_json::{json, Value};
@@ -3163,12 +3353,12 @@ mod tests {
     };
 
     use super::{
-        detail_providers_for_item, detail_retry_after_ms, find, map_bangumi, map_bangumi_catalog,
-        merge_anime, merge_anime_metadata_batches, parse_mikan_candidates, parse_mikan_detail,
-        preserve_catalog_cover, shared_title, should_merge, union, unique_by_normalized_title,
-        AnimeMetadataBatch, AnimeMetadataDetailProvider, AnimeMetadataDetailRequest,
-        AnimeMetadataService, BangumiImages, BangumiInfoboxItem, BangumiRating, BangumiSubject,
-        BangumiTag, MetadataEndpoints,
+        anilist_fields, detail_providers_for_item, detail_retry_after_ms, find, map_bangumi,
+        map_bangumi_catalog, merge_anime, merge_anime_metadata_batches, parse_mikan_candidates,
+        parse_mikan_detail, preserve_catalog_cover, shared_title, should_merge, union,
+        unique_by_normalized_title, AnimeMetadataBatch, AnimeMetadataDetailProvider,
+        AnimeMetadataDetailRequest, AnimeMetadataService, BangumiImages, BangumiInfoboxItem,
+        BangumiRating, BangumiSubject, BangumiTag, MetadataEndpoints,
     };
 
     #[derive(Default)]
@@ -3401,14 +3591,39 @@ mod tests {
     /// 验证仅瞬时网络与熔断错误进入详情补偿队列。
     #[test]
     fn classifies_retryable_detail_failures() {
-        assert!(detail_retry_after_ms(&SourceError::HttpStatus { status: 503 }).is_some());
-        assert!(detail_retry_after_ms(&SourceError::HttpStatus { status: 429 }).is_some());
+        assert!(detail_retry_after_ms(&SourceError::HttpStatus {
+            status: 503,
+            detail: None,
+        })
+        .is_some());
+        assert!(detail_retry_after_ms(&SourceError::HttpStatus {
+            status: 429,
+            detail: None,
+        })
+        .is_some());
         assert!(detail_retry_after_ms(&SourceError::CircuitOpen {
             backoff_until: (Utc::now() + chrono::Duration::seconds(30)).to_rfc3339(),
         })
         .is_some());
-        assert!(detail_retry_after_ms(&SourceError::HttpStatus { status: 404 }).is_none());
+        assert!(detail_retry_after_ms(&SourceError::HttpStatus {
+            status: 404,
+            detail: None,
+        })
+        .is_none());
         assert!(detail_retry_after_ms(&SourceError::Parse("invalid payload".to_owned())).is_none());
+    }
+
+    /// 验证 AniList 公共字段选择集的大括号完整闭合。
+    #[test]
+    fn keeps_anilist_field_selection_balanced() {
+        let fields = anilist_fields();
+
+        assert_eq!(
+            fields.chars().filter(|character| *character == '{').count(),
+            fields.chars().filter(|character| *character == '}').count()
+        );
+        assert!(fields.contains("staff(perPage: 12, sort: RELEVANCE)"));
+        assert!(fields.contains("} } rankings"));
     }
 
     /// 验证 Mikan 季度页解析去重并优先保留更完整标题。
@@ -3457,7 +3672,20 @@ mod tests {
                     key: Some("分级".to_owned()),
                     value: Some(json!("PG-13")),
                 },
+                BangumiInfoboxItem {
+                    key: Some("受众".to_owned()),
+                    value: Some(json!("少年")),
+                },
+                BangumiInfoboxItem {
+                    key: Some("国家/地区".to_owned()),
+                    value: Some(json!("日本")),
+                },
             ]),
+            rating: Some(BangumiRating {
+                rank: Some(42),
+                score: Some(8.2),
+                total: Some(1234),
+            }),
             ..BangumiSubject::default()
         };
 
@@ -3470,6 +3698,10 @@ mod tests {
         assert_eq!(detail["staff"][0]["name"], "测试导演");
         assert_eq!(detail["durationMinutes"], 90);
         assert_eq!(detail["contentRating"], "PG-13");
+        assert_eq!(detail["demographic"], "少年");
+        assert_eq!(detail["countryOfOrigin"], "日本");
+        assert_eq!(detail["ranking"]["rank"], 42);
+        assert_eq!(detail["ranking"]["source"], "bangumi");
     }
 
     /// 验证基础目录延后详情时，全部顶层业务字段保持一致。
@@ -3503,6 +3735,7 @@ mod tests {
                 },
             ]),
             rating: Some(BangumiRating {
+                rank: Some(42),
                 score: Some(8.2),
                 total: Some(1234),
             }),
@@ -3713,6 +3946,175 @@ mod tests {
         assert_eq!(result.settled_error_count, 0);
         assert!(result.retryable_requests.is_empty());
         assert_eq!(result.items[0].detail.as_ref().unwrap()["episodeCount"], 12);
+    }
+
+    /// 验证 Bangumi 浏览只访问 Bangumi，并保留在线分页总数。
+    #[tokio::test]
+    async fn browses_bangumi_online_with_filters() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind mock");
+        let address = listener.local_addr().expect("mock address");
+        let server = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            for _ in 0..1 {
+                let (mut stream, _) = listener.accept().await.expect("accept mock");
+                let mut buffer = vec![0u8; 16 * 1024];
+                let read = stream.read(&mut buffer).await.expect("read request");
+                let request = String::from_utf8_lossy(&buffer[..read]).to_string();
+                let body = json!({
+                    "data": [{
+                        "id": 101,
+                        "type": 2,
+                        "name": "Test Anime",
+                        "name_cn": "测试番",
+                        "date": "2026-07-03",
+                        "rating": {"score": 8.6, "total": 5000, "rank": 12},
+                        "tags": [{"name": "奇幻", "count": 100}]
+                    }],
+                    "total": 42,
+                    "limit": 20,
+                    "offset": 20
+                })
+                .to_string();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream
+                    .write_all(response.as_bytes())
+                    .await
+                    .expect("write response");
+                requests.push(request);
+            }
+            requests
+        });
+        let base = format!("http://{address}/");
+        let service = AnimeMetadataService {
+            network: Arc::new(
+                SourceNetworkService::new(NativeHttpConfig {
+                    proxy_mode: ProxyMode::Off,
+                    proxy_url: None,
+                    timeout_ms: 5_000,
+                    max_response_bytes: 1024 * 1024,
+                    user_agent: "AniTracker-Test".to_owned(),
+                })
+                .expect("network service"),
+            ),
+            endpoints: MetadataEndpoints {
+                bangumi: base.clone(),
+                anilist: format!("{base}graphql"),
+                mikan: base,
+            },
+            channel: NetworkRequestChannel::Interactive,
+            bangumi_catalog_cache: Mutex::new(HashMap::new()),
+        };
+        let result = service
+            .browse_bangumi(
+                &MemoryCircuitStore::default(),
+                BangumiBrowseQuery {
+                    keyword: "测试".to_owned(),
+                    sort: BangumiBrowseSort::Rating,
+                    filters: BangumiBrowseFilters {
+                        genres: vec!["fantasy".to_owned()],
+                        years: vec![2026],
+                        min_rating: 8.0,
+                        ..BangumiBrowseFilters::default()
+                    },
+                    page: 2,
+                    page_size: 20,
+                },
+            )
+            .await
+            .expect("browse Bangumi");
+        let requests = server.await.expect("mock server");
+
+        assert_eq!(result.source, "bangumi");
+        assert_eq!(result.total, 42);
+        assert!(result.has_more);
+        assert_eq!(result.items[0].external_ids["bangumi"], "101");
+        let browse_request = requests
+            .iter()
+            .find(|request| request.contains("/v0/search/subjects"))
+            .expect("Bangumi browse request");
+        assert!(browse_request.contains("\"sort\":\"score\""));
+        assert!(browse_request.contains("\"tag\":[\"奇幻\"]"));
+        assert!(browse_request.contains("\"air_date\":[\">=2026-01-01\",\"<2027-01-01\"]"));
+    }
+
+    /// 验证截图中的完整题材均映射为独立 Bangumi 标签。
+    #[test]
+    fn maps_complete_bangumi_browse_genres() {
+        let genres = vec![
+            "reasoning",
+            "harem",
+            "sciFi",
+            "girlsLove",
+            "horror",
+            "romance",
+            "music",
+            "school",
+            "timeTravel",
+            "action",
+            "sports",
+            "martialArts",
+            "fantasy",
+            "thriller",
+            "comedy",
+            "sliceOfLife",
+            "mystery",
+            "adventure",
+            "history",
+            "otome",
+            "food",
+            "workplace",
+            "xuanhuan",
+            "mecha",
+        ];
+        let filters = BangumiBrowseFilters {
+            genres: genres.into_iter().map(str::to_owned).collect(),
+            ..BangumiBrowseFilters::default()
+        };
+        let actual = super::bangumi_browse_tags(&filters)
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        let expected = [
+            "推理", "后宫", "科幻", "百合", "恐怖", "恋爱", "音乐", "校园", "穿越", "战斗", "运动",
+            "武侠", "奇幻", "惊悚", "搞笑", "日常", "悬疑", "冒险", "历史", "乙女", "美食", "职场",
+            "玄幻", "机战",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<BTreeSet<_>>();
+        assert_eq!(actual, expected);
+    }
+
+    /// 验证未来、单年和更早年份使用互不重叠的日期边界。
+    #[test]
+    fn maps_bangumi_browse_year_ranges() {
+        let exact = BangumiBrowseFilters {
+            years: vec![2026],
+            ..BangumiBrowseFilters::default()
+        };
+        let future = BangumiBrowseFilters {
+            year_range: Some(BangumiBrowseYearRange::Future { start_year: 2027 }),
+            ..BangumiBrowseFilters::default()
+        };
+        let earlier = BangumiBrowseFilters {
+            year_range: Some(BangumiBrowseYearRange::Earlier { end_year: 2017 }),
+            ..BangumiBrowseFilters::default()
+        };
+
+        assert_eq!(
+            super::bangumi_browse_air_date(&exact),
+            Some(vec![">=2026-01-01".to_owned(), "<2027-01-01".to_owned()])
+        );
+        assert_eq!(
+            super::bangumi_browse_air_date(&future),
+            Some(vec![">=2027-01-01".to_owned()])
+        );
+        assert_eq!(
+            super::bangumi_browse_air_date(&earlier),
+            Some(vec!["<2017-01-01".to_owned()])
+        );
     }
 
     /// 验证在线搜索聚合 Bangumi/AniList，并隔离 Mikan 单来源失败。

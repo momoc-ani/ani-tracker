@@ -297,6 +297,31 @@ async fn adds_associated_task_through_selected_engine() {
     assert_eq!(embedded.recorded(), vec!["addMagnet"]);
 }
 
+/// 验证提交前复查可识别缺少单集标识的历史任务。
+#[test]
+fn finds_existing_episode_download_by_episode_number() {
+    let mut existing = stored_task(
+        "existing-episode",
+        TorrentEngineKind::Qbittorrent,
+        Some("existing-hash"),
+    );
+    existing.anime_id = Some("anime-1".to_owned());
+    existing.episode_id = None;
+    existing.episode_no = Some(1.0);
+    let store = Arc::new(MemoryStore::with_tasks(vec![existing.clone()]));
+    let service = DownloadTaskService::new(Arc::new(DownloadEngineRegistry::new()), store);
+
+    let matched = service
+        .find_episode_download("anime-1", "episode-late-1", 1.0)
+        .expect("find episode download")
+        .expect("existing episode task");
+    assert_eq!(matched.id, existing.id);
+    assert!(service
+        .find_episode_download("anime-1", "episode-late-2", 2.0)
+        .expect("find different episode")
+        .is_none());
+}
+
 /// 验证暂停、恢复、优先级和删除始终路由到任务创建时的引擎。
 #[tokio::test]
 async fn routes_task_controls_to_original_engine() {
@@ -334,7 +359,7 @@ async fn routes_task_controls_to_original_engine() {
         .expect("resume task");
     assert_eq!(resumed[0].status, DownloadStatus::Downloading);
     assert!(service
-        .remove("qbittorrent:qb-task", true, &TorrentEngineKind::Qbittorrent,)
+        .remove("qbittorrent:qb-task", true)
         .await
         .expect("remove task")
         .is_empty());
@@ -348,6 +373,54 @@ async fn routes_task_controls_to_original_engine() {
             "resume:qb-hash",
             "removeFiles:qb-hash"
         ]
+    );
+}
+
+/// 验证删除不受当前默认引擎限制，并按任务自身引擎调用原始 hash。
+#[tokio::test]
+async fn removes_task_through_its_original_engine() {
+    let embedded_task = stored_task(
+        "embedded-task",
+        TorrentEngineKind::Embedded,
+        Some("embedded-hash"),
+    );
+    let qbittorrent_task = stored_task(
+        "qbittorrent-task",
+        TorrentEngineKind::Qbittorrent,
+        Some("qbittorrent-hash"),
+    );
+    let store = Arc::new(MemoryStore::with_tasks(vec![
+        embedded_task,
+        qbittorrent_task,
+    ]));
+    let embedded = Arc::new(FakeEngine::new(TorrentEngineKind::Embedded, Vec::new()));
+    let qbittorrent = Arc::new(FakeEngine::new(TorrentEngineKind::Qbittorrent, Vec::new()));
+    let mut registry = DownloadEngineRegistry::new();
+    registry
+        .register(embedded.clone())
+        .expect("register embedded");
+    registry
+        .register(qbittorrent.clone())
+        .expect("register qbittorrent");
+    let service = DownloadTaskService::new(Arc::new(registry), store.clone());
+
+    assert_eq!(
+        service
+            .task_engine("embedded:embedded-task")
+            .expect("read task engine"),
+        TorrentEngineKind::Embedded
+    );
+    assert!(service
+        .remove("embedded:embedded-task", false)
+        .await
+        .expect("remove embedded task while another engine is active")
+        .is_empty());
+
+    assert_eq!(embedded.recorded(), vec!["remove:embedded-hash"]);
+    assert!(qbittorrent.recorded().is_empty());
+    assert_eq!(
+        store.list_downloads().expect("list remaining tasks")[0].id,
+        "qbittorrent:qbittorrent-task"
     );
 }
 
@@ -530,7 +603,7 @@ async fn removes_missing_engine_task_without_deleting_files() {
     let service = DownloadTaskService::new(Arc::new(registry), store);
 
     assert!(service
-        .remove("embedded:missing-task", false, &TorrentEngineKind::Embedded,)
+        .remove("embedded:missing-task", false)
         .await
         .expect("remove stale local snapshot")
         .is_empty());
@@ -540,10 +613,7 @@ async fn removes_missing_engine_task_without_deleting_files() {
     registry.register(engine).expect("register embedded");
     let store = Arc::new(MemoryStore::with_tasks(vec![existing]));
     let service = DownloadTaskService::new(Arc::new(registry), store.clone());
-    assert!(service
-        .remove("embedded:missing-task", true, &TorrentEngineKind::Embedded,)
-        .await
-        .is_err());
+    assert!(service.remove("embedded:missing-task", true).await.is_err());
     assert_eq!(store.list_downloads().expect("task remains").len(), 1);
 }
 
@@ -602,6 +672,7 @@ async fn maps_torrent_core_protocol_and_options() {
             "listTasks".to_owned(),
             json!({ "tasks": [waiting_core_task] }),
         ),
+        ("remove".to_owned(), json!({})),
     ])));
     let engine = TorrentCoreEngine::new(transport.clone());
 
@@ -643,6 +714,10 @@ async fn maps_torrent_core_protocol_and_options() {
     assert_eq!(listed[0].status, DownloadStatus::WaitingNetwork);
     assert_eq!(listed[0].download_speed, 0);
     assert_eq!(listed[0].upload_speed, 0);
+    engine
+        .remove("core-hash", true)
+        .await
+        .expect("remove core task");
     engine.shutdown().await.expect("shutdown core");
 
     let calls = transport.calls.lock().expect("lock core calls");
@@ -659,6 +734,12 @@ async fn maps_torrent_core_protocol_and_options() {
     assert_eq!(add.1["selectedFileIndexes"], json!([0]));
     assert_eq!(add.1["paused"], true);
     assert_eq!(add.1["savePath"], "C:/Downloads");
+    let remove = calls
+        .iter()
+        .find(|(method, _)| method == "remove")
+        .expect("remove call");
+    assert_eq!(remove.1["taskId"], "core-hash");
+    assert_eq!(remove.1["deleteFiles"], true);
     assert_eq!(*transport.shutdown_count.lock().expect("shutdown count"), 1);
 }
 

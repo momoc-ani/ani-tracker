@@ -106,6 +106,9 @@ export function classifyAnimeRelease(release: Release, anime: Anime): AnimeRelea
   if (targetSeasonNo !== undefined && releaseSeasonNo !== undefined && targetSeasonNo !== releaseSeasonNo) {
     return "mismatch";
   }
+  if (targetSeasonNo !== undefined && targetSeasonNo > 1 && releaseSeasonNo === undefined) {
+    return "other";
+  }
   if (release.contentKind === "batch" && (targetSeasonNo === undefined || releaseSeasonNo === undefined)) {
     return "other";
   }

@@ -113,7 +113,7 @@ export function FilterToolbar({ className, ...props }: HTMLAttributes<HTMLDivEle
   return (
     <div
       className={cn(
-        "flex min-w-0 flex-col gap-3 border-y bg-card/50 py-3 sm:flex-row sm:items-center sm:justify-between",
+        "flex min-w-0 flex-col gap-3 border-b border-border/60 bg-card/50 py-3 sm:flex-row sm:items-center sm:justify-between",
         className
       )}
       {...props}

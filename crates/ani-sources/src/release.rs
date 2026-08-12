@@ -340,6 +340,9 @@ pub fn classify_anime_release(release: &Release, anime: &Anime) -> AnimeReleaseC
     if target.is_some() && actual.is_some() && target != actual {
         return AnimeReleaseCompatibility::Mismatch;
     }
+    if target.is_some_and(|value| value > 1) && actual.is_none() {
+        return AnimeReleaseCompatibility::Other;
+    }
     if release.content_kind == Some(ReleaseContentKind::Batch)
         && (target.is_none() || actual.is_none())
     {
@@ -674,18 +677,55 @@ fn detect_resolution(title: &str) -> Option<ReleaseResolution> {
 }
 
 fn detect_episode_range(title: &str) -> Option<ReleaseEpisodeRange> {
-    [
-        episode_range_season(),
-        episode_range_bracket(),
-        episode_range_generic(),
-    ]
-    .into_iter()
-    .find_map(|pattern| {
-        let captures = pattern.captures(title)?;
-        let start = captures.get(1)?.as_str().parse::<f64>().ok()?;
-        let end = captures.get(2)?.as_str().parse::<f64>().ok()?;
-        (end > start).then_some(ReleaseEpisodeRange { start, end })
-    })
+    for pattern in [episode_range_season(), episode_range_bracket()] {
+        if let Some(range) = pattern
+            .captures(title)
+            .as_ref()
+            .and_then(parse_episode_range_captures)
+        {
+            return Some(range);
+        }
+    }
+
+    let captures = episode_range_generic().captures(title)?;
+    if is_ambiguous_season_episode_range(&captures) {
+        return None;
+    }
+    parse_episode_range_captures(&captures)
+}
+
+/// 将正则捕获的起止集数转换为有效连集范围。
+fn parse_episode_range_captures(captures: &regex::Captures<'_>) -> Option<ReleaseEpisodeRange> {
+    let start = captures.get(1)?.as_str().parse::<f64>().ok()?;
+    let end = captures.get(2)?.as_str().parse::<f64>().ok()?;
+    (end > start).then_some(ReleaseEpisodeRange { start, end })
+}
+
+/// 排除“第二季 2 - 05”被当成第 2 至 5 集的歧义写法。
+fn is_ambiguous_season_episode_range(captures: &regex::Captures<'_>) -> bool {
+    let Some(start) = captures.get(1).map(|value| value.as_str()) else {
+        return false;
+    };
+    let Some(end) = captures.get(2).map(|value| value.as_str()) else {
+        return false;
+    };
+    let Some(full_match) = captures.get(0).map(|value| value.as_str()) else {
+        return false;
+    };
+    let normalized = full_match
+        .trim_start_matches(|character: char| {
+            character.is_whitespace() || character == '_' || character == '-'
+        })
+        .to_ascii_lowercase();
+    let explicitly_labeled = normalized.starts_with("ep")
+        || normalized.starts_with("episode")
+        || normalized.starts_with('第');
+    let spaced_separator = full_match.contains(" - ") || full_match.contains(" ~ ");
+    !explicitly_labeled
+        && spaced_separator
+        && start.len() == 1
+        && end.len() > 1
+        && end.starts_with('0')
 }
 
 fn detect_episode_no(title: &str) -> Option<f64> {
@@ -1218,18 +1258,81 @@ mod tests {
         assert_eq!(parsed.subtitle, Some(SubtitlePreference::Multi));
     }
 
+    /// 验证 NIX-RAWS 的“简繁内封”会明确识别为简体与繁体字幕。
+    #[test]
+    fn recognizes_nix_raws_embedded_chinese_subtitles() {
+        let title = "[NIX-RAWS] LV999的村民 - 04 [Baha][WEB-DL][1080P][AVC AAC][简繁内封]";
+        let parsed = parse_release_title(title, &[]);
+
+        assert_eq!(parsed.fansub_name.as_deref(), Some("NIX-RAWS"));
+        assert_eq!(parsed.episode_no, Some(4.0));
+        assert_eq!(
+            parsed.subtitle_languages,
+            vec![SubtitleLanguage::Chs, SubtitleLanguage::Cht]
+        );
+        assert_eq!(parsed.subtitle, Some(SubtitlePreference::Multi));
+
+        let release = enrich_release_from_title(
+            Release {
+                title: title.to_owned(),
+                ..empty_release()
+            },
+            &[],
+        );
+        assert!(release_satisfies_subtitle_requirement(
+            &release,
+            &["chs".to_owned(), "cht".to_owned()],
+            None,
+        ));
+    }
+
+    /// 验证没有字幕标记的 Kokoore 资源保持字幕未知，不能满足中文字幕门禁。
+    #[test]
+    fn keeps_kokoore_unmarked_subtitle_unknown() {
+        let title = "[LoliHouse] Kokoore - 05 [WebRip 1080p HEVC-10bit AAC].mkv";
+        let parsed = parse_release_title(title, &[]);
+
+        assert!(parsed.subtitle_languages.is_empty());
+        assert_eq!(parsed.subtitle, None);
+        let release = enrich_release_from_title(
+            Release {
+                title: title.to_owned(),
+                ..empty_release()
+            },
+            &[],
+        );
+        assert!(!release_satisfies_subtitle_requirement(
+            &release,
+            &["chs".to_owned()],
+            None,
+        ));
+    }
+
     /// 验证连集和合集不会被技术数字误判为单集。
     #[test]
     fn distinguishes_episode_ranges_and_batches() {
         let range = parse_release_title("[字幕组] 测试番 [01-12 合集][1080p]", &[]);
+        let season_range = parse_release_title("[字幕组] 测试番 S2E02-05 [1080p]", &[]);
+        let labeled_range = parse_release_title("[字幕组] 测试番 EP 2 - 05 [1080p]", &[]);
+        let bare_range = parse_release_title("[字幕组] 测试番 2-05 [1080p]", &[]);
         let batch = parse_release_title("[字幕组] 测试番 10-bit 1080p [S3 Fin]", &[]);
+        let season_episode = parse_release_title(
+            "[LoliHouse] 乙女游戏世界对路人角色很不友好2 / Otome Game Sekai wa Mob ni Kibishii Sekai desu 2 - 05 [WebRip 1080p HEVC-10bit AAC][简繁内封字幕]",
+            &[],
+        );
 
         assert_eq!(range.episode_no, None);
         assert_eq!(range.episode_range.expect("episode range").end, 12.0);
         assert_eq!(range.content_kind, ReleaseContentKind::Range);
+        assert_eq!(season_range.episode_range.expect("season range").start, 2.0);
+        assert_eq!(labeled_range.episode_range.expect("labeled range").end, 5.0);
+        assert_eq!(bare_range.episode_range.expect("bare range").end, 5.0);
         assert_eq!(batch.episode_no, None);
         assert_eq!(batch.series_season_no, Some(3));
         assert_eq!(batch.content_kind, ReleaseContentKind::Batch);
+        assert_eq!(season_episode.episode_no, Some(5.0));
+        assert_eq!(season_episode.episode_range, None);
+        assert_eq!(season_episode.content_kind, ReleaseContentKind::Episode);
     }
 
     /// 验证字幕组异体字符生成相同稳定 ID。
@@ -1299,6 +1402,53 @@ mod tests {
             end: 12.0,
         });
         assert!(release_matches_episode(&release, Some(8.0)));
+    }
+
+    /// 验证续作不会把未标季数的同名资源当作当前季自动下载候选。
+    #[test]
+    fn keeps_unmarked_sequel_episode_out_of_current_season() {
+        let anime = Anime {
+            title: "地狱模式 第二季".to_owned(),
+            original_title: Some("Hell Mode 2nd Season".to_owned()),
+            ..test_anime()
+        };
+        let release = enrich_release_from_title(
+            Release {
+                title: "[LoliHouse] 地狱模式～喜欢速通游戏的玩家在废设定异世界无双～ / Hell Mode - 08 [WebRip 1080p HEVC-10bit AAC][简繁内封字幕]".to_owned(),
+                ..empty_release()
+            },
+            &[],
+        );
+
+        assert_eq!(release.episode_no, Some(8.0));
+        assert_eq!(release.series_season_no, None);
+        assert_eq!(
+            release.subtitle_languages,
+            vec![SubtitleLanguage::Chs, SubtitleLanguage::Cht]
+        );
+        assert_eq!(
+            classify_anime_release(&release, &anime),
+            AnimeReleaseCompatibility::Other
+        );
+
+        let current_release = Release {
+            title: "[LoliHouse] Hell Mode S02E08 [1080p][HEVC-10bit][简繁]".to_owned(),
+            ..release.clone()
+        };
+        assert_eq!(
+            classify_anime_release(&current_release, &anime),
+            AnimeReleaseCompatibility::Current
+        );
+
+        let first_season = Anime {
+            title: "地狱模式 第一季".to_owned(),
+            original_title: Some("Hell Mode 1st Season".to_owned()),
+            ..anime
+        };
+        assert_eq!(
+            classify_anime_release(&release, &first_season),
+            AnimeReleaseCompatibility::Current
+        );
     }
 
     /// 验证自动下载必须完整覆盖字幕语言要求，未知多语组成不能绕过门禁。

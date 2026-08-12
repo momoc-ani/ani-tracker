@@ -18,6 +18,8 @@ import type {
   AutomationRunResult,
   AutomationSchedulerStatus,
   AppWindowState,
+  BangumiBrowseQuery,
+  BangumiBrowseResult,
   ConfirmAnimeSourceBindingInput,
   DesktopPlaybackSessionInput,
   DesktopPlayerWindowDragInput,
@@ -451,6 +453,20 @@ class TauriClientCore implements AppClient {
   async searchAnimeCatalog(keyword: string): Promise<AnimeDiscoverySearchResult> {
     return invoke<AnimeDiscoverySearchResult>("search_anime_catalog", { keyword }).catch((error) => {
       throw normalizeTauriError("search_anime_catalog", error);
+    });
+  }
+
+  /** 直接请求 Bangumi 在线浏览接口。 */
+  async browseBangumiAnime(query: BangumiBrowseQuery): Promise<BangumiBrowseResult> {
+    return invoke<BangumiBrowseResult>("browse_bangumi_anime", { query }).catch((error) => {
+      throw normalizeTauriError("browse_bangumi_anime", error);
+    });
+  }
+
+  /** 保存 Bangumi 追番，并由宿主启动后台元数据补全。 */
+  async followBangumiAnime(item: MyAnime): Promise<MyAnime[]> {
+    return invoke<MyAnime[]>("follow_bangumi_anime", { item }).catch((error) => {
+      throw normalizeTauriError("follow_bangumi_anime", error);
     });
   }
 

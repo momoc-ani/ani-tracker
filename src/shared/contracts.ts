@@ -12,6 +12,7 @@ import type {
   Season,
   TorrentFile
 } from "./domain";
+import type { DiscoveryBrowseFilters, DiscoveryBrowseSortKey } from "./discovery-filter";
 
 /** 返回当前客户端可加载的签名图片缓存地址。 */
 export interface ImageCacheResolveResult {
@@ -90,6 +91,24 @@ export interface AnimeDiscoverySeasonQuery {
   year: number;
   season: Season;
   forceRefresh?: boolean;
+}
+
+/** Bangumi 在线浏览的分页输入。 */
+export interface BangumiBrowseQuery {
+  keyword: string;
+  sort: DiscoveryBrowseSortKey;
+  filters: Omit<DiscoveryBrowseFilters, "airingStatuses">;
+  page: number;
+  pageSize: number;
+}
+
+/** Bangumi 在线浏览的分页响应。 */
+export interface BangumiBrowseResult {
+  query: BangumiBrowseQuery;
+  items: Anime[];
+  total: number;
+  hasMore: boolean;
+  source: "bangumi";
 }
 
 export interface AnimeDiscoveryResult {
@@ -298,6 +317,7 @@ export interface AddReleaseDownloadInput {
   fansubGroupId?: string;
   savePath?: string;
   paused?: boolean;
+  confirmUnknownSeason?: boolean;
 }
 
 export interface AddTorrentOptions {
