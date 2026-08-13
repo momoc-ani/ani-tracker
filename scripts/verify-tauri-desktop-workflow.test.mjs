@@ -49,6 +49,31 @@ test("RIFE sidecar 使用固定 Vulkan SDK 构建校验后再进入三平台安�
   );
 });
 
+test("Real-ESRGAN sidecar 使用独立资源目录并在三平台打包前校验", () => {
+  const prepareIndex = workflow.indexOf("name: Build and verify Real-ESRGAN model sidecar");
+  const windowsBuildIndex = workflow.indexOf("name: Build signed Windows installers");
+  const macosBuildIndex = workflow.indexOf("name: Build self-signed macOS app");
+  const linuxBuildIndex = workflow.indexOf("name: Build Linux bundles");
+  assert.match(
+    workflow,
+    /pnpm run prepare:realesrgan-sidecar[\s\S]*?pnpm run verify:realesrgan-sidecar/
+  );
+  assert.ok(prepareIndex >= 0 && prepareIndex < windowsBuildIndex);
+  assert.ok(prepareIndex < macosBuildIndex && prepareIndex < linuxBuildIndex);
+  assert.equal(
+    windowsConfig.bundle.resources["../out/realesrgan-model-sidecar/win32-x64/"],
+    "realesrgan-model-sidecar/win32-x64/"
+  );
+  assert.equal(
+    macosConfig.bundle.resources["../out/realesrgan-model-sidecar/"],
+    "realesrgan-model-sidecar/"
+  );
+  assert.equal(
+    linuxConfig.bundle.resources["../out/realesrgan-model-sidecar/linux-x64/"],
+    "realesrgan-model-sidecar/linux-x64/"
+  );
+});
+
 test("桌面重发同一版本时保留旧 Release，等待全平台成功后覆盖资产", () => {
   assert.match(workflow, /concurrency:[\s\S]*?group: ani-release-\$\{\{ inputs\.release_version \|\| github\.ref_name \}\}[\s\S]*?cancel-in-progress: false/);
   assert.match(workflow, /publish:\n    needs: desktop/);

@@ -246,6 +246,14 @@ jobs:
           pnpm run verify:rife-sidecar -- \
             --platform "${{ matrix.platform }}" --arch "${{ matrix.arch }}"
 
+      - name: Build and verify Real-ESRGAN model sidecar
+        shell: bash
+        run: |
+          pnpm run prepare:realesrgan-sidecar -- \
+            --platform "${{ matrix.platform }}" --arch "${{ matrix.arch }}"
+          pnpm run verify:realesrgan-sidecar -- \
+            --platform "${{ matrix.platform }}" --arch "${{ matrix.arch }}"
+
       - name: Import Windows signing certificate
         if: matrix.platform == 'win32' && env.WINDOWS_CERTIFICATE_BASE64 != ''
         id: windows-signing

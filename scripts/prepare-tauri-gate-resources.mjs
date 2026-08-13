@@ -27,16 +27,24 @@ export function compileOnlyResourceDirectories(platform, arch) {
       `out/ffmpeg/${target}`,
       `out/libmpv/${target}`,
       `out/model-sidecar/${target}`,
+      `out/realesrgan-model-sidecar/${target}`,
       `out/qbittorrent/${target}`,
       `out/torrent-core/${target}`
     ];
   }
   if (platform === "darwin") {
-    return ["out/ffmpeg", "out/model-sidecar", "out/qbittorrent", "out/torrent-core"];
+    return [
+      "out/ffmpeg",
+      "out/model-sidecar",
+      "out/realesrgan-model-sidecar",
+      "out/qbittorrent",
+      "out/torrent-core"
+    ];
   }
   if (platform === "linux") {
     return [
       `out/model-sidecar/${target}`,
+      `out/realesrgan-model-sidecar/${target}`,
       `out/qbittorrent/${target}`,
       `out/torrent-core/${target}`
     ];

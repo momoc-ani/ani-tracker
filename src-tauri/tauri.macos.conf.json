@@ -11,6 +11,7 @@
       "../out/ffmpeg/": "ffmpeg/",
       "../out/libvlc/": "libvlc/",
       "../out/model-sidecar/": "model-sidecar/",
+      "../out/realesrgan-model-sidecar/": "realesrgan-model-sidecar/",
       "../out/qbittorrent/": "qbittorrent/",
       "../out/torrent-core/": "torrent-core/",
       "../resources/licenses/vlc/": "licenses/vlc/",
