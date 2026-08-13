@@ -10,6 +10,7 @@
       "../NOTICE": "licenses/ani-tracker-NOTICE.txt",
       "../out/ffmpeg/": "ffmpeg/",
       "../out/libvlc/": "libvlc/",
+      "../out/model-sidecar/": "model-sidecar/",
       "../out/qbittorrent/": "qbittorrent/",
       "../out/torrent-core/": "torrent-core/",
       "../resources/licenses/vlc/": "licenses/vlc/",

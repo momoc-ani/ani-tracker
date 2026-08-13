@@ -9,6 +9,9 @@ const torrentCorePrepare = await readFile("scripts/prepare-desktop-torrent-core-
 const qbittorrentUnixBuild = await readFile("scripts/build-qbittorrent-nox-unix.sh", "utf8");
 const windowsSigningImport = await readFile("scripts/import-windows-signing-certificate.ps1", "utf8");
 const windowsSignatureVerification = await readFile("scripts/verify-windows-self-signature.ps1", "utf8");
+const windowsConfig = JSON.parse(await readFile("src-tauri/tauri.windows.conf.json", "utf8"));
+const macosConfig = JSON.parse(await readFile("src-tauri/tauri.macos.conf.json", "utf8"));
+const linuxConfig = JSON.parse(await readFile("src-tauri/tauri.linux.conf.json", "utf8"));
 
 test("桌面原生依赖按平台使用独立步骤和工具链", () => {
   assert.match(workflow, /name: Prepare Windows libVLC[\s\S]*?if: matrix\.platform == 'win32'[\s\S]*?shell: pwsh/);
@@ -24,6 +27,26 @@ test("桌面原生依赖按平台使用独立步骤和工具链", () => {
   assert.match(workflow, /name: Build Windows managed qBittorrent[\s\S]*?shell: pwsh/);
   assert.match(workflow, /name: Build macOS managed qBittorrent[\s\S]*?shell: bash/);
   assert.match(workflow, /name: Build Linux managed qBittorrent[\s\S]*?shell: bash/);
+});
+
+test("RIFE sidecar 使用固定 Vulkan SDK 构建校验后再进入三平台安装包", () => {
+  const prepareIndex = workflow.indexOf("name: Build and verify RIFE model sidecar");
+  const windowsBuildIndex = workflow.indexOf("name: Build signed Windows installers");
+  const macosBuildIndex = workflow.indexOf("name: Build self-signed macOS app");
+  const linuxBuildIndex = workflow.indexOf("name: Build Linux bundles");
+  assert.match(workflow, /name: Install pinned Vulkan SDK[\s\S]*?vulkan-query-version: 1\.3\.296\.0/);
+  assert.match(workflow, /pnpm run prepare:rife-sidecar[\s\S]*?pnpm run verify:rife-sidecar/);
+  assert.ok(prepareIndex >= 0 && prepareIndex < windowsBuildIndex);
+  assert.ok(prepareIndex < macosBuildIndex && prepareIndex < linuxBuildIndex);
+  assert.equal(
+    windowsConfig.bundle.resources["../out/model-sidecar/win32-x64/"],
+    "model-sidecar/win32-x64/"
+  );
+  assert.equal(macosConfig.bundle.resources["../out/model-sidecar/"], "model-sidecar/");
+  assert.equal(
+    linuxConfig.bundle.resources["../out/model-sidecar/linux-x64/"],
+    "model-sidecar/linux-x64/"
+  );
 });
 
 test("桌面重发同一版本时保留旧 Release，等待全平台成功后覆盖资产", () => {

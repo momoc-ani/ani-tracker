@@ -4,6 +4,9 @@ project(ani-rife-model-sidecar LANGUAGES C CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+find_package(Threads REQUIRED)
+find_package(Vulkan REQUIRED)
+
 set(RIFE_SOURCE_DIR "" CACHE PATH "Pinned rife-ncnn-vulkan checkout")
 if(NOT EXISTS "${RIFE_SOURCE_DIR}/src/rife.cpp")
   message(FATAL_ERROR "RIFE_SOURCE_DIR must point to a complete rife-ncnn-vulkan checkout")

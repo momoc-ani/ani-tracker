@@ -9,6 +9,7 @@
       "../LICENSE": "licenses/ani-tracker-LICENSE.txt",
       "../NOTICE": "licenses/ani-tracker-NOTICE.txt",
       "../out/libvlc/linux-x64/": "libvlc/linux-x64/",
+      "../out/model-sidecar/linux-x64/": "model-sidecar/linux-x64/",
       "../out/qbittorrent/linux-x64/": "qbittorrent/linux-x64/",
       "../out/torrent-core/linux-x64/": "torrent-core/linux-x64/",
       "../resources/licenses/vlc/": "licenses/vlc/",

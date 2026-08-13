@@ -167,11 +167,33 @@ async function configureAndBuild(sourceDirectory, buildDirectory, options) {
     "-DCMAKE_BUILD_TYPE=Release"
   ];
   if (options.platform === "darwin") {
-    cmakeArgs.push("-DUSE_STATIC_MOLTENVK=ON", `-DCMAKE_OSX_ARCHITECTURES=${options.arch === "x64" ? "x86_64" : "arm64"}`);
+    const moltenVk = await resolveMacosMoltenVk();
+    cmakeArgs.push(
+      "-DUSE_STATIC_MOLTENVK=ON",
+      `-DCMAKE_OSX_ARCHITECTURES=${options.arch === "x64" ? "x86_64" : "arm64"}`,
+      `-DVulkan_INCLUDE_DIR=${moltenVk.includeDirectory}`,
+      `-DVulkan_LIBRARY=${moltenVk.library}`
+    );
   }
   if (options.platform === "win32") cmakeArgs.push("-A", "x64");
   run("cmake", cmakeArgs);
   run("cmake", ["--build", buildDirectory, "--config", "Release", "--parallel", String(options.jobs)]);
+}
+
+async function resolveMacosMoltenVk() {
+  const sdk = process.env.VULKAN_SDK;
+  if (!sdk) throw new Error("[rife-sidecar] VULKAN_SDK is required for macOS MoltenVK builds");
+  const includeCandidates = [join(sdk, "include"), join(sdk, "MoltenVK", "include")];
+  const libraryCandidates = [
+    join(sdk, "MoltenVK", "MoltenVK.xcframework", "macos-arm64_x86_64", "libMoltenVK.a"),
+    join(sdk, "lib", "libMoltenVK.a")
+  ];
+  const includeDirectory = await firstDirectory(includeCandidates);
+  const library = await firstFile(libraryCandidates);
+  if (!includeDirectory || !library) {
+    throw new Error(`[rife-sidecar] static MoltenVK is missing from VULKAN_SDK: ${sdk}`);
+  }
+  return { includeDirectory, library };
 }
 
 async function resolveBuiltExecutable(buildDirectory, platform) {
@@ -277,4 +299,14 @@ async function isFile(path) {
 
 async function isDirectory(path) {
   try { return (await stat(path)).isDirectory(); } catch { return false; }
+}
+
+async function firstFile(paths) {
+  for (const path of paths) if (await isFile(path)) return path;
+  return undefined;
+}
+
+async function firstDirectory(paths) {
+  for (const path of paths) if (await isDirectory(path)) return path;
+  return undefined;
 }
