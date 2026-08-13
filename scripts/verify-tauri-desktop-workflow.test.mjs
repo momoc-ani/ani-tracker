@@ -21,6 +21,14 @@ test("桌面原生依赖按平台使用独立步骤和工具链", () => {
   assert.match(workflow, /name: Build Linux managed qBittorrent[\s\S]*?shell: bash/);
 });
 
+test("桌面重发同一版本时保留旧 Release，等待全平台成功后覆盖资产", () => {
+  assert.match(workflow, /concurrency:[\s\S]*?group: tauri-desktop-release-\$\{\{ inputs\.release_version \|\| github\.ref_name \}\}[\s\S]*?cancel-in-progress: false/);
+  assert.match(workflow, /publish:\n    needs: desktop/);
+  assert.match(workflow, /overwrite_files: true/);
+  assert.match(workflow, /fail_on_unmatched_files: true/);
+  assert.doesNotMatch(workflow, /gh release delete|git push .*--delete|git tag -d|DELETE .*releases/);
+});
+
 test("macOS Intel 架构转换为 CMake 识别的 x86_64", () => {
   assert.match(torrentCorePrepare, /arch === "x64" \? "x86_64" : arch/);
   assert.match(torrentCorePrepare, /CMAKE_OSX_ARCHITECTURES=\$\{cmakeArchitecture\}/);
