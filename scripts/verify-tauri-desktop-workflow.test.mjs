@@ -27,7 +27,7 @@ test("桌面原生依赖按平台使用独立步骤和工具链", () => {
 });
 
 test("桌面重发同一版本时保留旧 Release，等待全平台成功后覆盖资产", () => {
-  assert.match(workflow, /concurrency:[\s\S]*?group: tauri-desktop-release-\$\{\{ inputs\.release_version \|\| github\.ref_name \}\}[\s\S]*?cancel-in-progress: false/);
+  assert.match(workflow, /concurrency:[\s\S]*?group: ani-release-\$\{\{ inputs\.release_version \|\| github\.ref_name \}\}[\s\S]*?cancel-in-progress: false/);
   assert.match(workflow, /publish:\n    needs: desktop/);
   assert.match(workflow, /overwrite_files: true/);
   assert.match(workflow, /fail_on_unmatched_files: true/);

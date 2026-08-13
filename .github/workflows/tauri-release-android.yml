@@ -15,6 +15,10 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: ani-release-${{ inputs.release_version || github.ref_name }}
+  cancel-in-progress: false
+
 env:
   RELEASE_VERSION: ${{ github.event_name == 'workflow_dispatch' && inputs.release_version || github.ref_name }}
 
@@ -186,4 +190,6 @@ jobs:
           tag_name: ${{ env.RELEASE_VERSION }}
           target_commitish: ${{ github.sha }}
           generate_release_notes: true
+          overwrite_files: true
+          fail_on_unmatched_files: true
           files: release-assets/*
