@@ -1556,6 +1556,8 @@ mod tests {
                 ffprobe_paths: Vec::new(),
                 ffmpeg_path: PathBuf::from("ffmpeg"),
                 timeout: Duration::from_secs(1),
+                rife_sidecar_root: None,
+                rife_available_vram_bytes: 0,
             },
             temporary.path().join("sessions"),
         ));

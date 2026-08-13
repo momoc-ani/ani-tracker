@@ -8,6 +8,7 @@ license.workspace = true
 [dependencies]
 ani-contracts = { path = "../ani-contracts" }
 ani-domain = { path = "../ani-domain" }
+ani-media = { path = "../ani-media" }
 ani-image-cache = { path = "../ani-image-cache" }
 async-trait = "0.1"
 axum = { version = "0.8", features = ["http1", "json", "tokio"] }

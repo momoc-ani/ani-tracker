@@ -9,6 +9,8 @@ use ani_contracts::{
     RemotePlaybackEnhancement, RemotePlaybackSession, RemotePlaybackSubtitle,
 };
 use ani_domain::{AppSettings, DownloadTask, MediaFile, PlaybackCheckpoint};
+use ani_media::model_sidecar::{ModelSidecarConfig, ModelSidecarRuntime};
+use ani_media::player::{FrameInterpolator, RawVideoFrame};
 use async_trait::async_trait;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
@@ -17,13 +19,17 @@ use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
 use rand::rngs::OsRng;
 use rand::RngCore;
 use serde::Deserialize;
+use std::process::Stdio;
 use subtle::ConstantTimeEq;
-use tokio::process::{Child, Command};
-use tokio::sync::Mutex;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::process::{Child, ChildStdin, ChildStdout, Command};
+use tokio::sync::{mpsc, Mutex};
+use tokio::task::JoinHandle;
 
 const SESSION_TTL: Duration = Duration::from_secs(30 * 60);
 const TRANSCODER_START_TIMEOUT: Duration = Duration::from_secs(20);
 const MAX_SESSIONS: usize = 2;
+const RIFE_FRAME_QUEUE_CAPACITY: usize = 2;
 const ENCODER_CANDIDATES: &[(&str, &str)] = &[
     ("h264_nvenc", "nvenc"),
     ("h264_amf", "amf"),
@@ -74,6 +80,8 @@ pub struct RemoteMediaTools {
     pub ffprobe_paths: Vec<PathBuf>,
     pub ffmpeg_path: PathBuf,
     pub timeout: Duration,
+    pub rife_sidecar_root: Option<PathBuf>,
+    pub rife_available_vram_bytes: u64,
 }
 
 /// 网关可输出的受控媒体文件。
@@ -118,8 +126,45 @@ struct SessionRecord {
     source_path: PathBuf,
     content_type: String,
     temporary_directory: PathBuf,
-    process: Mutex<Option<Child>>,
+    process: Mutex<Option<MediaProcess>>,
     last_accessed_at_millis: Mutex<i64>,
+}
+
+struct MediaProcess {
+    encoder: Child,
+    decoder: Option<Child>,
+    pipeline: Option<JoinHandle<Result<(), String>>>,
+}
+
+impl Drop for MediaProcess {
+    fn drop(&mut self) {
+        if let Some(pipeline) = self.pipeline.take() {
+            pipeline.abort();
+        }
+    }
+}
+
+impl MediaProcess {
+    async fn stop(mut self) {
+        if let Some(pipeline) = self.pipeline.take() {
+            pipeline.abort();
+            let _ = pipeline.await;
+        }
+        if let Some(mut decoder) = self.decoder.take() {
+            let _ = decoder.kill().await;
+            let _ = tokio::time::timeout(Duration::from_secs(2), decoder.wait()).await;
+        }
+        let _ = self.encoder.kill().await;
+        let _ = tokio::time::timeout(Duration::from_secs(2), self.encoder.wait()).await;
+    }
+}
+
+struct HlsStart {
+    process: MediaProcess,
+    encoder: &'static str,
+    encoder_degraded: bool,
+    actual_interpolation: PlayerFrameInterpolation,
+    degradation_reason: Option<String>,
 }
 
 struct ResolvedMedia {
@@ -136,6 +181,7 @@ pub struct RemoteMediaSessionService {
     tools: RemoteMediaTools,
     temporary_root: PathBuf,
     sessions: Mutex<HashMap<String, Arc<SessionRecord>>>,
+    rife_runtime: Mutex<Option<Arc<ModelSidecarRuntime>>>,
 }
 
 impl RemoteMediaSessionService {
@@ -150,6 +196,7 @@ impl RemoteMediaSessionService {
             tools,
             temporary_root,
             sessions: Mutex::new(HashMap::new()),
+            rife_runtime: Mutex::new(None),
         }
     }
 
@@ -264,15 +311,20 @@ impl RemoteMediaSessionService {
             ..Default::default()
         };
         if mode == "hls" {
-            let (child, encoder, degraded) = self
+            let started = self
                 .start_hls(&media.path, &temporary_directory, enhancement)
                 .await
                 .inspect_err(|_| {
                     let _ = std::fs::remove_dir_all(&temporary_directory);
                 })?;
-            process = Some(child);
-            diagnostics.encoder = Some(encoder.to_owned());
-            diagnostics.encoder_degraded = degraded;
+            process = Some(started.process);
+            diagnostics.encoder = Some(started.encoder.to_owned());
+            diagnostics.encoder_degraded = started.encoder_degraded;
+            diagnostics.frame_interpolation = started.actual_interpolation;
+            diagnostics.enhanced_frame_input = diagnostics.video_enhancement
+                != PlayerVideoEnhancement::Off
+                || diagnostics.frame_interpolation != PlayerFrameInterpolation::Off;
+            diagnostics.degradation_reason = started.degradation_reason;
         }
         let now = Utc::now();
         let direct_asset_name =
@@ -473,9 +525,8 @@ impl RemoteMediaSessionService {
         let Some(record) = record else {
             return;
         };
-        if let Some(mut process) = record.process.lock().await.take() {
-            let _ = process.kill().await;
-            let _ = tokio::time::timeout(Duration::from_secs(2), process.wait()).await;
+        if let Some(process) = record.process.lock().await.take() {
+            process.stop().await;
         }
         if let Err(error) = tokio::fs::remove_dir_all(&record.temporary_directory).await {
             if error.kind() != std::io::ErrorKind::NotFound {
@@ -784,7 +835,82 @@ impl RemoteMediaSessionService {
         source_path: &Path,
         output_directory: &Path,
         enhancement: RemotePlaybackEnhancement,
-    ) -> Result<(Child, &'static str, bool), RemoteMediaError> {
+    ) -> Result<HlsStart, RemoteMediaError> {
+        if enhancement.frame_interpolation == PlayerFrameInterpolation::RifeRealtime {
+            match self.ensure_rife_runtime().await {
+                Ok(runtime) => match self
+                    .start_rife_hls(source_path, output_directory, enhancement, runtime)
+                    .await
+                {
+                    Ok(started) => return Ok(started),
+                    Err(error) => {
+                        log::warn!("RIFE 远程管线启动失败，回退 FFmpeg error={}", error.message);
+                        return self
+                            .start_hls_ffmpeg(
+                                source_path,
+                                output_directory,
+                                RemotePlaybackEnhancement {
+                                    frame_interpolation: PlayerFrameInterpolation::Off,
+                                    ..enhancement
+                                },
+                            )
+                            .await
+                            .map(|mut started| {
+                                started.degradation_reason = Some(error.message);
+                                started.encoder_degraded = true;
+                                started
+                            });
+                    }
+                },
+                Err(reason) => {
+                    log::warn!("RIFE sidecar 不可用，回退 FFmpeg reason={reason}");
+                    return self
+                        .start_hls_ffmpeg(
+                            source_path,
+                            output_directory,
+                            RemotePlaybackEnhancement {
+                                frame_interpolation: PlayerFrameInterpolation::Off,
+                                ..enhancement
+                            },
+                        )
+                        .await
+                        .map(|mut started| {
+                            started.degradation_reason = Some(reason);
+                            started.encoder_degraded = true;
+                            started
+                        });
+                }
+            }
+        }
+        self.start_hls_ffmpeg(source_path, output_directory, enhancement)
+            .await
+    }
+
+    async fn ensure_rife_runtime(&self) -> Result<Arc<ModelSidecarRuntime>, String> {
+        let mut guard = self.rife_runtime.lock().await;
+        if let Some(runtime) = guard.as_ref() {
+            if runtime.ready() {
+                return Ok(Arc::clone(runtime));
+            }
+            *guard = None;
+        }
+        let root = self
+            .tools
+            .rife_sidecar_root
+            .clone()
+            .ok_or_else(|| "未找到 RIFE sidecar 资源".to_owned())?;
+        let config = ModelSidecarConfig::new(root, self.tools.rife_available_vram_bytes, 33.0);
+        let runtime = Arc::new(ModelSidecarRuntime::launch(config).await?);
+        *guard = Some(Arc::clone(&runtime));
+        Ok(runtime)
+    }
+
+    async fn start_hls_ffmpeg(
+        &self,
+        source_path: &Path,
+        output_directory: &Path,
+        enhancement: RemotePlaybackEnhancement,
+    ) -> Result<HlsStart, RemoteMediaError> {
         let playlist = output_directory.join("index.m3u8");
         let segments = output_directory.join("segment-%06d.ts");
         let mut last_error = None;
@@ -829,7 +955,17 @@ impl RemoteMediaSessionService {
             let started = tokio::time::Instant::now();
             loop {
                 if tokio::fs::try_exists(&playlist).await.unwrap_or(false) {
-                    return Ok((child, *encoder, index > 0));
+                    return Ok(HlsStart {
+                        process: MediaProcess {
+                            encoder: child,
+                            decoder: None,
+                            pipeline: None,
+                        },
+                        encoder,
+                        encoder_degraded: index > 0,
+                        actual_interpolation: enhancement.frame_interpolation,
+                        degradation_reason: None,
+                    });
                 }
                 if let Ok(Some(status)) = child.try_wait() {
                     last_error = Some(format!("编码器 {encoder} 提前退出：{status}"));
@@ -849,6 +985,301 @@ impl RemoteMediaSessionService {
             last_error.unwrap_or_else(|| "没有可用的 HLS 编码器".to_owned()),
         ))
     }
+
+    async fn start_rife_hls(
+        &self,
+        source_path: &Path,
+        output_directory: &Path,
+        enhancement: RemotePlaybackEnhancement,
+        runtime: Arc<ModelSidecarRuntime>,
+    ) -> Result<HlsStart, RemoteMediaError> {
+        let video = self
+            .probe_video(source_path)
+            .await
+            .map_err(|error| RemoteMediaError::new(503, "RIFE_VIDEO_PROBE_FAILED", error))?;
+        let playlist = output_directory.join("index.m3u8");
+        let segments = output_directory.join("segment-%06d.ts");
+        let output_fps = (video.frame_rate * 2.0).clamp(1.0, 240.0);
+        let dimensions = format!("{}x{}", video.width, video.height);
+        let mut decoder = hidden_command(&self.tools.ffmpeg_path);
+        decoder
+            .args(["-nostdin", "-hide_banner", "-loglevel", "error", "-i"])
+            .arg(source_path)
+            .args([
+                "-map", "0:v:0", "-an", "-vsync", "0", "-f", "rawvideo", "-pix_fmt", "rgb24",
+                "pipe:1",
+            ])
+            .stdout(Stdio::piped())
+            .kill_on_drop(true);
+        let mut decoder = decoder.spawn().map_err(|error| {
+            RemoteMediaError::new(503, "RIFE_DECODER_UNAVAILABLE", error.to_string())
+        })?;
+        let decoder_stdout = decoder.stdout.take().ok_or_else(|| {
+            RemoteMediaError::new(
+                503,
+                "RIFE_DECODER_OUTPUT_UNAVAILABLE",
+                "FFmpeg RGB 输出不可用",
+            )
+        })?;
+
+        let mut encoder = hidden_command(&self.tools.ffmpeg_path);
+        let fps_arg = format!("{output_fps:.6}");
+        encoder
+            .args([
+                "-nostdin",
+                "-hide_banner",
+                "-loglevel",
+                "warning",
+                "-f",
+                "rawvideo",
+                "-pix_fmt",
+                "rgb24",
+                "-s",
+                &dimensions,
+                "-r",
+                &fps_arg,
+                "-i",
+                "pipe:0",
+                "-i",
+            ])
+            .arg(source_path)
+            .args(["-map", "0:v:0", "-map", "1:a:0?", "-c:v"])
+            .args(encoder_video_args("libx264"))
+            .args(remote_video_filter_args(RemotePlaybackEnhancement {
+                frame_interpolation: PlayerFrameInterpolation::Off,
+                ..enhancement
+            }))
+            .args([
+                "-pix_fmt",
+                "yuv420p",
+                "-c:a",
+                "aac",
+                "-b:a",
+                "160k",
+                "-ac",
+                "2",
+                "-shortest",
+                "-f",
+                "hls",
+                "-hls_time",
+                "4",
+                "-hls_list_size",
+                "0",
+                "-hls_playlist_type",
+                "event",
+                "-hls_segment_filename",
+            ])
+            .arg(&segments)
+            .arg(&playlist)
+            .stdin(Stdio::piped())
+            .kill_on_drop(true);
+        let mut encoder = encoder.spawn().map_err(|error| {
+            RemoteMediaError::new(503, "RIFE_ENCODER_UNAVAILABLE", error.to_string())
+        })?;
+        let encoder_stdin = encoder.stdin.take().ok_or_else(|| {
+            RemoteMediaError::new(
+                503,
+                "RIFE_ENCODER_INPUT_UNAVAILABLE",
+                "FFmpeg rawvideo 输入不可用",
+            )
+        })?;
+        let pipeline = tokio::spawn(run_rife_pipeline(
+            decoder_stdout,
+            encoder_stdin,
+            runtime,
+            video.width,
+            video.height,
+            video.frame_rate,
+        ));
+        let started = tokio::time::Instant::now();
+        loop {
+            if tokio::fs::try_exists(&playlist).await.unwrap_or(false) {
+                return Ok(HlsStart {
+                    process: MediaProcess {
+                        encoder,
+                        decoder: Some(decoder),
+                        pipeline: Some(pipeline),
+                    },
+                    encoder: "libx264",
+                    encoder_degraded: true,
+                    actual_interpolation: PlayerFrameInterpolation::RifeRealtime,
+                    degradation_reason: None,
+                });
+            }
+            if let Ok(Some(status)) = encoder.try_wait() {
+                let _ = decoder.kill().await;
+                pipeline.abort();
+                return Err(RemoteMediaError::new(
+                    503,
+                    "RIFE_ENCODER_EXITED",
+                    format!("RIFE 编码器提前退出：{status}"),
+                ));
+            }
+            if started.elapsed() >= TRANSCODER_START_TIMEOUT {
+                pipeline.abort();
+                let _ = decoder.kill().await;
+                let _ = encoder.kill().await;
+                return Err(RemoteMediaError::new(
+                    503,
+                    "RIFE_PIPELINE_START_TIMEOUT",
+                    "RIFE 远程管线启动超时",
+                ));
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    async fn probe_video(&self, source_path: &Path) -> Result<VideoProbe, String> {
+        let mut last_error = "没有可用 FFprobe".to_owned();
+        for command_path in &self.tools.ffprobe_paths {
+            match run_command(
+                command_path,
+                &[
+                    "-v",
+                    "quiet",
+                    "-print_format",
+                    "json",
+                    "-show_entries",
+                    "stream=width,height,avg_frame_rate",
+                    "-select_streams",
+                    "v:0",
+                ],
+                Some(source_path),
+                self.tools.timeout,
+            )
+            .await
+            {
+                Ok(output) => {
+                    let parsed: VideoProbeOutput = serde_json::from_slice(&output.stdout)
+                        .map_err(|error| format!("FFprobe 视频 JSON 无效：{error}"))?;
+                    let stream = parsed
+                        .streams
+                        .into_iter()
+                        .next()
+                        .ok_or_else(|| "媒体没有视频流".to_owned())?;
+                    let width = stream.width.ok_or_else(|| "视频宽度缺失".to_owned())?;
+                    let height = stream.height.ok_or_else(|| "视频高度缺失".to_owned())?;
+                    let frame_rate =
+                        parse_frame_rate(stream.avg_frame_rate.as_deref().unwrap_or("0/1"))?;
+                    return Ok(VideoProbe {
+                        width,
+                        height,
+                        frame_rate,
+                    });
+                }
+                Err(error) => last_error = error,
+            }
+        }
+        Err(last_error)
+    }
+}
+
+struct VideoProbe {
+    width: u32,
+    height: u32,
+    frame_rate: f64,
+}
+
+#[derive(Default, Deserialize)]
+struct VideoProbeOutput {
+    #[serde(default)]
+    streams: Vec<VideoProbeStream>,
+}
+
+#[derive(Default, Deserialize)]
+struct VideoProbeStream {
+    width: Option<u32>,
+    height: Option<u32>,
+    avg_frame_rate: Option<String>,
+}
+
+fn parse_frame_rate(value: &str) -> Result<f64, String> {
+    let (numerator, denominator) = value
+        .split_once('/')
+        .ok_or_else(|| "视频帧率格式无效".to_owned())?;
+    let numerator = numerator
+        .parse::<f64>()
+        .map_err(|_| "视频帧率无效".to_owned())?;
+    let denominator = denominator
+        .parse::<f64>()
+        .map_err(|_| "视频帧率无效".to_owned())?;
+    let frame_rate = numerator / denominator;
+    if !frame_rate.is_finite() || frame_rate <= 0.0 || frame_rate > 120.0 {
+        return Err("视频帧率超出 RIFE 管线限制".to_owned());
+    }
+    Ok(frame_rate)
+}
+
+async fn run_rife_pipeline(
+    mut decoder_stdout: ChildStdout,
+    mut encoder_stdin: ChildStdin,
+    runtime: Arc<ModelSidecarRuntime>,
+    width: u32,
+    height: u32,
+    frame_rate: f64,
+) -> Result<(), String> {
+    let frame_size = usize::try_from(width)
+        .ok()
+        .and_then(|width| width.checked_mul(3))
+        .and_then(|stride| {
+            usize::try_from(height)
+                .ok()
+                .and_then(|height| stride.checked_mul(height))
+        })
+        .ok_or_else(|| "RIFE 视频帧大小溢出".to_owned())?;
+    let frame_interval = (1_000_000.0 / frame_rate).round() as i64;
+    let (sender, mut receiver) = mpsc::channel::<RawVideoFrame>(RIFE_FRAME_QUEUE_CAPACITY);
+    let reader = tokio::spawn(async move {
+        let mut index = 0_i64;
+        loop {
+            let mut data = vec![0_u8; frame_size];
+            match decoder_stdout.read_exact(&mut data).await {
+                Ok(_) => {
+                    let frame = RawVideoFrame {
+                        width,
+                        height,
+                        stride: width.saturating_mul(3),
+                        pts_micros: index.saturating_mul(frame_interval),
+                        data,
+                    };
+                    if sender.send(frame).await.is_err() {
+                        return Ok::<(), String>(());
+                    }
+                    index = index.saturating_add(1);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
+                Err(error) => return Err(format!("读取 FFmpeg RGB 帧失败：{error}")),
+            }
+        }
+    });
+    let Some(mut previous) = receiver.recv().await else {
+        let _ = reader.await;
+        return Err("FFmpeg 没有输出视频帧".to_owned());
+    };
+    while let Some(next) = receiver.recv().await {
+        encoder_stdin
+            .write_all(&previous.data)
+            .await
+            .map_err(|error| format!("写入 RIFE 原始帧失败：{error}"))?;
+        let middle = runtime.interpolate(previous.clone(), next.clone()).await?;
+        encoder_stdin
+            .write_all(&middle.data)
+            .await
+            .map_err(|error| format!("写入 RIFE 中间帧失败：{error}"))?;
+        previous = next;
+    }
+    encoder_stdin
+        .write_all(&previous.data)
+        .await
+        .map_err(|error| format!("写入 RIFE 最后一帧失败：{error}"))?;
+    encoder_stdin
+        .shutdown()
+        .await
+        .map_err(|error| format!("关闭 RIFE 编码输入失败：{error}"))?;
+    reader
+        .await
+        .map_err(|error| format!("读取 RIFE 帧任务失败：{error}"))??;
+    Ok(())
 }
 
 fn validate_remote_enhancement(
@@ -864,14 +1295,11 @@ fn validate_remote_enhancement(
             "远程画质增强和插帧只能在实时转码模式使用",
         ));
     }
-    if matches!(
-        enhancement.frame_interpolation,
-        PlayerFrameInterpolation::DisplayResample | PlayerFrameInterpolation::RifeRealtime
-    ) {
+    if enhancement.frame_interpolation == PlayerFrameInterpolation::DisplayResample {
         return Err(RemoteMediaError::new(
             400,
             "MEDIA_INTERPOLATION_UNAVAILABLE",
-            "远程转码仅支持运动估计插帧；RIFE 模型运行时尚未就绪",
+            "远程转码不使用播放器显示刷新率重采样",
         ));
     }
     Ok(())
@@ -968,11 +1396,27 @@ mod encoder_tests {
         assert!(validate_remote_enhancement(
             "transcode",
             RemotePlaybackEnhancement {
-                frame_interpolation: PlayerFrameInterpolation::RifeRealtime,
+                frame_interpolation: PlayerFrameInterpolation::DisplayResample,
                 ..Default::default()
             }
         )
         .is_err());
+        assert!(validate_remote_enhancement(
+            "transcode",
+            RemotePlaybackEnhancement {
+                frame_interpolation: PlayerFrameInterpolation::RifeRealtime,
+                ..Default::default()
+            }
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn accepts_normal_frame_rates_and_rejects_unsafe_values() {
+        assert!((super::parse_frame_rate("24000/1001").unwrap() - 23.976).abs() < 0.01);
+        assert!(super::parse_frame_rate("0/1").is_err());
+        assert!(super::parse_frame_rate("121/1").is_err());
+        assert!(super::parse_frame_rate("nan/1").is_err());
     }
 }
 

@@ -701,6 +701,7 @@ export interface RemotePlaybackDiagnostics {
   enhancedFrameInput: boolean;
   videoEnhancement: import("./player-contract").PlayerVideoEnhancement;
   frameInterpolation: import("./player-contract").PlayerFrameInterpolation;
+  degradationReason?: string;
 }
 
 export interface RemotePlaybackSession {

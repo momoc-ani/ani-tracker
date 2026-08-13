@@ -870,6 +870,8 @@ pub struct RemotePlaybackDiagnostics {
     pub video_enhancement: PlayerVideoEnhancement,
     #[serde(default)]
     pub frame_interpolation: PlayerFrameInterpolation,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub degradation_reason: Option<String>,
 }
 
 /// 远程转码实际请求的像素处理链；直传模式必须保持关闭。

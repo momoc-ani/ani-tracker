@@ -362,10 +362,13 @@ impl AppMediaState {
             .into_iter()
             .next()
             .ok_or_else(|| "没有可用的 FFmpeg 命令".to_owned())?;
+        let rife_sidecar_root = resolve_model_sidecar_root(&self.app);
         Ok(RemoteMediaTools {
             ffprobe_paths,
             ffmpeg_path,
             timeout: Duration::from_secs(timeout),
+            rife_sidecar_root,
+            rife_available_vram_bytes: configured_vram_bytes(&settings),
         })
     }
 
@@ -698,6 +701,44 @@ fn setting_u64(settings: &AppSettings, pointer: &str, fallback: u64) -> u64 {
         .pointer(pointer)
         .and_then(Value::as_u64)
         .unwrap_or(fallback)
+}
+
+#[cfg(desktop)]
+fn configured_vram_bytes(settings: &AppSettings) -> u64 {
+    setting_u64(settings, "/media/rifeAvailableVramBytes", 0)
+}
+
+#[cfg(desktop)]
+fn resolve_model_sidecar_root(app: &AppHandle) -> Option<PathBuf> {
+    let platform = if cfg!(target_os = "windows") {
+        "win32"
+    } else if cfg!(target_os = "macos") {
+        "darwin"
+    } else {
+        "linux"
+    };
+    let arch = match std::env::consts::ARCH {
+        "x86_64" => "x64",
+        "aarch64" => "arm64",
+        value => value,
+    };
+    let mut roots = Vec::new();
+    if let Ok(resources) = app.path().resource_dir() {
+        roots.push(resources.join("model-sidecar"));
+    }
+    let current = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    roots.extend([
+        current.join("out/model-sidecar"),
+        current.join("resources/model-sidecar"),
+    ]);
+    #[cfg(debug_assertions)]
+    if let Some(workspace) = Path::new(env!("CARGO_MANIFEST_DIR")).parent() {
+        roots.push(workspace.join("out/model-sidecar"));
+    }
+    roots
+        .into_iter()
+        .map(|root| root.join(format!("{platform}-{arch}")))
+        .find(|path| path.is_dir())
 }
 
 fn log_scan_result(result: &MediaScanResult, mode: &str) {
