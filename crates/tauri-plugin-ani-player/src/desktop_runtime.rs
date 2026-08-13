@@ -367,6 +367,9 @@ impl VlcRuntime {
                     "桌面 libVLC 不支持 GPU shader 画质增强",
                 ));
             }
+            PlayerCommandAction::SetFrameInterpolation { .. } => {
+                return Ok(unsupported(&command_id, "桌面 libVLC 不支持模型补帧"));
+            }
             PlayerCommandAction::PreviousItem | PlayerCommandAction::NextItem => {
                 return Ok(unsupported(&command_id, "播放列表切换由页面会话管理"));
             }
@@ -516,6 +519,7 @@ impl VlcRuntime {
             }
             PlayerCommandAction::Close
             | PlayerCommandAction::SetVideoEnhancement { .. }
+            | PlayerCommandAction::SetFrameInterpolation { .. }
             | PlayerCommandAction::SetPictureInPicture { .. }
             | PlayerCommandAction::PreviousItem
             | PlayerCommandAction::NextItem => {}
@@ -1052,6 +1056,8 @@ fn desktop_capabilities() -> PlayerCapabilities {
         supports_subtitle_tracks: true,
         supports_subtitle_scale: true,
         supports_video_enhancement: false,
+        supports_frame_interpolation: false,
+        supports_model_enhancement: false,
         supports_aspect_ratio: true,
         supports_fullscreen: true,
         supports_picture_in_picture: false,
@@ -1115,6 +1121,8 @@ fn initial_snapshot(
         subtitle_scale,
         video_enhancement: ani_contracts::PlayerVideoEnhancement::Off,
         video_enhancement_degraded: false,
+        frame_interpolation: ani_contracts::PlayerFrameInterpolation::Off,
+        enhancement_diagnostics: Default::default(),
         aspect_ratio: PlayerAspectRatio::Default,
         fullscreen: false,
         picture_in_picture: false,

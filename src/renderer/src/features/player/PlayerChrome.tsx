@@ -52,6 +52,7 @@ import type { RemotePlaybackRequestMode, RemotePlaybackSubtitle } from "@shared/
 import {
   PLAYER_SUBTITLE_SCALES,
   type PlayerAspectRatio,
+  type PlayerFrameInterpolation,
   type PlayerSubtitleScale,
   type PlayerVideoEnhancement
 } from "@shared/player-contract";
@@ -81,6 +82,7 @@ interface PlayerChromeProps {
   onChangeSubtitle: (subtitleId?: string) => void;
   onChangeSubtitleScale: (subtitleScale: PlayerSubtitleScale) => void;
   onChangeVideoEnhancement?: (videoEnhancement: PlayerVideoEnhancement) => void;
+  onChangeFrameInterpolation?: (frameInterpolation: PlayerFrameInterpolation) => void;
   onClose: () => void;
   onGoNext: () => void;
   onGoPrevious: () => void;
@@ -105,6 +107,8 @@ interface PlayerChromeProps {
   videoEnhancement?: PlayerVideoEnhancement;
   videoEnhancementAvailable?: boolean;
   videoEnhancementDegraded?: boolean;
+  frameInterpolation?: PlayerFrameInterpolation;
+  frameInterpolationAvailable?: boolean;
   subtitles: RemotePlaybackSubtitle[];
   visible: boolean;
   volume: number;
@@ -253,6 +257,7 @@ function PlayerBottomBar(
           <PlaybackRateMenu {...props} />
           <AspectRatioMenu {...props} />
           <VideoEnhancementMenu {...props} />
+          <FrameInterpolationMenu {...props} />
           {props.mode && props.onChangeMode && <PlaybackModeMenu {...props} mode={props.mode} onChangeMode={props.onChangeMode} />}
           {props.pictureInPictureAvailable !== false && (
             <PlayerIconButton aria-pressed={props.pictureInPicture} label="画中画" onClick={props.onTogglePictureInPicture}>
@@ -431,6 +436,28 @@ function VideoEnhancementMenu(props: PlayerChromeProps) {
   );
 }
 
+/** 仅在实际模型运行时声明可用时提供补帧入口。 */
+function FrameInterpolationMenu(props: PlayerChromeProps) {
+  if (!props.frameInterpolationAvailable || !props.onChangeFrameInterpolation) return null;
+  return (
+    <DropdownMenu>
+      <DropdownMenuTrigger asChild>
+        <Button aria-label="实时补帧" size="icon" variant="media"><Sparkles /></Button>
+      </DropdownMenuTrigger>
+      <DropdownMenuContent align="end">
+        <DropdownMenuLabel>实时补帧</DropdownMenuLabel>
+        <DropdownMenuRadioGroup
+          onValueChange={(value) => props.onChangeFrameInterpolation?.(value as PlayerFrameInterpolation)}
+          value={props.frameInterpolation ?? "off"}
+        >
+          <DropdownMenuRadioItem value="off">关闭</DropdownMenuRadioItem>
+          <DropdownMenuRadioItem value="rife-realtime">RIFE 实时</DropdownMenuRadioItem>
+        </DropdownMenuRadioGroup>
+      </DropdownMenuContent>
+    </DropdownMenu>
+  );
+}
+
 /** 提供原文件与实时转码模式切换。 */
 function PlaybackModeMenu(
   props: PlayerChromeProps & {
@@ -521,6 +548,21 @@ function PlayerSettingsSheet(
               {props.videoEnhancementDegraded && (
                 <p className="text-xs text-muted-foreground">已根据实时渲染性能自动降低档位</p>
               )}
+            </div>
+          )}
+          {props.frameInterpolationAvailable && props.onChangeFrameInterpolation && (
+            <div className="flex flex-col gap-2">
+              <h3 className="text-sm font-medium">实时补帧</h3>
+              <ToggleGroup
+                className="justify-start"
+                onValueChange={(value) => value && props.onChangeFrameInterpolation?.(value as PlayerFrameInterpolation)}
+                type="single"
+                value={props.frameInterpolation ?? "off"}
+                variant="outline"
+              >
+                <ToggleGroupItem value="off">关闭</ToggleGroupItem>
+                <ToggleGroupItem value="rife-realtime">RIFE 实时</ToggleGroupItem>
+              </ToggleGroup>
             </div>
           )}
           <div className="flex flex-col gap-2">

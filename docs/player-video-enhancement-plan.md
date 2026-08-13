@@ -1,5 +1,7 @@
 # PC 内置播放器与画质增强执行计划
 
+> 当前实现边界（2026-08-13）：桌面 Windows/Linux 已接入 libmpv、gpu-next、硬解路径、Anime4K Shader、字幕后合成、掉帧自动降级和 libVLC 回退。模型超分、RIFE 插帧、HDR 输出和远程增强编码尚未启用；契约已预留能力字段，但没有模型运行时和权重时不得宣称可用。
+
 ## 目标架构
 
 首版播放链路：
@@ -76,6 +78,40 @@
 验收：Windows 安装包在未安装 mpv/IINA/VLC 的干净系统启动；Linux DEB/RPM 由包管理器补齐 libmpv，AppImage 在宿主缺少 libmpv 时回退 libVLC；回退路径至少保留一个稳定版。
 
 ## 最终阶段
+
+### 终版落地顺序
+
+1. **能力与诊断契约**：统一声明 GPU 厂商、渲染器、解码器、模型后端、掉帧数、帧耗时和降级原因；旧快照字段必须可默认解码。
+2. **GPU 零重编码链**：Windows 使用 D3D11/D3D11VA，Linux 使用 Vulkan/VA-API；Anime4K 在字幕/OSD 之前运行，禁止 CPU 视频重编码。
+3. **模型超分适配器**：以独立 `ModelEnhancer` 端口接入 Real-CUGAN/Real-ESRGAN 类模型；加载前校验模型摘要、显存预算和目标分辨率，失败只回退 Shader/原画。
+4. **模型插帧适配器**：以独立 `FrameInterpolator` 端口接入 RIFE；使用有界双帧队列，模型延迟超过帧预算或连续掉帧时自动关闭，字幕不得进入模型输入。
+5. **HDR 能力**：同时满足源视频色彩元数据、渲染器和显示器能力后才开启；不满足条件时保持 SDR，不用滤镜伪装 HDR。
+6. **远程增强输出**：增强帧进入独立编码器端口，按 NVENC/AMF/QSV/libx264 探测结果选择；字幕默认软传递，只有终端不支持时才烧录。
+7. **双版本稳定期**：至少两个版本完成 Windows NVIDIA/AMD/Intel、macOS Apple Silicon/Intel、Linux AMD/Intel/NVIDIA 的基础播放与 Shader 矩阵后，才评估移除桌面 libVLC。
+
+### 终版能力开关规则
+
+- `supportsModelEnhancement`、`supportsFrameInterpolation` 和 `supportsHdr` 只有在真实后端初始化、资源校验和实时预算检查全部通过后才能为 `true`。
+- UI 只根据能力字段显示入口；命令在后端再次校验，避免伪造客户端绕过能力门禁。
+- 模型与 Shader 不得无条件叠加：总帧预算、显存预算或掉帧阈值任一超限，按“插帧 -> 模型超分 -> Shader”顺序降级。
+
+### 终版验收指标
+
+| 场景 | 必须满足 |
+| --- | --- |
+| 基础播放 | 1080p H.264/H.265 10-bit 连续 30 分钟无崩溃，首帧 P95 <= 2 秒 |
+| Shader | 切换预设不中断；字幕边缘不被锐化；CPU 不出现视频重编码进程 |
+| 模型超分 | 模型摘要校验通过；显存不足自动关闭；P95 帧耗时不超过目标帧间隔 |
+| 插帧 | 双帧队列有界；连续掉帧 3 个采样周期内关闭；关闭后恢复原始时间轴 |
+| HDR | 仅在源、渲染器、显示器三者能力齐全时开启；SDR 不被错误提升 |
+| 远程 | 编码器降级可观测；断线可恢复；软字幕与烧录字幕路径可区分 |
+
+### 当前未完成项
+
+- RIFE/Real-CUGAN/Real-ESRGAN 模型运行时、权重管理和 GPU 推理后端。
+- libmpv render API + Metal 的 macOS 原生输出。
+- HDR 元数据探测、显示器能力探测和远程硬件编码管线。
+- Windows NVIDIA/AMD/Intel、macOS、Linux 真机矩阵与两个版本稳定期。
 
 ### F1：能力调度层
 

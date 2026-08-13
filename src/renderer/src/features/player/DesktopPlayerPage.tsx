@@ -20,6 +20,7 @@ import {
   type PlayerAspectRatio,
   type PlayerCapabilities,
   type PlayerCommand,
+  type PlayerFrameInterpolation,
   type PlayerSnapshot,
   type PlayerSubtitleScale,
   type PlayerVideoEnhancement
@@ -459,6 +460,13 @@ function DesktopVlcControls({
       console.info("[player] 桌面画质增强预设已保存", { videoEnhancement: value });
     });
   };
+  const changeFrameInterpolation = (value: PlayerFrameInterpolation): void => {
+    const command = createCommand<Extract<PlayerCommand, { type: "set-frame-interpolation" }>>({
+      type: "set-frame-interpolation",
+      frameInterpolation: value
+    });
+    if (command) void dispatchCommand(command);
+  };
   const toggleFullscreen = (): void => {
     const command = createCommand<Extract<PlayerCommand, { type: "set-fullscreen" }>>({
       type: "set-fullscreen",
@@ -510,6 +518,10 @@ function DesktopVlcControls({
   };
   const statusBadges = [
     snapshot?.backend === "mpv" ? "libmpv" : "libVLC",
+    snapshot?.enhancementDiagnostics.pipeline !== "none"
+      ? snapshot?.enhancementDiagnostics.pipeline
+      : undefined,
+    snapshot?.enhancementDiagnostics.degradationReason ? "增强已降级" : undefined,
     session ? "原文件直放" : undefined,
     snapshot ? `${snapshot.subtitleTracks.length} 条字幕` : undefined,
     activeItem?.task.resolution?.toUpperCase()
@@ -572,6 +584,7 @@ function DesktopVlcControls({
           onChangeSubtitle={changeSubtitle}
           onChangeSubtitleScale={changeSubtitleScale}
           onChangeVideoEnhancement={changeVideoEnhancement}
+          onChangeFrameInterpolation={changeFrameInterpolation}
           onClose={() => closeAfterFlush(onClose)}
           onGoNext={() => nextItem && selectItemAfterFlush(nextItem)}
           onGoPrevious={() => previousItem && selectItemAfterFlush(previousItem)}
@@ -595,6 +608,8 @@ function DesktopVlcControls({
           videoEnhancement={snapshot?.videoEnhancement ?? videoEnhancement}
           videoEnhancementAvailable={capabilities?.supportsVideoEnhancement ?? false}
           videoEnhancementDegraded={snapshot?.videoEnhancementDegraded ?? false}
+          frameInterpolation={snapshot?.frameInterpolation ?? "off"}
+          frameInterpolationAvailable={capabilities?.supportsFrameInterpolation ?? false}
           subtitles={subtitleOptions}
           visible={toolbarVisible}
           volume={snapshot?.volume ?? 0.7}

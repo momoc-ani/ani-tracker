@@ -4,9 +4,9 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use ani_contracts::{
     PlayerAspectRatio, PlayerAvailability, PlayerBackend, PlayerCapabilities, PlayerCommand,
-    PlayerCommandAction, PlayerCommandResult, PlayerError, PlayerErrorCode, PlayerHostPlatform,
-    PlayerMediaSource, PlayerRecoveryAction, PlayerSnapshot, PlayerStatus, PlayerTrack,
-    PlayerTrackKind, PlayerVideoEnhancement,
+    PlayerCommandAction, PlayerCommandResult, PlayerError, PlayerErrorCode,
+    PlayerFrameInterpolation, PlayerHostPlatform, PlayerMediaSource, PlayerRecoveryAction,
+    PlayerSnapshot, PlayerStatus, PlayerTrack, PlayerTrackKind, PlayerVideoEnhancement,
 };
 use ani_media::player::{unsupported, PlayerTransport, PlayerTransportError};
 use async_trait::async_trait;
@@ -158,6 +158,7 @@ struct MpvRuntimeState {
     snapshot: Option<PlayerSnapshot>,
     subtitle_scale: u16,
     enhancement: PlayerVideoEnhancement,
+    frame_interpolation: PlayerFrameInterpolation,
     enhancement_degraded: bool,
     last_dropped_frames: u64,
     drop_score: u32,
@@ -233,6 +234,7 @@ impl MpvRuntime {
                 snapshot: None,
                 subtitle_scale: 100,
                 enhancement: PlayerVideoEnhancement::Off,
+                frame_interpolation: PlayerFrameInterpolation::Off,
                 enhancement_degraded: false,
                 last_dropped_frames: 0,
                 drop_score: 0,
@@ -282,6 +284,14 @@ impl MpvRuntime {
             }
             PlayerCommandAction::PreviousItem | PlayerCommandAction::NextItem => {
                 return Ok(unsupported(&command_id, "播放列表切换由页面会话管理"));
+            }
+            PlayerCommandAction::SetFrameInterpolation {
+                frame_interpolation,
+            } if *frame_interpolation != PlayerFrameInterpolation::Off => {
+                return Ok(unsupported(
+                    &command_id,
+                    "当前桌面版本尚未加载 RIFE 模型运行时，无法启用实时补帧",
+                ));
             }
             _ => self.dispatch_media_command(&command)?,
         }
@@ -344,12 +354,23 @@ impl MpvRuntime {
                 if let Some(snapshot) = state.snapshot.as_mut() {
                     snapshot.video_enhancement = *video_enhancement;
                     snapshot.video_enhancement_degraded = false;
+                    snapshot.enhancement_diagnostics.degradation_reason = None;
+                    snapshot.enhancement_diagnostics.pipeline =
+                        enhancement_pipeline(&self.capabilities, *video_enhancement);
                 }
                 log::info!(
                     "Tauri 桌面 libmpv 画质增强已更新 preset={:?} session_id={}",
                     video_enhancement,
                     command.session_id
                 );
+            }
+            PlayerCommandAction::SetFrameInterpolation {
+                frame_interpolation,
+            } => {
+                state.frame_interpolation = *frame_interpolation;
+                if let Some(snapshot) = state.snapshot.as_mut() {
+                    snapshot.frame_interpolation = *frame_interpolation;
+                }
             }
             PlayerCommandAction::SetAspectRatio {
                 aspect_ratio,
@@ -425,6 +446,7 @@ impl MpvRuntime {
             state.sequence,
             state.subtitle_scale,
             state.enhancement,
+            state.frame_interpolation,
         ));
         log::info!("Tauri 桌面 libmpv 已加载媒体 session_id={session_id}");
         Ok(())
@@ -524,6 +546,9 @@ impl MpvRuntime {
         snapshot.playback_rate = self.property_f64("speed").unwrap_or(1.0);
         snapshot.audio_tracks = self.read_tracks(PlayerTrackKind::Audio);
         snapshot.subtitle_tracks = self.read_tracks(PlayerTrackKind::Subtitle);
+        snapshot.enhancement_diagnostics.dropped_frames = self
+            .property_u64("frame-drop-count")
+            .unwrap_or(snapshot.enhancement_diagnostics.dropped_frames);
         self.maybe_degrade_enhancement(state, &mut snapshot)?;
         state.sequence = state.sequence.saturating_add(1);
         snapshot.sequence = state.sequence;
@@ -597,6 +622,8 @@ impl MpvRuntime {
         state.drop_score = 0;
         snapshot.video_enhancement = next;
         snapshot.video_enhancement_degraded = true;
+        snapshot.enhancement_diagnostics.pipeline = enhancement_pipeline(&self.capabilities, next);
+        snapshot.enhancement_diagnostics.degradation_reason = Some("持续掉帧".to_owned());
         Ok(())
     }
 
@@ -1063,6 +1090,8 @@ fn mpv_capabilities(shaders_available: bool) -> PlayerCapabilities {
         supports_subtitle_tracks: true,
         supports_subtitle_scale: true,
         supports_video_enhancement: shaders_available,
+        supports_frame_interpolation: false,
+        supports_model_enhancement: false,
         supports_aspect_ratio: true,
         supports_fullscreen: true,
         supports_picture_in_picture: false,
@@ -1104,7 +1133,9 @@ fn initial_snapshot(
     sequence: u64,
     subtitle_scale: u16,
     video_enhancement: PlayerVideoEnhancement,
+    frame_interpolation: PlayerFrameInterpolation,
 ) -> PlayerSnapshot {
+    let pipeline = enhancement_pipeline(&capabilities, video_enhancement);
     PlayerSnapshot {
         session_id: session_id.to_owned(),
         sequence,
@@ -1128,10 +1159,30 @@ fn initial_snapshot(
         subtitle_scale,
         video_enhancement,
         video_enhancement_degraded: false,
+        frame_interpolation,
+        enhancement_diagnostics: ani_contracts::PlayerEnhancementDiagnostics {
+            pipeline,
+            renderer: Some("gpu-next".to_owned()),
+            decoder: Some("hardware-auto".to_owned()),
+            dropped_frames: 0,
+            ..Default::default()
+        },
         aspect_ratio: PlayerAspectRatio::Default,
         fullscreen: false,
         picture_in_picture: false,
         error: None,
+    }
+}
+
+/// 返回当前实际生效的桌面增强链路名称。
+fn enhancement_pipeline(
+    capabilities: &PlayerCapabilities,
+    enhancement: PlayerVideoEnhancement,
+) -> String {
+    if capabilities.supports_video_enhancement && enhancement != PlayerVideoEnhancement::Off {
+        "libmpv-gpu-next-anime4k".to_owned()
+    } else {
+        "libmpv-gpu-next".to_owned()
     }
 }
 
