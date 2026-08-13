@@ -29,7 +29,11 @@ test("Real-ESRGAN manifest binds 2x enhancement executable and model digests", a
   for (const file of REALESRGAN_SIDECAR_SOURCE.files) {
     await writeFile(join(modelRoot, file.name), file.name);
   }
-  const manifest = await createBundleManifest(root, executableName, "test-x64");
+  const manifest = await createBundleManifest(root, executableName);
+  assert.deepEqual(
+    Object.keys(manifest).sort(),
+    ["executable", "executableSha256", "files", "model", "protocolVersion", "schemaVersion"]
+  );
   assert.equal(manifest.protocolVersion, 1);
   assert.equal(manifest.model.backend, "ncnn-vulkan");
   assert.equal(manifest.model.operation, "enhance");
@@ -43,6 +47,10 @@ test("Real-ESRGAN manifest binds 2x enhancement executable and model digests", a
 
 test("Real-ESRGAN source and official model archive are immutable", () => {
   assert.match(REALESRGAN_SIDECAR_SOURCE.commit, /^[a-f0-9]{40}$/);
+  assert.deepEqual(Object.keys(REALESRGAN_SIDECAR_SOURCE.submodules).sort(), ["glslang", "libwebp", "ncnn"]);
+  for (const commit of Object.values(REALESRGAN_SIDECAR_SOURCE.submodules)) {
+    assert.match(commit, /^[0-9a-f]{40}$/);
+  }
   assert.equal(REALESRGAN_SIDECAR_SOURCE.modelArchive.release, "v0.2.5.0");
   assert.equal(REALESRGAN_SIDECAR_SOURCE.modelArchive.sha256.length, 64);
   assert.deepEqual(

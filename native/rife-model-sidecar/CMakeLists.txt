@@ -28,6 +28,11 @@ target_include_directories(ani-rife-model-sidecar PRIVATE
   "${CMAKE_CURRENT_BINARY_DIR}/rife-upstream/ncnn/src"
 )
 target_link_libraries(ani-rife-model-sidecar PRIVATE ncnn webp Threads::Threads ${Vulkan_LIBRARY})
+if(MSVC)
+  set_source_files_properties(src/main.cpp PROPERTIES COMPILE_OPTIONS "/EHsc")
+else()
+  set_source_files_properties(src/main.cpp PROPERTIES COMPILE_OPTIONS "-fexceptions")
+endif()
 
 if(USE_STATIC_MOLTENVK)
   foreach(framework CoreFoundation Foundation Metal QuartzCore CoreGraphics Cocoa IOKit IOSurface)

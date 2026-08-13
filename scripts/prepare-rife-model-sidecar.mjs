@@ -9,7 +9,12 @@ import { spawnSync } from "node:child_process";
 
 export const RIFE_SIDECAR_SOURCE = Object.freeze({
   repository: "https://github.com/nihui/rife-ncnn-vulkan.git",
-  commit: "a7532fc3f9f008cd6eecd6f2ffe2a9698e0cf7",
+  commit: "a7532fc3f9f8f008cd6eecd6f2ffe2a9698e0cf7",
+  submodules: Object.freeze({
+    ncnn: "b4ba207c18d3103d6df890c0e3a97b469b196b26",
+    libwebp: "5abb55823bb6196a918dd87202b2f32bbaff4c18",
+    glslang: "86ff4bca1ddc7e2262f119c16e7228d0efb67610"
+  }),
   modelId: "rife-v4.6",
   backend: "ncnn-vulkan",
   files: Object.freeze([
@@ -65,13 +70,14 @@ async function main(args) {
   }
   await cp(join(sourceDirectory, "LICENSE"), join(licenseDirectory, "rife-ncnn-vulkan-MIT.txt"));
 
-  const manifest = await createBundleManifest(targetDirectory, executableName, targetKey);
+  const manifest = await createBundleManifest(targetDirectory, executableName);
   await writeFile(join(targetDirectory, "manifest.json"), `${JSON.stringify(manifest, null, 2)}\n`, "utf8");
   await writeFile(
     join(targetDirectory, "SOURCE.json"),
     `${JSON.stringify({
       repository: RIFE_SIDECAR_SOURCE.repository,
       commit: RIFE_SIDECAR_SOURCE.commit,
+      submodules: RIFE_SIDECAR_SOURCE.submodules,
       modelId: RIFE_SIDECAR_SOURCE.modelId,
       backend: RIFE_SIDECAR_SOURCE.backend,
       target: targetKey,
@@ -83,7 +89,7 @@ async function main(args) {
   console.log(`[rife-sidecar] bundle ready: ${targetDirectory}`);
 }
 
-export async function createBundleManifest(targetDirectory, executableName, targetKey) {
+export async function createBundleManifest(targetDirectory, executableName) {
   const files = [];
   for (const file of RIFE_SIDECAR_SOURCE.files) {
     const relativePath = `models/${RIFE_SIDECAR_SOURCE.modelId}/${file.name}`;
@@ -93,7 +99,6 @@ export async function createBundleManifest(targetDirectory, executableName, targ
   return {
     schemaVersion: 1,
     protocolVersion: 1,
-    target: targetKey,
     executable: executableName,
     executableSha256: await sha256(join(targetDirectory, executableName)),
     model: {
@@ -137,16 +142,54 @@ export async function verifyBundle(targetDirectory) {
 
 async function ensureSource(directory, offline) {
   if (await isDirectory(join(directory, ".git"))) {
-    const commit = run("git", ["rev-parse", "HEAD"], { cwd: directory, capture: true }).trim();
-    if (commit === RIFE_SIDECAR_SOURCE.commit) return;
-    if (offline) throw new Error(`[rife-sidecar] cached source commit mismatch: ${commit}`);
+    const commit = readGitHead(directory) ?? await readPinnedCommit(directory);
+    const complete = await Promise.all([
+      isFile(join(directory, "src", "rife.cpp")),
+      isFile(join(directory, "src", "ncnn", "CMakeLists.txt")),
+      isFile(join(directory, "src", "libwebp", "CMakeLists.txt")),
+      isFile(join(directory, "src", "ncnn", "glslang", "CMakeLists.txt")),
+      pinnedSubmoduleMatches(join(directory, "src", "ncnn"), RIFE_SIDECAR_SOURCE.submodules.ncnn),
+      pinnedSubmoduleMatches(join(directory, "src", "libwebp"), RIFE_SIDECAR_SOURCE.submodules.libwebp),
+      pinnedSubmoduleMatches(join(directory, "src", "ncnn", "glslang"), RIFE_SIDECAR_SOURCE.submodules.glslang)
+    ]);
+    if (commit === RIFE_SIDECAR_SOURCE.commit && complete.every(Boolean)) return;
+    if (offline) throw new Error(`[rife-sidecar] cached source is incomplete or commit mismatched: ${commit ?? "missing"}`);
   }
   if (offline) throw new Error(`[rife-sidecar] offline source missing: ${directory}`);
   await rm(directory, { recursive: true, force: true });
   await mkdir(resolve(directory, ".."), { recursive: true });
-  run("git", ["clone", "--filter=blob:none", "--no-checkout", RIFE_SIDECAR_SOURCE.repository, directory]);
-  run("git", ["checkout", "--detach", RIFE_SIDECAR_SOURCE.commit], { cwd: directory });
+  run("git", ["init", directory]);
+  run("git", ["remote", "add", "origin", RIFE_SIDECAR_SOURCE.repository], { cwd: directory });
+  run("git", ["sparse-checkout", "init", "--cone"], { cwd: directory });
+  run("git", ["sparse-checkout", "set", "src"], { cwd: directory });
+  run("git", ["fetch", "--depth", "1", "--filter=blob:none", "origin", RIFE_SIDECAR_SOURCE.commit], { cwd: directory });
+  run("git", ["switch", "--detach", "FETCH_HEAD"], { cwd: directory });
   run("git", ["submodule", "update", "--init", "--recursive", "--depth", "1"], { cwd: directory });
+  await writeFile(join(directory, ".ani-source-commit"), `${RIFE_SIDECAR_SOURCE.commit}\n`, "utf8");
+  await writeFile(join(directory, "src", "ncnn", ".ani-submodule-commit"), `${RIFE_SIDECAR_SOURCE.submodules.ncnn}\n`, "utf8");
+  await writeFile(join(directory, "src", "libwebp", ".ani-submodule-commit"), `${RIFE_SIDECAR_SOURCE.submodules.libwebp}\n`, "utf8");
+  await writeFile(join(directory, "src", "ncnn", "glslang", ".ani-submodule-commit"), `${RIFE_SIDECAR_SOURCE.submodules.glslang}\n`, "utf8");
+}
+
+async function readPinnedCommit(directory) {
+  try { return (await readFile(join(directory, ".ani-source-commit"), "utf8")).trim(); } catch { return undefined; }
+}
+
+function readGitHead(directory) {
+  try { return run("git", ["rev-parse", "HEAD"], { cwd: directory, capture: true }).trim(); } catch { return undefined; }
+}
+
+async function pinnedSubmoduleMatches(directory, expected) {
+  try {
+    const marker = (await readFile(join(directory, ".ani-submodule-commit"), "utf8")).trim();
+    const topLevel = resolve(run("git", ["rev-parse", "--show-toplevel"], { cwd: directory, capture: true }).trim());
+    if (topLevel !== resolve(directory)) return marker === expected;
+    return readGitHead(directory) === expected;
+  } catch {
+    try {
+      return readGitHead(directory) === expected;
+    } catch { return false; }
+  }
 }
 
 async function ensureModelFiles(directory, offline) {
@@ -166,7 +209,8 @@ async function configureAndBuild(sourceDirectory, buildDirectory, options) {
     "-S", resolve("native/rife-model-sidecar"),
     "-B", buildDirectory,
     `-DRIFE_SOURCE_DIR=${sourceDirectory}`,
-    "-DCMAKE_BUILD_TYPE=Release"
+    "-DCMAKE_BUILD_TYPE=Release",
+    "-DCMAKE_POLICY_VERSION_MINIMUM=3.5"
   ];
   if (options.platform === "darwin") {
     const moltenVk = await resolveMacosMoltenVk();
@@ -188,6 +232,7 @@ async function resolveMacosMoltenVk() {
   const includeCandidates = [join(sdk, "include"), join(sdk, "MoltenVK", "include")];
   const libraryCandidates = [
     join(sdk, "MoltenVK", "MoltenVK.xcframework", "macos-arm64_x86_64", "libMoltenVK.a"),
+    join(sdk, "lib", "MoltenVK.xcframework", "macos-arm64_x86_64", "libMoltenVK.a"),
     join(sdk, "lib", "libMoltenVK.a")
   ];
   const includeDirectory = await firstDirectory(includeCandidates);

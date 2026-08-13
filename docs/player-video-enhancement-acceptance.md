@@ -26,8 +26,8 @@ cargo clippy --workspace --all-targets -- -D warnings
 
 | 模型 | 上游提交 | 后端/操作 | 资源摘要 |
 | --- | --- | --- | --- |
-| RIFE `rife-v4.6` | `a7532fc3f9f008cd6eecd6f2ffe2a9698e0cf7` | `ncnn-vulkan` / 插帧 / 1x | 以 `scripts/prepare-rife-model-sidecar.mjs` 清单为准 |
-| Real-ESRGAN `realesr-animevideov3-x2` | `37026f49824c5cf84062e7c6a5dd71445dcf610f` | `ncnn-vulkan` / 单帧增强 / 2x | `.bin` `548a36f9c3f4ab8da56cd3b13badf23968bee207b396dad14d04b830e5f2ab2d`；`.param` `b88ff4f00ebf019a7fdac17fdd45a7fd3665d37509efc5baf2e4da2e24420a04` |
+| RIFE `rife-v4.6` | `a7532fc3f9f8f008cd6eecd6f2ffe2a9698e0cf7` | `ncnn-vulkan` / 插帧 / 1x | NCNN `b4ba207c18d3103d6df890c0e3a97b469b196b26`；libwebp `5abb55823bb6196a918dd87202b2f32bbaff4c18`；glslang `86ff4bca1ddc7e2262f119c16e7228d0efb67610`；权重以脚本清单为准 |
+| Real-ESRGAN `realesr-animevideov3-x2` | `37026f49824c5cf84062e7c6a5dd71445dcf610f` | `ncnn-vulkan` / 单帧增强 / 2x | NCNN `6125c9f47cd14b589de0521350668cf9d3d37e3c`；libwebp `8ea81561d2fdd382da60f57958741a7c23a18eb6`；glslang `4afd69177258d0636f78d2c4efb823ab6382a187`；`.bin` `548a36f9c3f4ab8da56cd3b13badf23968bee207b396dad14d04b830e5f2ab2d`；`.param` `b88ff4f00ebf019a7fdac17fdd45a7fd3665d37509efc5baf2e4da2e24420a04` |
 
 Real-ESRGAN 模型归档固定为 `v0.2.5.0/realesrgan-ncnn-vulkan-20220424-windows.zip`，大小 `45474481`，SHA-256 `abc02804e17982a3be33675e4d471e91ea374e65b70167abc09e31acb412802d`。
 
@@ -40,6 +40,15 @@ Real-ESRGAN 模型归档固定为 `v0.2.5.0/realesrgan-ncnn-vulkan-20220424-wind
 - Real-ESRGAN 运行中失败后，使用最近邻 2x 保持编码器固定输入尺寸，同时实际增强状态变为关闭。
 
 结果记录：模型版本、权重摘要、后端版本、GPU/驱动、输入分辨率、目标帧率、显存峰值、P50/P95 帧耗时、累计丢帧和实际降级原因。
+
+### macOS 本机 Vulkan 证据（2026-08-14）
+
+测试主机为 macOS `26.4.1`、Intel `x86_64`、AMD Radeon RX 6750 XT，LunarG Vulkan SDK `1.3.296.0`，Vulkan 通过 MoltenVK/Metal。
+
+- Real-ESRGAN `realesr-animevideov3-x2`：真实握手和 warmup 通过，最新实测 `24.46 ms`，满足 `33 ms` 单帧预算。
+- RIFE `rife-v4.6`：真实握手和 warmup 通过，`118.57 ms`，未满足 `16 ms` 实时预算；不能标记为实时插帧通过。
+- 上述结果只证明 Vulkan sidecar、模型加载、协议和单次推理链路，不代表 30 分钟播放、HDR、字幕、远程编码或 Windows/Linux 真机矩阵已完成。
+- RIFE 旧缓存曾使用错误 libwebp 提交；脚本现已固定并校验 NCNN、libwebp、glslang 提交，需网络恢复后重新构建并复测 RIFE 才能替换旧证据。
 
 ## 3. 桌面 GPU 矩阵
 

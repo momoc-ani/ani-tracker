@@ -40,6 +40,28 @@ async fn launches_validated_single_frame_enhancer() {
     runtime.shutdown().await;
 }
 
+#[tokio::test]
+#[ignore = "requires ANI_MODEL_SIDECAR_BUNDLE and a working Vulkan GPU"]
+async fn launches_real_vulkan_model_bundle() {
+    let root = std::env::var_os("ANI_MODEL_SIDECAR_BUNDLE")
+        .map(std::path::PathBuf::from)
+        .expect("ANI_MODEL_SIDECAR_BUNDLE must point to a prepared model bundle");
+    let mut config = ModelSidecarConfig::new(root, 16 * 1024 * 1024 * 1024, 120_000.0);
+    config.startup_timeout = Duration::from_secs(120);
+    let runtime = ModelSidecarRuntime::launch(config)
+        .await
+        .expect("launch real Vulkan model sidecar");
+    let diagnostics = runtime.diagnostics().await;
+    assert_eq!(diagnostics.backend, "ncnn-vulkan");
+    assert!(!diagnostics.gpu_device.trim().is_empty());
+    assert!(diagnostics.warmup_frame_time_ms.is_finite());
+    eprintln!(
+        "model={} gpu={} warmup_ms={:.2}",
+        diagnostics.model_id, diagnostics.gpu_device, diagnostics.warmup_frame_time_ms
+    );
+    runtime.shutdown().await;
+}
+
 async fn launch_fixture(operation: &str) -> ModelSidecarRuntime {
     let directory = tempfile::tempdir().expect("temporary model bundle");
     let executable_source = Path::new(env!("CARGO_BIN_EXE_ani-model-sidecar-fixture"));

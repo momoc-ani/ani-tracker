@@ -19,6 +19,14 @@ test("RIFE sidecar target parser covers all desktop GPU families", () => {
   assert.throws(() => parseArgs(["--platform", "linux", "--arch", "arm64"]), /unsupported target/);
 });
 
+test("RIFE source and native submodules are pinned to complete Git commits", () => {
+  assert.match(RIFE_SIDECAR_SOURCE.commit, /^[0-9a-f]{40}$/);
+  assert.deepEqual(Object.keys(RIFE_SIDECAR_SOURCE.submodules).sort(), ["glslang", "libwebp", "ncnn"]);
+  for (const commit of Object.values(RIFE_SIDECAR_SOURCE.submodules)) {
+    assert.match(commit, /^[0-9a-f]{40}$/);
+  }
+});
+
 test("RIFE sidecar manifest binds executable and every model file digest", async () => {
   const root = await mkdtemp(join(tmpdir(), "ani-rife-manifest-"));
   const executableName = process.platform === "win32" ? "sidecar.exe" : "sidecar";
@@ -27,7 +35,11 @@ test("RIFE sidecar manifest binds executable and every model file digest", async
   const modelRoot = join(root, "models", RIFE_SIDECAR_SOURCE.modelId);
   await mkdir(modelRoot, { recursive: true });
   for (const file of RIFE_SIDECAR_SOURCE.files) await writeFile(join(modelRoot, file.name), file.name);
-  const manifest = await createBundleManifest(root, executableName, "test-x64");
+  const manifest = await createBundleManifest(root, executableName);
+  assert.deepEqual(
+    Object.keys(manifest).sort(),
+    ["executable", "executableSha256", "files", "model", "protocolVersion", "schemaVersion"]
+  );
   assert.equal(manifest.protocolVersion, 1);
   assert.equal(manifest.model.backend, "ncnn-vulkan");
   assert.equal(manifest.model.operation, "interpolate");

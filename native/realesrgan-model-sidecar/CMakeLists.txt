@@ -4,6 +4,8 @@ project(ani-realesrgan-model-sidecar LANGUAGES C CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+find_package(Threads REQUIRED)
+
 set(REALESRGAN_SOURCE_DIR "" CACHE PATH "Pinned Real-ESRGAN-ncnn-vulkan checkout")
 if(NOT EXISTS "${REALESRGAN_SOURCE_DIR}/src/realesrgan.cpp")
   message(FATAL_ERROR "REALESRGAN_SOURCE_DIR must point to a complete Real-ESRGAN-ncnn-vulkan checkout")
@@ -29,6 +31,11 @@ target_link_libraries(ani-realesrgan-model-sidecar PRIVATE
   Threads::Threads
   ${Vulkan_LIBRARY}
 )
+if(MSVC)
+  set_source_files_properties(src/main.cpp PROPERTIES COMPILE_OPTIONS "/EHsc")
+else()
+  set_source_files_properties(src/main.cpp PROPERTIES COMPILE_OPTIONS "-fexceptions")
+endif()
 set_target_properties(ani-realesrgan-model-sidecar PROPERTIES CXX_EXTENSIONS OFF)
 
 if(OPENMP_FOUND)

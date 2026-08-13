@@ -1,6 +1,6 @@
 # PC 内置播放器与画质增强执行计划
 
-> 当前实现边界（2026-08-13）：桌面 Windows/Linux 已接入 libmpv、gpu-next、硬解路径、Anime4K Shader、字幕后合成、掉帧自动降级和 libVLC 回退。远程 HLS 已按 NVENC/AMF/QSV/libx264 探测普通转码编码器；模型链已接入 RIFE 插帧和 Real-ESRGAN 2x 动画超分，采用 `FFmpeg RGB24 解码 -> 可选 RIFE -> 可选 Real-ESRGAN -> FFmpeg 编码`，并通过受认证会话诊断报告实际模型与降级原因。模型能力只有在资源摘要、显存/帧预算、真实 Vulkan 握手和 warmup 全部通过后才启用。本机没有 `VULKAN_SDK`，因此当前代码门禁不代表本机或跨平台真实 GPU warmup 已通过；本地 libmpv 模型链、HDR 原生输出和跨 GPU 真机证据也仍未完成。
+> 当前实现边界（2026-08-14）：桌面 Windows/Linux 已接入 libmpv、gpu-next、硬解路径、Anime4K Shader、字幕后合成、掉帧自动降级和 libVLC 回退。远程 HLS 已按 NVENC/AMF/QSV/libx264 探测普通转码编码器；模型链已接入 RIFE 插帧和 Real-ESRGAN 2x 动画超分，采用 `FFmpeg RGB24 解码 -> 可选 RIFE -> 可选 Real-ESRGAN -> FFmpeg 编码`，并通过受认证会话诊断报告实际模型与降级原因。macOS Intel + AMD RX 6750 XT + MoltenVK 已完成真实 sidecar 握手：Real-ESRGAN 最新 warmup `24.46 ms` 达到 `33 ms` 预算，RIFE warmup `118.57 ms` 未达到 `16 ms` 预算。模型能力只有在资源摘要、显存/帧预算、真实 Vulkan 握手和 warmup 全部通过后才启用；本地 libmpv 模型链、HDR 原生输出和跨 GPU 真机证据仍未完成。
 
 正式模型包、HDR、远程输出和真实 GPU 的逐项执行与证据要求见 [播放器终版发布验收清单](./player-video-enhancement-acceptance.md)。
 
@@ -117,7 +117,7 @@
 ### 当前未完成项
 
 - 本地 libmpv 的模型超分/插帧渲染链；当前模型仅用于远程 HLS。
-- 本机及 Windows/macOS/Linux Release Runner 的真实 RIFE、Real-ESRGAN Vulkan 构建、握手、warmup 和帧耗时证据。
+- Windows/Linux Release Runner 的真实 RIFE、Real-ESRGAN Vulkan 构建、握手、warmup 和帧耗时证据；macOS RIFE 需用正确固定 libwebp 提交重建后复测。
 - 模型 rawvideo 链的 NVENC/AMF/QSV 编码、终端字幕能力探测、自适应码率和断线恢复。
 - libmpv render API + Metal 的 macOS 原生输出。
 - HDR 源元数据、渲染器、显示器能力探测和原生输出。
@@ -130,7 +130,7 @@
 | 首版 P0-P3 | 已完成：libmpv/libVLC 单内核切换、跨厂商硬解配置、Anime4K、字幕后合成和掉帧降级 | macOS 仍使用 libVLC；各平台真机需持续回归 |
 | 首版 P4 | 已完成发布资源门禁和实机矩阵声明 | Windows/AMD/NVIDIA/Intel、macOS、Linux 实机结果待采集 |
 | 终版 F1 | 已完成能力、诊断、组合预算、权重/可执行文件摘要校验和安全降级契约 | 真实 GPU 显存值仍使用配置预算；真机数据待采集 |
-| 终版 F2 | 已完成 RIFE 与 Real-ESRGAN 端口、长驻 sidecar、内存帧协议、2x 固定尺寸回退和双倍帧率时间轴保护 | 本地播放器模型链、真实 Vulkan warmup、HDR 原生输出待完成 |
+| 终版 F2 | 已完成 RIFE 与 Real-ESRGAN 端口、长驻 sidecar、内存帧协议、2x 固定尺寸回退和双倍帧率时间轴保护；固定提交和子模块校验已接入 | macOS Real-ESRGAN Vulkan warmup 已通过；RIFE warmup 未达实时预算且需正确 libwebp 重建；本地播放器模型链、HDR 原生输出待完成 |
 | 终版 F3 | 已完成普通 HLS 编码器回退、远程 RIFE + Real-ESRGAN rawvideo 管线、独立音轨/软字幕和受认证诊断刷新 | 模型链硬件编码、终端字幕探测、断线恢复和跨厂商证据待完成 |
 | 终版 F4 | 删除条件和双版本稳定门槛已固化 | 必须经过两个正式版本，不在当前阶段删除 libVLC |
 
@@ -143,7 +143,7 @@
 ### F2：模型增强
 
 - 动画超分：首版固定 `Real-ESRGAN-ncnn-vulkan` 提交 `37026f49824c5cf84062e7c6a5dd71445dcf610f` 与 `realesr-animevideov3-x2`，输出 2x；模型来源和 SHA-256 固定在准备脚本及验收清单。
-- 插帧：固定 `rife-ncnn-vulkan` 提交 `a7532fc3f9f008cd6eecd6f2ffe2a9698e0cf7` 与 `rife-v4.6`，和超分共享显存/帧预算，组合超限时优先关闭插帧。
+- 插帧：固定 `rife-ncnn-vulkan` 提交 `a7532fc3f9f8f008cd6eecd6f2ffe2a9698e0cf7` 与 `rife-v4.6`，和超分共享显存/帧预算，组合超限时优先关闭插帧。
 - HDR：色彩空间和显示能力完整探测后再启用，不以简单滤镜冒充 HDR。
 - 模型下载、校验、版本切换和缓存独立于播放器内核。
 
