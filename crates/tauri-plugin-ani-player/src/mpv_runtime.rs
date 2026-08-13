@@ -933,10 +933,10 @@ fn system_mpv_candidates() -> Vec<PathBuf> {
             roots.push(PathBuf::from("/lib").join(multiarch));
         }
         roots.extend([PathBuf::from("/usr/lib64"), PathBuf::from("/usr/lib")]);
-        return roots
+        roots
             .into_iter()
             .flat_map(|root| [root.join("libmpv.so.2"), root.join("libmpv.so.1")])
-            .collect();
+            .collect()
     }
 }
 
