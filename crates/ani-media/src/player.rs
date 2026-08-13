@@ -17,6 +17,8 @@ pub enum PlayerTransportError {
     Unavailable(String),
     #[error("播放器原生调用失败：{0}")]
     Native(String),
+    #[error("播放器媒体加载失败：{0}")]
+    LoadFailed(String),
     #[error("播放器返回无效状态：{0}")]
     InvalidResponse(String),
 }
@@ -222,9 +224,9 @@ fn invalid_command(message: impl Into<String>) -> PlayerError {
 fn transport_error(error: PlayerTransportError) -> PlayerError {
     let (code, recoverable) = match &error {
         PlayerTransportError::Unavailable(_) => (PlayerErrorCode::RuntimeMissing, false),
-        PlayerTransportError::Native(_) | PlayerTransportError::InvalidResponse(_) => {
-            (PlayerErrorCode::Unknown, true)
-        }
+        PlayerTransportError::Native(_)
+        | PlayerTransportError::LoadFailed(_)
+        | PlayerTransportError::InvalidResponse(_) => (PlayerErrorCode::Unknown, true),
     };
     PlayerError {
         code,

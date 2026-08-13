@@ -28,8 +28,33 @@ type MpvSetPropertyString =
     unsafe extern "C" fn(*mut MpvHandle, *const c_char, *const c_char) -> c_int;
 type MpvGetPropertyString = unsafe extern "C" fn(*mut MpvHandle, *const c_char) -> *mut c_char;
 type MpvCommand = unsafe extern "C" fn(*mut MpvHandle, *const *const c_char) -> c_int;
+type MpvWaitEvent = unsafe extern "C" fn(*mut MpvHandle, f64) -> *mut MpvEvent;
 type MpvFree = unsafe extern "C" fn(*mut c_void);
 type MpvErrorString = unsafe extern "C" fn(c_int) -> *const c_char;
+
+#[repr(C)]
+struct MpvEvent {
+    event_id: c_int,
+    error: c_int,
+    reply_userdata: u64,
+    data: *mut c_void,
+}
+
+#[repr(C)]
+struct MpvEventEndFile {
+    reason: c_int,
+    error: c_int,
+}
+
+const MPV_EVENT_NONE: c_int = 0;
+const MPV_EVENT_END_FILE: c_int = 7;
+const MPV_EVENT_FILE_LOADED: c_int = 8;
+const MPV_END_FILE_REASON_ERROR: c_int = 4;
+
+enum MpvLoadEvent {
+    Loaded,
+    Failed(String),
+}
 
 /// 动态加载的稳定 libmpv client API；不向其他 crate 暴露 FFI 类型。
 struct MpvApi {
@@ -42,6 +67,7 @@ struct MpvApi {
     set_property_string: MpvSetPropertyString,
     get_property_string: MpvGetPropertyString,
     command: MpvCommand,
+    wait_event: MpvWaitEvent,
     free: MpvFree,
     error_string: MpvErrorString,
 }
@@ -59,6 +85,7 @@ impl MpvApi {
                 set_property_string: load_mpv_symbol(&library, b"mpv_set_property_string\0")?,
                 get_property_string: load_mpv_symbol(&library, b"mpv_get_property_string\0")?,
                 command: load_mpv_symbol(&library, b"mpv_command\0")?,
+                wait_event: load_mpv_symbol(&library, b"mpv_wait_event\0")?,
                 free: load_mpv_symbol(&library, b"mpv_free\0")?,
                 error_string: load_mpv_symbol(&library, b"mpv_error_string\0")?,
                 _library: library,
@@ -135,6 +162,7 @@ struct MpvRuntimeState {
     last_dropped_frames: u64,
     drop_score: u32,
     sequence: u64,
+    load_pending: bool,
     closed: bool,
 }
 
@@ -209,6 +237,7 @@ impl MpvRuntime {
                 last_dropped_frames: 0,
                 drop_score: 0,
                 sequence: 0,
+                load_pending: false,
                 closed: false,
             }),
         })
@@ -388,6 +417,7 @@ impl MpvRuntime {
         state.last_dropped_frames = 0;
         state.drop_score = 0;
         state.enhancement_degraded = false;
+        state.load_pending = true;
         state.snapshot = Some(initial_snapshot(
             session_id,
             source,
@@ -445,6 +475,20 @@ impl MpvRuntime {
         let Some(mut snapshot) = state.snapshot.clone() else {
             return Ok(());
         };
+        let load_event = self.poll_events();
+        if state.load_pending {
+            match load_event {
+                Some(MpvLoadEvent::Loaded) => state.load_pending = false,
+                Some(MpvLoadEvent::Failed(error)) => {
+                    state.load_pending = false;
+                    snapshot.status = PlayerStatus::Error;
+                    snapshot.error = Some(decoder_error(error.clone()));
+                    state.snapshot = Some(snapshot);
+                    return Err(PlayerTransportError::LoadFailed(error));
+                }
+                None => {}
+            }
+        }
         let position = self
             .property_f64("time-pos")
             .unwrap_or(snapshot.position_seconds);
@@ -455,7 +499,9 @@ impl MpvRuntime {
         let buffering = self.property_bool("paused-for-cache").unwrap_or(false);
         let idle = self.property_bool("idle-active").unwrap_or(false);
         let ended = self.property_bool("eof-reached").unwrap_or(false);
-        snapshot.status = if ended {
+        snapshot.status = if state.load_pending {
+            PlayerStatus::Loading
+        } else if ended {
             PlayerStatus::Ended
         } else if buffering {
             PlayerStatus::Buffering
@@ -483,6 +529,35 @@ impl MpvRuntime {
         snapshot.sequence = state.sequence;
         state.snapshot = Some(snapshot);
         Ok(())
+    }
+
+    /// 非阻塞消费 libmpv 事件，识别异步首帧/解码失败。
+    fn poll_events(&self) -> Option<MpvLoadEvent> {
+        let mut load_event = None;
+        loop {
+            let event = unsafe { (self.api.wait_event)(self.handle(), 0.0) };
+            if event.is_null() {
+                return load_event;
+            }
+            let event = unsafe { &*event };
+            if event.event_id == MPV_EVENT_NONE {
+                return load_event;
+            }
+            if event.event_id == MPV_EVENT_FILE_LOADED {
+                load_event = Some(MpvLoadEvent::Loaded);
+                continue;
+            }
+            if event.event_id != MPV_EVENT_END_FILE || event.data.is_null() {
+                continue;
+            }
+            let end_file = unsafe { &*(event.data as *const MpvEventEndFile) };
+            if end_file.reason == MPV_END_FILE_REASON_ERROR {
+                load_event = Some(MpvLoadEvent::Failed(format!(
+                    "libmpv 异步加载媒体失败：{}",
+                    end_file.error
+                )));
+            }
+        }
     }
 
     fn maybe_degrade_enhancement(

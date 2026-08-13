@@ -1,5 +1,5 @@
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use ani_contracts::{
@@ -64,6 +64,9 @@ impl<R: Runtime> AniPlayer<R> {
                 controller,
                 vlc_roots: desktop_runtime_roots(&self.0),
                 fallback_active: AtomicBool::new(false),
+                last_load: Mutex::new(None),
+                last_mpv_sequence: AtomicU64::new(0),
+                fallback_sequence_offset: AtomicU64::new(0),
             })
         } else {
             log::warn!("Tauri 桌面播放器回退到 libVLC transport");
@@ -84,6 +87,9 @@ struct DesktopFallbackTransport {
     controller: Arc<dyn DesktopWindowController>,
     vlc_roots: Vec<PathBuf>,
     fallback_active: AtomicBool,
+    last_load: Mutex<Option<PlayerCommand>>,
+    last_mpv_sequence: AtomicU64,
+    fallback_sequence_offset: AtomicU64,
 }
 
 impl DesktopFallbackTransport {
@@ -106,6 +112,21 @@ impl DesktopFallbackTransport {
     fn active_fallback(&self) -> Result<Arc<DesktopPlayerTransport>, PlayerTransportError> {
         self.fallback()
     }
+
+    async fn fallback_snapshot(&self) -> Result<Option<PlayerSnapshot>, PlayerTransportError> {
+        let snapshot = self.active_fallback()?.snapshot().await?;
+        Ok(snapshot.map(|mut snapshot| {
+            snapshot.sequence = fallback_snapshot_sequence(
+                self.fallback_sequence_offset.load(Ordering::Acquire),
+                snapshot.sequence,
+            );
+            snapshot
+        }))
+    }
+}
+
+fn fallback_snapshot_sequence(mpv_sequence: u64, vlc_sequence: u64) -> u64 {
+    mpv_sequence.saturating_add(vlc_sequence)
 }
 
 #[async_trait]
@@ -124,6 +145,12 @@ impl PlayerTransport for DesktopFallbackTransport {
     ) -> Result<PlayerCommandResult, PlayerTransportError> {
         if self.fallback_active.load(Ordering::Acquire) {
             return self.active_fallback()?.dispatch(command).await;
+        }
+        if matches!(command.action, PlayerCommandAction::Load { .. }) {
+            self.last_load
+                .lock()
+                .map_err(|error| PlayerTransportError::Native(error.to_string()))?
+                .replace(command.clone());
         }
         let fallback_command = command.clone();
         match self.mpv.dispatch(command).await {
@@ -152,9 +179,51 @@ impl PlayerTransport for DesktopFallbackTransport {
 
     async fn snapshot(&self) -> Result<Option<PlayerSnapshot>, PlayerTransportError> {
         if self.fallback_active.load(Ordering::Acquire) {
-            self.active_fallback()?.snapshot().await
+            self.fallback_snapshot().await
         } else {
-            self.mpv.snapshot().await
+            match self.mpv.snapshot().await {
+                Ok(snapshot) => {
+                    if let Some(snapshot) = &snapshot {
+                        self.last_mpv_sequence
+                            .store(snapshot.sequence, Ordering::Release);
+                        if snapshot.status != ani_contracts::PlayerStatus::Loading {
+                            self.last_load
+                                .lock()
+                                .map_err(|error| PlayerTransportError::Native(error.to_string()))?
+                                .take();
+                        }
+                    }
+                    Ok(snapshot)
+                }
+                Err(error @ PlayerTransportError::LoadFailed(_)) => {
+                    let load = self
+                        .last_load
+                        .lock()
+                        .map_err(|lock_error| PlayerTransportError::Native(lock_error.to_string()))?
+                        .clone();
+                    let Some(load) = load else {
+                        return Err(error);
+                    };
+                    log::warn!(
+                        "libmpv 异步加载失败，切换到 libVLC session_id={} error={error}",
+                        load.session_id
+                    );
+                    self.mpv.shutdown().await?;
+                    let fallback = self.fallback()?;
+                    let capabilities = fallback.capabilities().await?;
+                    if capabilities.availability != ani_contracts::PlayerAvailability::Available {
+                        return Err(error);
+                    }
+                    fallback.dispatch(load).await?;
+                    self.fallback_sequence_offset.store(
+                        self.last_mpv_sequence.load(Ordering::Acquire),
+                        Ordering::Release,
+                    );
+                    self.fallback_active.store(true, Ordering::Release);
+                    self.fallback_snapshot().await
+                }
+                Err(error) => Err(error),
+            }
         }
     }
 
@@ -316,7 +385,13 @@ fn platform_directory_for(os: &str, arch: &str) -> String {
 mod tests {
     use std::path::PathBuf;
 
-    use super::{platform_directory_for, runtime_roots_for};
+    use super::{fallback_snapshot_sequence, platform_directory_for, runtime_roots_for};
+
+    #[test]
+    fn preserves_monotonic_sequence_after_fallback() {
+        assert_eq!(fallback_snapshot_sequence(8, 1), 9);
+        assert_eq!(fallback_snapshot_sequence(u64::MAX, 1), u64::MAX);
+    }
 
     #[test]
     fn maps_supported_desktop_resource_directories() {
