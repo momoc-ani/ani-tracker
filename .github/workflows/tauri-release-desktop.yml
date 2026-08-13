@@ -95,7 +95,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y \
             build-essential cmake ffmpeg libayatana-appindicator3-dev \
-            libboost-system-dev librsvg2-dev libssl-dev libwebkit2gtk-4.1-dev \
+            libboost-system-dev libmpv1 librsvg2-dev libssl-dev libwebkit2gtk-4.1-dev \
             libx11-dev libxdo-dev ninja-build patchelf pax-utils vlc wget
 
       - name: Install macOS native dependencies
@@ -158,7 +158,9 @@ jobs:
       - name: Prepare Windows libVLC
         if: matrix.platform == 'win32'
         shell: pwsh
-        run: pnpm run prepare:tauri:win-libvlc -- --arch "${{ matrix.arch }}"
+        run: |
+          pnpm run prepare:tauri:win-libvlc -- --arch "${{ matrix.arch }}"
+          pnpm run prepare:tauri:win-libmpv -- --arch "${{ matrix.arch }}"
 
       - name: Prepare macOS libVLC
         if: matrix.platform == 'darwin'

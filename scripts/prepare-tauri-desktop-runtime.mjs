@@ -23,6 +23,7 @@ if (process.platform === "linux") {
 } else {
   runPnpm("build:tauri:remote-renderer");
   runPnpm(platformScript);
+  if (process.platform === "win32") runPnpm("prepare:tauri:win-libmpv");
 }
 console.log(`[tauri-runtime] 桌面运行资源已准备：${process.platform}-${process.arch}`);
 

@@ -25,6 +25,7 @@ export function compileOnlyResourceDirectories(platform, arch) {
   if (platform === "win32") {
     return [
       `out/ffmpeg/${target}`,
+      `out/libmpv/${target}`,
       `out/qbittorrent/${target}`,
       `out/torrent-core/${target}`
     ];

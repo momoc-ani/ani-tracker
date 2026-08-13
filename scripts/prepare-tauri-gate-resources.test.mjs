@@ -6,6 +6,7 @@ import { compileOnlyResourceDirectories } from "./prepare-tauri-gate-resources.m
 test("返回 Windows 分架构编译资源目录", () => {
   assert.deepEqual(compileOnlyResourceDirectories("win32", "x64"), [
     "out/ffmpeg/win32-x64",
+    "out/libmpv/win32-x64",
     "out/qbittorrent/win32-x64",
     "out/torrent-core/win32-x64"
   ]);

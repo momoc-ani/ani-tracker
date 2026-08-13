@@ -33,6 +33,10 @@ on:
       - "scripts/prepare-tauri-gate-resources.mjs"
       - "scripts/prepare-tauri-gate-resources.test.mjs"
       - "scripts/prepare-windows-libvlc-dev.mjs"
+      - "scripts/prepare-windows-libmpv-dev.mjs"
+      - "scripts/prepare-windows-libmpv-dev.test.mjs"
+      - "scripts/verify-tauri-desktop-workflow.test.mjs"
+      - "resources/shaders/**"
       - "scripts/verify-tauri-mobile-package.mjs"
       - "scripts/verify-tauri-mobile-package.test.mjs"
       - "vite.remote.config.ts"
@@ -64,6 +68,10 @@ on:
       - "scripts/prepare-tauri-gate-resources.mjs"
       - "scripts/prepare-tauri-gate-resources.test.mjs"
       - "scripts/prepare-windows-libvlc-dev.mjs"
+      - "scripts/prepare-windows-libmpv-dev.mjs"
+      - "scripts/prepare-windows-libmpv-dev.test.mjs"
+      - "scripts/verify-tauri-desktop-workflow.test.mjs"
+      - "resources/shaders/**"
       - "scripts/verify-tauri-mobile-package.mjs"
       - "scripts/verify-tauri-mobile-package.test.mjs"
       - "vite.remote.config.ts"
@@ -140,6 +148,7 @@ jobs:
             curl \
             file \
             libayatana-appindicator3-dev \
+            libmpv1 \
             librsvg2-dev \
             libssl-dev \
             libwebkit2gtk-4.1-dev \
@@ -156,7 +165,9 @@ jobs:
 
       - name: Prepare Windows Tauri libVLC runtime
         if: runner.os == 'Windows'
-        run: pnpm run prepare:tauri:win-libvlc -- --arch "${{ matrix.arch }}"
+        run: |
+          pnpm run prepare:tauri:win-libvlc -- --arch "${{ matrix.arch }}"
+          pnpm run prepare:tauri:win-libmpv -- --arch "${{ matrix.arch }}"
 
       - name: Prepare macOS Tauri libVLC runtime
         if: runner.os == 'macOS'

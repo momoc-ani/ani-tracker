@@ -4,6 +4,7 @@ import { readFile } from "node:fs/promises";
 import test from "node:test";
 
 const workflow = await readFile(".github/workflows/tauri-release-desktop.yml", "utf8");
+const desktopWorkflow = await readFile(".github/workflows/tauri-desktop.yml", "utf8");
 const torrentCorePrepare = await readFile("scripts/prepare-desktop-torrent-core-dev.mjs", "utf8");
 const qbittorrentUnixBuild = await readFile("scripts/build-qbittorrent-nox-unix.sh", "utf8");
 const windowsSigningImport = await readFile("scripts/import-windows-signing-certificate.ps1", "utf8");
@@ -11,6 +12,10 @@ const windowsSignatureVerification = await readFile("scripts/verify-windows-self
 
 test("桌面原生依赖按平台使用独立步骤和工具链", () => {
   assert.match(workflow, /name: Prepare Windows libVLC[\s\S]*?if: matrix\.platform == 'win32'[\s\S]*?shell: pwsh/);
+  assert.match(workflow, /pnpm run prepare:tauri:win-libvlc[\s\S]*?pnpm run prepare:tauri:win-libmpv/);
+  assert.match(desktopWorkflow, /pnpm run prepare:tauri:win-libvlc[\s\S]*?pnpm run prepare:tauri:win-libmpv/);
+  assert.match(desktopWorkflow, /Install Linux Tauri dependencies[\s\S]*?libmpv1/);
+  assert.match(workflow, /Install Linux desktop dependencies[\s\S]*?libmpv1/);
   assert.match(workflow, /name: Prepare macOS libVLC[\s\S]*?if: matrix\.platform == 'darwin'[\s\S]*?shell: bash/);
   assert.match(workflow, /name: Prepare Linux libVLC[\s\S]*?if: matrix\.platform == 'linux'[\s\S]*?shell: bash/);
   assert.match(workflow, /name: Build Windows torrent-core[\s\S]*?shell: pwsh/);

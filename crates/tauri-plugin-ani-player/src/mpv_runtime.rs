@@ -846,7 +846,23 @@ fn system_mpv_candidates() -> Vec<PathBuf> {
         PathBuf::from("/usr/local/lib/libmpv.dylib"),
     ];
     #[cfg(target_os = "linux")]
-    return vec![PathBuf::from("libmpv.so.2"), PathBuf::from("libmpv.so.1")];
+    {
+        let multiarch = match std::env::consts::ARCH {
+            "x86_64" => Some("x86_64-linux-gnu"),
+            "aarch64" => Some("aarch64-linux-gnu"),
+            _ => None,
+        };
+        let mut roots = Vec::new();
+        if let Some(multiarch) = multiarch {
+            roots.push(PathBuf::from("/usr/lib").join(multiarch));
+            roots.push(PathBuf::from("/lib").join(multiarch));
+        }
+        roots.extend([PathBuf::from("/usr/lib64"), PathBuf::from("/usr/lib")]);
+        return roots
+            .into_iter()
+            .flat_map(|root| [root.join("libmpv.so.2"), root.join("libmpv.so.1")])
+            .collect();
+    }
 }
 
 fn platform_options() -> Vec<(&'static str, &'static str)> {
