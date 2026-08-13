@@ -2,6 +2,8 @@
 
 > 当前实现边界（2026-08-13）：桌面 Windows/Linux 已接入 libmpv、gpu-next、硬解路径、Anime4K Shader、字幕后合成、掉帧自动降级和 libVLC 回退；远程 HLS 已按 NVENC/AMF/QSV/libx264 顺序尝试并报告实际编码器。模型接口、权重 SHA-256 文件校验、显存/帧预算调度、RIFE 有界队列、HDR 三方能力门禁和远程增强输入诊断已完成。模型推理、HDR 输出和“增强帧进入远程编码”的实际管线尚未启用；没有模型运行时和权重时不得宣称可用。
 
+正式模型包、HDR、远程输出和真实 GPU 的逐项执行与证据要求见 [播放器终版发布验收清单](./player-video-enhancement-acceptance.md)。
+
 ## 目标架构
 
 首版播放链路：
