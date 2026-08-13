@@ -59,7 +59,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 
 - 分别在 NVIDIA、AMD、Intel 环境确认 NVENC、AMF、QSV 的实际编码器诊断。
 - 禁用全部硬件编码器后确认回退 `libx264`，且界面显示编码降级。
-- 在增强帧真正进入编码器前，`enhancedFrameInput` 必须保持 `false`；接入后使用画面对比和管线日志确认其为 `true`。
+- RIFE 远程管线接入后，`enhancedFrameInput` 必须在成功 warmup 和帧处理中为 `true`；sidecar 缺失、显存不足、超时或推理失败时必须记录 `degradationReason` 并回退原始 RGB 帧。Real-ESRGAN 未接入前不得把超分请求标记为模型成功。
 - 软字幕终端保持独立字幕轨；不支持软字幕的终端才允许烧录，并在诊断中标记模式。
 - 播放中断网后恢复，确认会话、HLS 清单、播放位置和字幕状态可恢复。
 

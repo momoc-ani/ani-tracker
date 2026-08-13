@@ -3,8 +3,9 @@
 /** 终版播放器实机验收矩阵；CI 只校验目标项完整，不伪造硬件通过。 */
 export const PLAYER_ENHANCEMENT_MATRIX = [
   { platform: "windows", arch: "x64", gpuVendors: ["nvidia", "amd", "intel"], renderer: "d3d11", decoder: "d3d11va" },
-  { platform: "macos", arch: "arm64", gpuVendors: ["apple"], renderer: "metal", decoder: "videotoolbox" },
-  { platform: "macos", arch: "x64", gpuVendors: ["intel", "amd"], renderer: "metal", decoder: "videotoolbox" },
+  // macOS libVLC remains the production transport; future libmpv render API uses OpenGL/CGL.
+  { platform: "macos", arch: "arm64", gpuVendors: ["apple"], renderer: "opengl-cgl", decoder: "videotoolbox" },
+  { platform: "macos", arch: "x64", gpuVendors: ["intel", "amd"], renderer: "opengl-cgl", decoder: "videotoolbox" },
   { platform: "linux", arch: "x64", gpuVendors: ["amd", "intel", "nvidia"], renderer: "vulkan", decoder: "vaapi" }
 ];
 

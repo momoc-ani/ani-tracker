@@ -8,6 +8,7 @@ test("播放器实机矩阵覆盖桌面架构和 GPU 厂商", () => {
   assert.equal(matrix.length, 4);
   assert.deepEqual(matrix.find((entry) => entry.platform === "windows").gpuVendors, ["nvidia", "amd", "intel"]);
   assert.deepEqual(matrix.find((entry) => entry.platform === "linux").gpuVendors, ["amd", "intel", "nvidia"]);
+  assert.equal(matrix.find((entry) => entry.platform === "macos" && entry.arch === "arm64").renderer, "opengl-cgl");
 });
 
 test("播放器实机矩阵拒绝缺少目标或能力字段", () => {

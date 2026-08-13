@@ -1,6 +1,6 @@
 # PC 内置播放器与画质增强执行计划
 
-> 当前实现边界（2026-08-13）：桌面 Windows/Linux 已接入 libmpv、gpu-next、硬解路径、Anime4K Shader、字幕后合成、掉帧自动降级和 libVLC 回退；远程 HLS 已按 NVENC/AMF/QSV/libx264 顺序尝试并报告实际编码器。模型接口、权重 SHA-256 文件校验、显存/帧预算调度、RIFE 有界队列、HDR 三方能力门禁和远程增强输入诊断已完成。模型推理、HDR 输出和“增强帧进入远程编码”的实际管线尚未启用；没有模型运行时和权重时不得宣称可用。
+> 当前实现边界（2026-08-13）：桌面 Windows/Linux 已接入 libmpv、gpu-next、硬解路径、Anime4K Shader、字幕后合成、掉帧自动降级和 libVLC 回退；远程 HLS 已按 NVENC/AMF/QSV/libx264 顺序尝试并报告实际编码器。RIFE sidecar 已固定上游提交、校验可执行文件与权重、完成 Vulkan 握手和真实 warmup，并已接入远程 RGB24 双帧队列、模型中间帧和 rawvideo 编码回退。Real-CUGAN/Real-ESRGAN 的单帧模型端口已完成，但正式上游模型资产、真实超分 sidecar 构建和本地播放器接入仍未完成；HDR 原生输出和跨 GPU 真机证据也未完成。没有模型运行时和权重时不得宣称可用。
 
 正式模型包、HDR、远程输出和真实 GPU 的逐项执行与证据要求见 [播放器终版发布验收清单](./player-video-enhancement-acceptance.md)。
 
@@ -88,7 +88,7 @@
 3. **模型超分适配器**：以独立 `ModelEnhancer` 端口接入 Real-CUGAN/Real-ESRGAN 类模型；加载前校验模型摘要、显存预算和目标分辨率，失败只回退 Shader/原画。
 4. **模型插帧适配器**：以独立 `FrameInterpolator` 端口接入 RIFE；使用有界双帧队列，模型延迟超过帧预算或连续掉帧时自动关闭，字幕不得进入模型输入。
 5. **HDR 能力**：同时满足源视频色彩元数据、渲染器和显示器能力后才开启；不满足条件时保持 SDR，不用滤镜伪装 HDR。
-6. **远程增强输出**：基础 HLS 已按 NVENC/AMF/QSV/libx264 探测并报告降级；模型增强帧进入独立编码器端口、字幕终端能力探测和断线恢复仍待增强帧管线接入。
+6. **远程增强输出**：基础 HLS 已按 NVENC/AMF/QSV/libx264 探测并报告降级；RIFE 增强帧已进入独立 rawvideo 编码管线并保留独立音轨，终端字幕能力探测和断线恢复仍待增强。
 7. **双版本稳定期**：至少两个版本完成 Windows NVIDIA/AMD/Intel、macOS Apple Silicon/Intel、Linux AMD/Intel/NVIDIA 的基础播放与 Shader 矩阵后，才评估移除桌面 libVLC。
 
 ### 终版能力开关规则
@@ -110,8 +110,8 @@
 
 ### 当前未完成项
 
-- RIFE/Real-CUGAN/Real-ESRGAN 模型运行时、权重管理和 GPU 推理后端。
-- 模型接口、摘要/显存/帧预算校验和 RIFE 有界双帧队列已完成；具体权重与推理 SDK 尚未装配，因此能力字段仍为 `false`。
+- Real-CUGAN/Real-ESRGAN 正式模型运行时、权重管理和 GPU 推理后端。
+- RIFE sidecar、摘要/显存/帧预算校验和远程有界双帧队列已完成；真实 Vulkan 构建、warmup 和 Windows/macOS/Linux GPU 证据仍需 CI/真机记录。
 - libmpv render API + Metal 的 macOS 原生输出。
 - HDR 元数据探测、显示器能力探测和远程硬件编码管线。
 - Windows NVIDIA/AMD/Intel、macOS、Linux 真机矩阵与两个版本稳定期。
@@ -123,8 +123,8 @@
 | 首版 P0-P3 | 已完成：libmpv/libVLC 单内核切换、跨厂商硬解配置、Anime4K、字幕后合成和掉帧降级 | macOS 仍使用 libVLC；各平台真机需持续回归 |
 | 首版 P4 | 已完成发布资源门禁和实机矩阵声明 | Windows/AMD/NVIDIA/Intel、macOS、Linux 实机结果待采集 |
 | 终版 F1 | 已完成能力、诊断、预算、权重摘要文件校验和安全降级契约 | 真实 GPU/显存探测需随模型后端装配 |
-| 终版 F2 | 已完成模型超分/插帧端口、HDR 三方门禁和有界队列 | 推理 SDK、正式权重、HDR 原生输出待接入 |
-| 终版 F3 | 已完成 HLS 编码器回退与诊断，明确当前使用原始帧输入 | 增强帧编码入口、终端字幕探测和断线恢复待接入 |
+| 终版 F2 | 已完成模型超分/插帧端口、RIFE sidecar 协议、HDR 三方门禁和有界队列 | Real-ESRGAN 正式权重/sidecar、真实 Vulkan warmup、HDR 原生输出待接入 |
+| 终版 F3 | 已完成 HLS 编码器回退、RIFE 增强帧 rawvideo 管线和独立音轨诊断 | 终端字幕探测、断线恢复和跨厂商实际编码证据待采集 |
 | 终版 F4 | 删除条件和双版本稳定门槛已固化 | 必须经过两个正式版本，不在当前阶段删除 libVLC |
 
 ### F1：能力调度层
@@ -135,14 +135,14 @@
 
 ### F2：模型增强
 
-- 动画超分：Real-CUGAN/Real-ESRGAN 类模型，按平台选择通用推理后端。
+- 动画超分：Real-CUGAN/Real-ESRGAN 类模型，按平台选择通用 ncnn/Vulkan 推理后端；未取得可验证模型资产前保持关闭。
 - 插帧：RIFE 类模型，和超分共享帧预算，禁止两者无条件同时满负载。
 - HDR：色彩空间和显示能力完整探测后再启用，不以简单滤镜冒充 HDR。
 - 模型下载、校验、版本切换和缓存独立于播放器内核。
 
 ### F3：远程增强输出
 
-- 基础 HLS 已使用独立编码器探测；模型增强后的帧进入本地编码管线仍待接入，不复用字幕已经烧录的源画面。
+- 基础 HLS 已使用独立编码器探测；RIFE 增强后的 RGB 帧已经进入本地编码管线，不复用字幕已经烧录的源画面。
 - 支持软字幕传递和按终端能力选择烧录字幕。
 - 自适应码率、断线恢复、延迟模式和带宽探测纳入远程会话契约。
 - 编码器按 NVENC/AMF/QSV 选择，最后回退 libx264，并在会话诊断中标记降级。
