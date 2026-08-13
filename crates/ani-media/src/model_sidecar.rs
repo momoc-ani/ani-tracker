@@ -156,6 +156,11 @@ struct WireMessage {
 }
 
 impl ModelSidecarRuntime {
+    /// 返回清单声明并已完成校验的输出倍率。
+    pub fn output_scale(&self) -> u32 {
+        self.output_scale
+    }
+
     /// 校验全部发布资源，启动长驻 sidecar，并以真实模型帧完成 warmup 后才返回可用运行时。
     pub async fn launch(config: ModelSidecarConfig) -> Result<Self, String> {
         let validated = validate_sidecar_bundle(&config).await?;

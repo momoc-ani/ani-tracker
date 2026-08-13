@@ -594,15 +594,26 @@ async fn handle_request(
             return Ok(empty_response(StatusCode::NO_CONTENT));
         }
         if matches!(method, Method::GET | Method::HEAD) {
+            let device = authenticate(core, request.headers(), true).await?;
+            consume_rate_limit(
+                core,
+                format!("media:{}:read", device.id),
+                600,
+                Duration::from_secs(60),
+            )
+            .await?;
+            if route.asset_name.is_none() && method == Method::GET {
+                let session = core
+                    .media
+                    .get_session(&route.session_id, &device.id)
+                    .await
+                    .map_err(GatewayHttpError::from_media)?;
+                return Ok(json_response(
+                    StatusCode::OK,
+                    serde_json::to_value(session)?,
+                ));
+            }
             if let Some(asset_name) = route.asset_name {
-                let device = authenticate(core, request.headers(), true).await?;
-                consume_rate_limit(
-                    core,
-                    format!("media:{}:read", device.id),
-                    600,
-                    Duration::from_secs(60),
-                )
-                .await?;
                 let asset = core
                     .media
                     .get_asset(&route.session_id, &device.id, &asset_name)
@@ -1557,7 +1568,8 @@ mod tests {
                 ffmpeg_path: PathBuf::from("ffmpeg"),
                 timeout: Duration::from_secs(1),
                 rife_sidecar_root: None,
-                rife_available_vram_bytes: 0,
+                realesrgan_sidecar_root: None,
+                model_available_vram_bytes: 0,
             },
             temporary.path().join("sessions"),
         ));
@@ -1726,6 +1738,32 @@ mod tests {
         let session: Value =
             serde_json::from_str(&session_response.text().await.expect("media session body"))
                 .expect("media session response");
+        let session_id = session["id"].as_str().expect("session id");
+        let unauthorized_status = client
+            .get(format!("{base_url}/api/media/sessions/{session_id}"))
+            .send()
+            .await
+            .expect("unauthorized media session status request");
+        assert_eq!(
+            unauthorized_status.status(),
+            reqwest::StatusCode::UNAUTHORIZED
+        );
+        let status_response = client
+            .get(format!("{base_url}/api/media/sessions/{session_id}"))
+            .bearer_auth(token)
+            .send()
+            .await
+            .expect("media session status request");
+        assert_eq!(status_response.status(), reqwest::StatusCode::OK);
+        let status: Value = serde_json::from_str(
+            &status_response
+                .text()
+                .await
+                .expect("media session status body"),
+        )
+        .expect("media session status response");
+        assert_eq!(status["id"], session["id"]);
+        assert_eq!(status["diagnostics"]["enhancedFrameInput"], false);
         let stream_url = session["streamUrl"].as_str().expect("stream url");
         let range_response = client
             .get(format!("{base_url}{stream_url}"))

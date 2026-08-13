@@ -12,6 +12,7 @@ export interface PlaybackSessionClient {
     fileIndex: number | undefined,
     enhancement: RemotePlaybackEnhancement
   ): Promise<RemotePlaybackSession>;
+  refresh?(sessionId: string): Promise<RemotePlaybackSession>;
   close(sessionId: string): Promise<void>;
 }
 

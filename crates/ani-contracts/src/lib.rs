@@ -866,6 +866,8 @@ pub struct RemotePlaybackDiagnostics {
     pub subtitle_mode: Option<String>,
     #[serde(default)]
     pub enhanced_frame_input: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_backend: Option<String>,
     #[serde(default)]
     pub video_enhancement: PlayerVideoEnhancement,
     #[serde(default)]

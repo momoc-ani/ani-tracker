@@ -29,6 +29,7 @@ import {
 import { cn } from "@/lib/cn";
 import type {
   RemotePlaybackEnhancement,
+  RemotePlaybackDiagnostics,
   RemotePlaybackRequestMode,
   RemotePlaybackSession
 } from "@shared/contracts";
@@ -49,6 +50,7 @@ import {
   detectExternalPlayer
 } from "./external-player-launch";
 import type { PlaybackSessionClient } from "./playback-session-client";
+import { startPlaybackSessionRefresh } from "@shared/playback-session-refresh";
 import {
   playlistItemLabel,
   resolveAdjacentPlaylistItem,
@@ -116,6 +118,7 @@ export function RemoteVideoPlayer({
   const [requestedMode, setRequestedMode] = useState<RemotePlaybackRequestMode>(readRemotePlaybackMode);
   const [enhancement, setEnhancement] = useState<RemotePlaybackEnhancement>(readRemotePlaybackEnhancement);
   const [session, setSession] = useState<RemotePlaybackSession | null>(null);
+  const [sessionDiagnostics, setSessionDiagnostics] = useState<RemotePlaybackDiagnostics>();
   const [playbackError, setPlaybackError] = useState<string | null>(null);
   const [retryNonce, setRetryNonce] = useState(0);
   const [toolbarVisible, setToolbarVisible] = useState(true);
@@ -242,6 +245,7 @@ export function RemoteVideoPlayer({
     let active = true;
     let createdSession: RemotePlaybackSession | undefined;
     setSession(null);
+    setSessionDiagnostics(undefined);
     setPlayerSnapshot(undefined);
     setPlaybackError(null);
 
@@ -259,6 +263,7 @@ export function RemoteVideoPlayer({
           createdSession = result;
           if (!active) return sessionClient.close(result.id);
           setSession(result);
+          setSessionDiagnostics(result.diagnostics);
           console.info("[remote] 播放会话已创建", {
             taskId: activeItem.task.id,
             fileIndex: result.fileIndex,
@@ -282,6 +287,18 @@ export function RemoteVideoPlayer({
       if (createdSession) void sessionClient.close(createdSession.id);
     };
   }, [activeItem, requestedMode, retryNonce, sessionClient, sessionEnhancement]);
+
+  useEffect(() => {
+    if (!session || session.mode !== "hls" || !sessionClient.refresh) return;
+    return startPlaybackSessionRefresh({
+      intervalMs: 2_000,
+      refresh: () => sessionClient.refresh!(session.id),
+      onSession: (next) => setSessionDiagnostics(next.diagnostics),
+      onError: (error) => console.warn("[remote] 播放诊断刷新失败", error),
+      schedule: window.setInterval.bind(window),
+      cancel: window.clearInterval.bind(window)
+    });
+  }, [session?.id, session?.mode, sessionClient]);
 
   /** 原文件发生媒体错误时仅自动升级一次实时转码。 */
   const startAutomaticTranscode = useCallback((): void => {
@@ -636,10 +653,12 @@ export function RemoteVideoPlayer({
 
   const statusBadges = [
     session?.mode === "hls" ? "实时转码" : session ? "原文件直传" : undefined,
-    session?.diagnostics?.encoder ? `编码 ${session.diagnostics.encoder}` : undefined,
-    session?.diagnostics?.encoderDegraded ? "编码器已降级" : undefined,
-    session?.diagnostics?.videoEnhancement !== "off" ? "画质增强" : undefined,
-    session?.diagnostics?.frameInterpolation === "motion-compensated" ? "60 FPS 运动补偿" : undefined,
+    sessionDiagnostics?.encoder ? `编码 ${sessionDiagnostics.encoder}` : undefined,
+    sessionDiagnostics?.encoderDegraded ? "编码器已降级" : undefined,
+    sessionDiagnostics?.modelBackend ? `模型 ${sessionDiagnostics.modelBackend}` : undefined,
+    sessionDiagnostics?.degradationReason ? "增强已降级" : undefined,
+    sessionDiagnostics && sessionDiagnostics.videoEnhancement !== "off" ? "画质增强" : undefined,
+    sessionDiagnostics?.frameInterpolation === "motion-compensated" ? "60 FPS 运动补偿" : undefined,
     session ? `${session.subtitles.length} 条字幕` : undefined,
     activeItem?.task.resolution?.toUpperCase()
   ].filter((value): value is string => Boolean(value));

@@ -362,13 +362,16 @@ impl AppMediaState {
             .into_iter()
             .next()
             .ok_or_else(|| "没有可用的 FFmpeg 命令".to_owned())?;
-        let rife_sidecar_root = resolve_model_sidecar_root(&self.app);
+        let rife_sidecar_root = resolve_model_sidecar_root(&self.app, "model-sidecar");
+        let realesrgan_sidecar_root =
+            resolve_model_sidecar_root(&self.app, "realesrgan-model-sidecar");
         Ok(RemoteMediaTools {
             ffprobe_paths,
             ffmpeg_path,
             timeout: Duration::from_secs(timeout),
             rife_sidecar_root,
-            rife_available_vram_bytes: configured_vram_bytes(&settings),
+            realesrgan_sidecar_root,
+            model_available_vram_bytes: configured_vram_bytes(&settings),
         })
     }
 
@@ -709,7 +712,7 @@ fn configured_vram_bytes(settings: &AppSettings) -> u64 {
 }
 
 #[cfg(desktop)]
-fn resolve_model_sidecar_root(app: &AppHandle) -> Option<PathBuf> {
+fn resolve_model_sidecar_root(app: &AppHandle, resource_name: &str) -> Option<PathBuf> {
     let platform = if cfg!(target_os = "windows") {
         "win32"
     } else if cfg!(target_os = "macos") {
@@ -724,16 +727,16 @@ fn resolve_model_sidecar_root(app: &AppHandle) -> Option<PathBuf> {
     };
     let mut roots = Vec::new();
     if let Ok(resources) = app.path().resource_dir() {
-        roots.push(resources.join("model-sidecar"));
+        roots.push(resources.join(resource_name));
     }
     let current = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     roots.extend([
-        current.join("out/model-sidecar"),
-        current.join("resources/model-sidecar"),
+        current.join("out").join(resource_name),
+        current.join("resources").join(resource_name),
     ]);
     #[cfg(debug_assertions)]
     if let Some(workspace) = Path::new(env!("CARGO_MANIFEST_DIR")).parent() {
-        roots.push(workspace.join("out/model-sidecar"));
+        roots.push(workspace.join("out").join(resource_name));
     }
     roots
         .into_iter()

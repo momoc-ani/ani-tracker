@@ -699,6 +699,7 @@ export interface RemotePlaybackDiagnostics {
   encoderDegraded: boolean;
   subtitleMode?: "soft" | "burned";
   enhancedFrameInput: boolean;
+  modelBackend?: string;
   videoEnhancement: import("./player-contract").PlayerVideoEnhancement;
   frameInterpolation: import("./player-contract").PlayerFrameInterpolation;
   degradationReason?: string;

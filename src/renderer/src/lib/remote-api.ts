@@ -183,6 +183,23 @@ export async function closeRemotePlaybackSession(sessionId: string): Promise<voi
   }
 }
 
+/** 读取远程播放会话的最新实际编码和模型降级状态。 */
+export async function getRemotePlaybackSession(sessionId: string): Promise<RemotePlaybackSession> {
+  const baseUrl = getRemoteBaseUrl();
+  const accessToken = window.localStorage.getItem(REMOTE_TOKEN_STORAGE_KEY);
+  if (!accessToken) throw new Error("当前设备尚未完成远程配对");
+  const response = await fetch(`${baseUrl}/api/media/sessions/${encodeURIComponent(sessionId)}`, {
+    credentials: "same-origin",
+    headers: { Authorization: `Bearer ${accessToken}` }
+  });
+  const payload = (await response.json().catch(() => ({}))) as RemotePlaybackSession & { error?: string };
+  if (!response.ok || !payload.id) {
+    if (response.status === 401) clearRemoteDeviceToken();
+    throw new Error(payload.error ?? `播放会话状态读取失败：${response.status}`);
+  }
+  return payload;
+}
+
 /** 调用桌面端暴露的远程 RPC，并统一处理协议错误。 */
 async function invokeRemote(baseUrl: string, method: string, args: unknown[]): Promise<unknown> {
   const accessToken = window.localStorage.getItem(REMOTE_TOKEN_STORAGE_KEY);

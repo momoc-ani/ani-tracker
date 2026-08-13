@@ -10,7 +10,7 @@ use ani_contracts::{
 };
 use ani_domain::{AppSettings, DownloadTask, MediaFile, PlaybackCheckpoint};
 use ani_media::model_sidecar::{ModelSidecarConfig, ModelSidecarRuntime};
-use ani_media::player::{FrameInterpolator, RawVideoFrame};
+use ani_media::player::{EnhancementBudget, FrameInterpolator, ModelEnhancer, RawVideoFrame};
 use async_trait::async_trait;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
@@ -81,7 +81,8 @@ pub struct RemoteMediaTools {
     pub ffmpeg_path: PathBuf,
     pub timeout: Duration,
     pub rife_sidecar_root: Option<PathBuf>,
-    pub rife_available_vram_bytes: u64,
+    pub realesrgan_sidecar_root: Option<PathBuf>,
+    pub model_available_vram_bytes: u64,
 }
 
 /// 网关可输出的受控媒体文件。
@@ -134,6 +135,7 @@ struct MediaProcess {
     encoder: Child,
     decoder: Option<Child>,
     pipeline: Option<JoinHandle<Result<(), String>>>,
+    pipeline_state: Option<Arc<Mutex<ModelPipelineState>>>,
 }
 
 impl Drop for MediaProcess {
@@ -163,8 +165,31 @@ struct HlsStart {
     process: MediaProcess,
     encoder: &'static str,
     encoder_degraded: bool,
+    actual_video_enhancement: PlayerVideoEnhancement,
     actual_interpolation: PlayerFrameInterpolation,
+    model_backend: Option<String>,
     degradation_reason: Option<String>,
+}
+
+struct ModelPipelineState {
+    actual_video_enhancement: PlayerVideoEnhancement,
+    actual_interpolation: PlayerFrameInterpolation,
+    rife_model_backend: Option<String>,
+    realesrgan_model_backend: Option<String>,
+    degradation_reasons: Vec<String>,
+}
+
+impl ModelPipelineState {
+    fn model_backend(&self) -> Option<String> {
+        model_backend_name(
+            self.rife_model_backend.as_deref(),
+            self.realesrgan_model_backend.as_deref(),
+        )
+    }
+
+    fn degradation_reason(&self) -> Option<String> {
+        (!self.degradation_reasons.is_empty()).then(|| self.degradation_reasons.join("；"))
+    }
 }
 
 struct ResolvedMedia {
@@ -182,6 +207,7 @@ pub struct RemoteMediaSessionService {
     temporary_root: PathBuf,
     sessions: Mutex<HashMap<String, Arc<SessionRecord>>>,
     rife_runtime: Mutex<Option<Arc<ModelSidecarRuntime>>>,
+    realesrgan_runtime: Mutex<Option<Arc<ModelSidecarRuntime>>>,
 }
 
 impl RemoteMediaSessionService {
@@ -197,6 +223,7 @@ impl RemoteMediaSessionService {
             temporary_root,
             sessions: Mutex::new(HashMap::new()),
             rife_runtime: Mutex::new(None),
+            realesrgan_runtime: Mutex::new(None),
         }
     }
 
@@ -320,7 +347,9 @@ impl RemoteMediaSessionService {
             process = Some(started.process);
             diagnostics.encoder = Some(started.encoder.to_owned());
             diagnostics.encoder_degraded = started.encoder_degraded;
+            diagnostics.video_enhancement = started.actual_video_enhancement;
             diagnostics.frame_interpolation = started.actual_interpolation;
+            diagnostics.model_backend = started.model_backend;
             diagnostics.enhanced_frame_input = diagnostics.video_enhancement
                 != PlayerVideoEnhancement::Off
                 || diagnostics.frame_interpolation != PlayerFrameInterpolation::Off;
@@ -386,6 +415,38 @@ impl RemoteMediaSessionService {
             .require_session(session_id, Some(device_id), None)
             .await?;
         self.resolve_asset(&record, asset_name).await
+    }
+
+    /// 返回设备拥有会话的最新实际增强诊断。
+    pub async fn get_session(
+        &self,
+        session_id: &str,
+        device_id: &str,
+    ) -> Result<RemotePlaybackSession, RemoteMediaError> {
+        let record = self
+            .require_session(session_id, Some(device_id), None)
+            .await?;
+        let mut public = record.public.lock().await.clone();
+        let pipeline_state = record
+            .process
+            .lock()
+            .await
+            .as_ref()
+            .and_then(|process| process.pipeline_state.clone());
+        if let Some(state) = pipeline_state {
+            let state = state.lock().await;
+            public.diagnostics.video_enhancement = state.actual_video_enhancement;
+            public.diagnostics.frame_interpolation = state.actual_interpolation;
+            public.diagnostics.model_backend = state.model_backend();
+            public.diagnostics.enhanced_frame_input = state.actual_video_enhancement
+                != PlayerVideoEnhancement::Off
+                || state.actual_interpolation != PlayerFrameInterpolation::Off;
+            public.diagnostics.degradation_reason = join_degradation_reasons(
+                public.diagnostics.degradation_reason.take(),
+                state.degradation_reason().into_iter().collect(),
+            );
+        }
+        Ok(public)
     }
 
     /// 使用外部会话专属票据返回媒体资源。
@@ -836,51 +897,100 @@ impl RemoteMediaSessionService {
         output_directory: &Path,
         enhancement: RemotePlaybackEnhancement,
     ) -> Result<HlsStart, RemoteMediaError> {
-        if enhancement.frame_interpolation == PlayerFrameInterpolation::RifeRealtime {
-            match self.ensure_rife_runtime().await {
-                Ok(runtime) => match self
-                    .start_rife_hls(source_path, output_directory, enhancement, runtime)
-                    .await
-                {
-                    Ok(started) => return Ok(started),
-                    Err(error) => {
-                        log::warn!("RIFE 远程管线启动失败，回退 FFmpeg error={}", error.message);
-                        return self
-                            .start_hls_ffmpeg(
-                                source_path,
-                                output_directory,
-                                RemotePlaybackEnhancement {
-                                    frame_interpolation: PlayerFrameInterpolation::Off,
-                                    ..enhancement
-                                },
-                            )
-                            .await
-                            .map(|mut started| {
-                                started.degradation_reason = Some(error.message);
-                                started.encoder_degraded = true;
-                                started
-                            });
+        let wants_rife = enhancement.frame_interpolation == PlayerFrameInterpolation::RifeRealtime;
+        let wants_realesrgan = enhancement.video_enhancement == PlayerVideoEnhancement::Clear;
+        if wants_rife || wants_realesrgan {
+            let mut degradation_reasons = Vec::new();
+            let mut rife = if wants_rife {
+                match self.ensure_rife_runtime().await {
+                    Ok(runtime) => Some(runtime),
+                    Err(reason) => {
+                        log::warn!("RIFE sidecar 不可用，关闭模型插帧 reason={reason}");
+                        degradation_reasons.push(reason);
+                        None
                     }
-                },
-                Err(reason) => {
-                    log::warn!("RIFE sidecar 不可用，回退 FFmpeg reason={reason}");
-                    return self
-                        .start_hls_ffmpeg(
-                            source_path,
-                            output_directory,
-                            RemotePlaybackEnhancement {
-                                frame_interpolation: PlayerFrameInterpolation::Off,
-                                ..enhancement
-                            },
-                        )
-                        .await
-                        .map(|mut started| {
-                            started.degradation_reason = Some(reason);
-                            started.encoder_degraded = true;
-                            started
-                        });
+                }
+            } else {
+                None
+            };
+            let realesrgan = if wants_realesrgan {
+                match self.ensure_realesrgan_runtime().await {
+                    Ok(runtime) => Some(runtime),
+                    Err(reason) => {
+                        log::warn!(
+                            "Real-ESRGAN sidecar 不可用，回退 FFmpeg 清晰滤镜 reason={reason}"
+                        );
+                        degradation_reasons.push(reason);
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+            if let (Some(rife_runtime), Some(realesrgan_runtime)) = (&rife, &realesrgan) {
+                if !model_pair_fits(
+                    FrameInterpolator::budget(rife_runtime.as_ref()),
+                    ModelEnhancer::budget(realesrgan_runtime.as_ref()),
+                    self.tools.model_available_vram_bytes,
+                ) {
+                    degradation_reasons
+                        .push("模型组合超出帧时间或显存预算，已优先关闭 RIFE 插帧".to_owned());
+                    rife = None;
                 }
             }
+            if rife.is_some() || realesrgan.is_some() {
+                match self
+                    .start_model_hls(
+                        source_path,
+                        output_directory,
+                        RemotePlaybackEnhancement {
+                            video_enhancement: enhancement.video_enhancement,
+                            frame_interpolation: if rife.is_some() {
+                                PlayerFrameInterpolation::RifeRealtime
+                            } else {
+                                PlayerFrameInterpolation::Off
+                            },
+                        },
+                        rife,
+                        realesrgan,
+                    )
+                    .await
+                {
+                    Ok(mut started) => {
+                        started.degradation_reason = join_degradation_reasons(
+                            started.degradation_reason.take(),
+                            degradation_reasons,
+                        );
+                        return Ok(started);
+                    }
+                    Err(error) => {
+                        log::warn!("模型远程管线启动失败，回退 FFmpeg error={}", error.message);
+                        degradation_reasons.push(error.message);
+                    }
+                }
+            }
+            return self
+                .start_hls_ffmpeg(
+                    source_path,
+                    output_directory,
+                    RemotePlaybackEnhancement {
+                        frame_interpolation: if wants_rife {
+                            PlayerFrameInterpolation::Off
+                        } else {
+                            enhancement.frame_interpolation
+                        },
+                        ..enhancement
+                    },
+                )
+                .await
+                .map(|mut started| {
+                    started.degradation_reason = join_degradation_reasons(
+                        started.degradation_reason.take(),
+                        degradation_reasons,
+                    );
+                    started.encoder_degraded = true;
+                    started
+                });
         }
         self.start_hls_ffmpeg(source_path, output_directory, enhancement)
             .await
@@ -889,7 +999,7 @@ impl RemoteMediaSessionService {
     async fn ensure_rife_runtime(&self) -> Result<Arc<ModelSidecarRuntime>, String> {
         let mut guard = self.rife_runtime.lock().await;
         if let Some(runtime) = guard.as_ref() {
-            if runtime.ready() {
+            if FrameInterpolator::ready(runtime.as_ref()) {
                 return Ok(Arc::clone(runtime));
             }
             *guard = None;
@@ -899,8 +1009,30 @@ impl RemoteMediaSessionService {
             .rife_sidecar_root
             .clone()
             .ok_or_else(|| "未找到 RIFE sidecar 资源".to_owned())?;
-        let config = ModelSidecarConfig::new(root, self.tools.rife_available_vram_bytes, 33.0);
+        let config = ModelSidecarConfig::new(root, self.tools.model_available_vram_bytes, 33.0);
         let runtime = Arc::new(ModelSidecarRuntime::launch(config).await?);
+        *guard = Some(Arc::clone(&runtime));
+        Ok(runtime)
+    }
+
+    async fn ensure_realesrgan_runtime(&self) -> Result<Arc<ModelSidecarRuntime>, String> {
+        let mut guard = self.realesrgan_runtime.lock().await;
+        if let Some(runtime) = guard.as_ref() {
+            if ModelEnhancer::ready(runtime.as_ref()) {
+                return Ok(Arc::clone(runtime));
+            }
+            *guard = None;
+        }
+        let root = self
+            .tools
+            .realesrgan_sidecar_root
+            .clone()
+            .ok_or_else(|| "未找到 Real-ESRGAN sidecar 资源".to_owned())?;
+        let config = ModelSidecarConfig::new(root, self.tools.model_available_vram_bytes, 33.0);
+        let runtime = Arc::new(ModelSidecarRuntime::launch(config).await?);
+        if runtime.output_scale() != 2 || !ModelEnhancer::ready(runtime.as_ref()) {
+            return Err("Real-ESRGAN sidecar 未声明可用的 2x 单帧增强".to_owned());
+        }
         *guard = Some(Arc::clone(&runtime));
         Ok(runtime)
     }
@@ -960,10 +1092,13 @@ impl RemoteMediaSessionService {
                             encoder: child,
                             decoder: None,
                             pipeline: None,
+                            pipeline_state: None,
                         },
                         encoder,
                         encoder_degraded: index > 0,
+                        actual_video_enhancement: enhancement.video_enhancement,
                         actual_interpolation: enhancement.frame_interpolation,
+                        model_backend: None,
                         degradation_reason: None,
                     });
                 }
@@ -986,21 +1121,36 @@ impl RemoteMediaSessionService {
         ))
     }
 
-    async fn start_rife_hls(
+    async fn start_model_hls(
         &self,
         source_path: &Path,
         output_directory: &Path,
         enhancement: RemotePlaybackEnhancement,
-        runtime: Arc<ModelSidecarRuntime>,
+        rife: Option<Arc<ModelSidecarRuntime>>,
+        realesrgan: Option<Arc<ModelSidecarRuntime>>,
     ) -> Result<HlsStart, RemoteMediaError> {
         let video = self
             .probe_video(source_path)
             .await
-            .map_err(|error| RemoteMediaError::new(503, "RIFE_VIDEO_PROBE_FAILED", error))?;
+            .map_err(|error| RemoteMediaError::new(503, "MODEL_VIDEO_PROBE_FAILED", error))?;
         let playlist = output_directory.join("index.m3u8");
         let segments = output_directory.join("segment-%06d.ts");
-        let output_fps = (video.frame_rate * 2.0).clamp(1.0, 240.0);
-        let dimensions = format!("{}x{}", video.width, video.height);
+        let output_fps = if rife.is_some() {
+            (video.frame_rate * 2.0).clamp(1.0, 240.0)
+        } else {
+            video.frame_rate
+        };
+        let output_scale = realesrgan
+            .as_ref()
+            .map_or(1, |runtime| runtime.output_scale());
+        let model_enhancement_active = realesrgan.is_some();
+        let output_width = video.width.checked_mul(output_scale).ok_or_else(|| {
+            RemoteMediaError::new(503, "MODEL_OUTPUT_SIZE_INVALID", "模型输出宽度溢出")
+        })?;
+        let output_height = video.height.checked_mul(output_scale).ok_or_else(|| {
+            RemoteMediaError::new(503, "MODEL_OUTPUT_SIZE_INVALID", "模型输出高度溢出")
+        })?;
+        let dimensions = format!("{output_width}x{output_height}");
         let mut decoder = hidden_command(&self.tools.ffmpeg_path);
         decoder
             .args(["-nostdin", "-hide_banner", "-loglevel", "error", "-i"])
@@ -1012,12 +1162,12 @@ impl RemoteMediaSessionService {
             .stdout(Stdio::piped())
             .kill_on_drop(true);
         let mut decoder = decoder.spawn().map_err(|error| {
-            RemoteMediaError::new(503, "RIFE_DECODER_UNAVAILABLE", error.to_string())
+            RemoteMediaError::new(503, "MODEL_DECODER_UNAVAILABLE", error.to_string())
         })?;
         let decoder_stdout = decoder.stdout.take().ok_or_else(|| {
             RemoteMediaError::new(
                 503,
-                "RIFE_DECODER_OUTPUT_UNAVAILABLE",
+                "MODEL_DECODER_OUTPUT_UNAVAILABLE",
                 "FFmpeg RGB 输出不可用",
             )
         })?;
@@ -1046,8 +1196,12 @@ impl RemoteMediaSessionService {
             .args(["-map", "0:v:0", "-map", "1:a:0?", "-c:v"])
             .args(encoder_video_args("libx264"))
             .args(remote_video_filter_args(RemotePlaybackEnhancement {
+                video_enhancement: if model_enhancement_active {
+                    PlayerVideoEnhancement::Off
+                } else {
+                    enhancement.video_enhancement
+                },
                 frame_interpolation: PlayerFrameInterpolation::Off,
-                ..enhancement
             }))
             .args([
                 "-pix_fmt",
@@ -1074,22 +1228,38 @@ impl RemoteMediaSessionService {
             .stdin(Stdio::piped())
             .kill_on_drop(true);
         let mut encoder = encoder.spawn().map_err(|error| {
-            RemoteMediaError::new(503, "RIFE_ENCODER_UNAVAILABLE", error.to_string())
+            RemoteMediaError::new(503, "MODEL_ENCODER_UNAVAILABLE", error.to_string())
         })?;
         let encoder_stdin = encoder.stdin.take().ok_or_else(|| {
             RemoteMediaError::new(
                 503,
-                "RIFE_ENCODER_INPUT_UNAVAILABLE",
+                "MODEL_ENCODER_INPUT_UNAVAILABLE",
                 "FFmpeg rawvideo 输入不可用",
             )
         })?;
-        let pipeline = tokio::spawn(run_rife_pipeline(
+        let pipeline_state = Arc::new(Mutex::new(ModelPipelineState {
+            actual_video_enhancement: enhancement.video_enhancement,
+            actual_interpolation: enhancement.frame_interpolation,
+            rife_model_backend: rife
+                .as_ref()
+                .map(|runtime| FrameInterpolator::backend_id(runtime.as_ref()).to_owned()),
+            realesrgan_model_backend: realesrgan
+                .as_ref()
+                .map(|runtime| ModelEnhancer::backend_id(runtime.as_ref()).to_owned()),
+            degradation_reasons: Vec::new(),
+        }));
+        let model_backend = pipeline_state.lock().await.model_backend();
+        let pipeline = tokio::spawn(run_model_pipeline(
             decoder_stdout,
             encoder_stdin,
-            runtime,
-            video.width,
-            video.height,
-            video.frame_rate,
+            ModelPipelineConfig {
+                rife,
+                realesrgan,
+                state: Arc::clone(&pipeline_state),
+                width: video.width,
+                height: video.height,
+                frame_rate: video.frame_rate,
+            },
         ));
         let started = tokio::time::Instant::now();
         loop {
@@ -1099,10 +1269,13 @@ impl RemoteMediaSessionService {
                         encoder,
                         decoder: Some(decoder),
                         pipeline: Some(pipeline),
+                        pipeline_state: Some(pipeline_state),
                     },
                     encoder: "libx264",
                     encoder_degraded: true,
-                    actual_interpolation: PlayerFrameInterpolation::RifeRealtime,
+                    actual_video_enhancement: enhancement.video_enhancement,
+                    actual_interpolation: enhancement.frame_interpolation,
+                    model_backend,
                     degradation_reason: None,
                 });
             }
@@ -1111,8 +1284,8 @@ impl RemoteMediaSessionService {
                 pipeline.abort();
                 return Err(RemoteMediaError::new(
                     503,
-                    "RIFE_ENCODER_EXITED",
-                    format!("RIFE 编码器提前退出：{status}"),
+                    "MODEL_ENCODER_EXITED",
+                    format!("模型管线编码器提前退出：{status}"),
                 ));
             }
             if started.elapsed() >= TRANSCODER_START_TIMEOUT {
@@ -1121,8 +1294,8 @@ impl RemoteMediaSessionService {
                 let _ = encoder.kill().await;
                 return Err(RemoteMediaError::new(
                     503,
-                    "RIFE_PIPELINE_START_TIMEOUT",
-                    "RIFE 远程管线启动超时",
+                    "MODEL_PIPELINE_START_TIMEOUT",
+                    "模型远程管线启动超时",
                 ));
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -1180,6 +1353,15 @@ struct VideoProbe {
     frame_rate: f64,
 }
 
+struct ModelPipelineConfig {
+    rife: Option<Arc<ModelSidecarRuntime>>,
+    realesrgan: Option<Arc<ModelSidecarRuntime>>,
+    state: Arc<Mutex<ModelPipelineState>>,
+    width: u32,
+    height: u32,
+    frame_rate: f64,
+}
+
 #[derive(Default, Deserialize)]
 struct VideoProbeOutput {
     #[serde(default)]
@@ -1210,14 +1392,24 @@ fn parse_frame_rate(value: &str) -> Result<f64, String> {
     Ok(frame_rate)
 }
 
-async fn run_rife_pipeline(
+async fn run_model_pipeline(
     mut decoder_stdout: ChildStdout,
     mut encoder_stdin: ChildStdin,
-    runtime: Arc<ModelSidecarRuntime>,
-    width: u32,
-    height: u32,
-    frame_rate: f64,
+    config: ModelPipelineConfig,
 ) -> Result<(), String> {
+    let ModelPipelineConfig {
+        mut rife,
+        mut realesrgan,
+        state: pipeline_state,
+        width,
+        height,
+        frame_rate,
+    } = config;
+    // 即使 RIFE 运行中降级，编码器仍保持已启动的双倍帧率，后续帧必须重复补齐时间轴。
+    let maintain_doubled_cadence = rife.is_some();
+    let fallback_scale = realesrgan
+        .as_ref()
+        .map_or(1, |runtime| runtime.output_scale());
     let frame_size = usize::try_from(width)
         .ok()
         .and_then(|width| width.checked_mul(3))
@@ -1226,7 +1418,7 @@ async fn run_rife_pipeline(
                 .ok()
                 .and_then(|height| stride.checked_mul(height))
         })
-        .ok_or_else(|| "RIFE 视频帧大小溢出".to_owned())?;
+        .ok_or_else(|| "模型视频帧大小溢出".to_owned())?;
     let frame_interval = (1_000_000.0 / frame_rate).round() as i64;
     let (sender, mut receiver) = mpsc::channel::<RawVideoFrame>(RIFE_FRAME_QUEUE_CAPACITY);
     let reader = tokio::spawn(async move {
@@ -1257,29 +1449,193 @@ async fn run_rife_pipeline(
         return Err("FFmpeg 没有输出视频帧".to_owned());
     };
     while let Some(next) = receiver.recv().await {
+        let original = apply_model_enhancement(
+            &mut realesrgan,
+            previous.clone(),
+            fallback_scale,
+            &pipeline_state,
+        )
+        .await;
         encoder_stdin
-            .write_all(&previous.data)
+            .write_all(&original.data)
             .await
-            .map_err(|error| format!("写入 RIFE 原始帧失败：{error}"))?;
-        let middle = runtime.interpolate(previous.clone(), next.clone()).await?;
-        encoder_stdin
-            .write_all(&middle.data)
-            .await
-            .map_err(|error| format!("写入 RIFE 中间帧失败：{error}"))?;
+            .map_err(|error| format!("写入模型管线原始帧失败：{error}"))?;
+        if maintain_doubled_cadence {
+            let middle = if let Some(runtime) = rife.as_ref() {
+                match runtime.interpolate(previous.clone(), next.clone()).await {
+                    Ok(middle) => Some(
+                        apply_model_enhancement(
+                            &mut realesrgan,
+                            middle,
+                            fallback_scale,
+                            &pipeline_state,
+                        )
+                        .await,
+                    ),
+                    Err(reason) => {
+                        log::warn!("RIFE 运行中降级，继续双倍帧率原始时间轴 reason={reason}");
+                        rife = None;
+                        let mut state = pipeline_state.lock().await;
+                        state.actual_interpolation = PlayerFrameInterpolation::Off;
+                        state.rife_model_backend = None;
+                        state.degradation_reasons.push(reason);
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+            encoder_stdin
+                .write_all(middle.as_ref().map_or(&original.data, |frame| &frame.data))
+                .await
+                .map_err(|error| format!("写入模型管线补间帧失败：{error}"))?;
+        }
         previous = next;
     }
+    let last =
+        apply_model_enhancement(&mut realesrgan, previous, fallback_scale, &pipeline_state).await;
     encoder_stdin
-        .write_all(&previous.data)
+        .write_all(&last.data)
         .await
-        .map_err(|error| format!("写入 RIFE 最后一帧失败：{error}"))?;
+        .map_err(|error| format!("写入模型管线最后一帧失败：{error}"))?;
+    if maintain_doubled_cadence {
+        encoder_stdin
+            .write_all(&last.data)
+            .await
+            .map_err(|error| format!("写入模型管线尾部重复帧失败：{error}"))?;
+    }
     encoder_stdin
         .shutdown()
         .await
-        .map_err(|error| format!("关闭 RIFE 编码输入失败：{error}"))?;
+        .map_err(|error| format!("关闭模型管线编码输入失败：{error}"))?;
     reader
         .await
-        .map_err(|error| format!("读取 RIFE 帧任务失败：{error}"))??;
+        .map_err(|error| format!("读取模型帧任务失败：{error}"))??;
     Ok(())
+}
+
+fn model_backend_name(
+    rife_backend: Option<&str>,
+    realesrgan_backend: Option<&str>,
+) -> Option<String> {
+    match (rife_backend, realesrgan_backend) {
+        (Some(rife), Some(realesrgan)) => Some(format!("rife:{rife}+realesrgan:{realesrgan}")),
+        (Some(rife), None) => Some(format!("rife:{rife}")),
+        (None, Some(realesrgan)) => Some(format!("realesrgan:{realesrgan}")),
+        (None, None) => None,
+    }
+}
+
+async fn apply_model_enhancement(
+    runtime: &mut Option<Arc<ModelSidecarRuntime>>,
+    frame: RawVideoFrame,
+    fallback_scale: u32,
+    pipeline_state: &Arc<Mutex<ModelPipelineState>>,
+) -> RawVideoFrame {
+    let Some(enhancer) = runtime.as_ref() else {
+        return if fallback_scale == 1 {
+            frame
+        } else {
+            upscale_rgb24_nearest(frame, fallback_scale).unwrap_or_else(|(frame, error)| {
+                log::error!("Real-ESRGAN 降级帧缩放失败 error={error}");
+                frame
+            })
+        };
+    };
+    match enhancer.enhance(frame.clone()).await {
+        Ok(enhanced) => enhanced,
+        Err(reason) => {
+            log::warn!("Real-ESRGAN 运行中降级，继续固定输出尺寸 reason={reason}");
+            *runtime = None;
+            let mut state = pipeline_state.lock().await;
+            state.actual_video_enhancement = PlayerVideoEnhancement::Off;
+            state.realesrgan_model_backend = None;
+            state.degradation_reasons.push(reason);
+            drop(state);
+            upscale_rgb24_nearest(frame, fallback_scale).unwrap_or_else(|(frame, error)| {
+                log::error!("Real-ESRGAN 降级帧缩放失败 error={error}");
+                frame
+            })
+        }
+    }
+}
+
+fn upscale_rgb24_nearest(
+    frame: RawVideoFrame,
+    scale: u32,
+) -> Result<RawVideoFrame, (RawVideoFrame, String)> {
+    let Some(output_width) = frame.width.checked_mul(scale) else {
+        return Err((frame, "降级输出宽度溢出".to_owned()));
+    };
+    let Some(output_height) = frame.height.checked_mul(scale) else {
+        return Err((frame, "降级输出高度溢出".to_owned()));
+    };
+    let Some(output_stride) = output_width.checked_mul(3) else {
+        return Err((frame, "降级输出步长溢出".to_owned()));
+    };
+    let Some(output_len) = usize::try_from(output_stride).ok().and_then(|stride| {
+        usize::try_from(output_height)
+            .ok()
+            .and_then(|height| stride.checked_mul(height))
+    }) else {
+        return Err((frame, "降级输出帧大小溢出".to_owned()));
+    };
+    let scale_usize = scale as usize;
+    let input_stride = frame.stride as usize;
+    let output_stride_usize = output_stride as usize;
+    let mut data = vec![0_u8; output_len];
+    for output_y in 0..output_height as usize {
+        let input_y = output_y / scale_usize;
+        for output_x in 0..output_width as usize {
+            let input_x = output_x / scale_usize;
+            let input_offset = input_y * input_stride + input_x * 3;
+            let output_offset = output_y * output_stride_usize + output_x * 3;
+            data[output_offset..output_offset + 3]
+                .copy_from_slice(&frame.data[input_offset..input_offset + 3]);
+        }
+    }
+    Ok(RawVideoFrame {
+        width: output_width,
+        height: output_height,
+        stride: output_stride,
+        pts_micros: frame.pts_micros,
+        data,
+    })
+}
+
+fn model_pair_fits(
+    rife: EnhancementBudget,
+    realesrgan: EnhancementBudget,
+    available_vram_bytes: u64,
+) -> bool {
+    let required_vram_bytes = rife
+        .required_vram_bytes
+        .saturating_add(realesrgan.required_vram_bytes);
+    // 每个 RIFE 区间会增强原帧与中间帧，超分预算需要按两次推理计算。
+    let estimated_frame_time_ms =
+        rife.estimated_frame_time_ms + realesrgan.estimated_frame_time_ms * 2.0;
+    required_vram_bytes <= available_vram_bytes
+        && estimated_frame_time_ms
+            <= rife
+                .target_frame_time_ms
+                .min(realesrgan.target_frame_time_ms)
+}
+
+fn join_degradation_reasons(current: Option<String>, additional: Vec<String>) -> Option<String> {
+    let mut reasons = Vec::new();
+    let mut seen = HashSet::new();
+    for group in current.into_iter().chain(additional) {
+        for reason in group
+            .split('；')
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            if seen.insert(reason.to_owned()) {
+                reasons.push(reason.to_owned());
+            }
+        }
+    }
+    (!reasons.is_empty()).then(|| reasons.join("；"))
 }
 
 fn validate_remote_enhancement(
@@ -1349,6 +1705,7 @@ mod encoder_tests {
     use ani_contracts::{
         PlayerFrameInterpolation, PlayerVideoEnhancement, RemotePlaybackEnhancement,
     };
+    use ani_media::player::{EnhancementBudget, RawVideoFrame};
 
     #[test]
     fn selects_vendor_specific_video_options() {
@@ -1417,6 +1774,78 @@ mod encoder_tests {
         assert!(super::parse_frame_rate("0/1").is_err());
         assert!(super::parse_frame_rate("121/1").is_err());
         assert!(super::parse_frame_rate("nan/1").is_err());
+    }
+
+    #[test]
+    fn model_pair_requires_combined_frame_and_vram_budget() {
+        let rife = EnhancementBudget {
+            target_frame_time_ms: 33.0,
+            estimated_frame_time_ms: 16.0,
+            available_vram_bytes: 4_000,
+            required_vram_bytes: 2_000,
+        };
+        let realesrgan = EnhancementBudget {
+            target_frame_time_ms: 33.0,
+            estimated_frame_time_ms: 8.5,
+            available_vram_bytes: 4_000,
+            required_vram_bytes: 1_000,
+        };
+        assert!(super::model_pair_fits(rife, realesrgan, 4_000));
+        assert!(!super::model_pair_fits(rife, realesrgan, 2_999));
+        assert!(!super::model_pair_fits(
+            EnhancementBudget {
+                estimated_frame_time_ms: 17.1,
+                ..rife
+            },
+            realesrgan,
+            4_000
+        ));
+    }
+
+    #[test]
+    fn nearest_neighbor_fallback_preserves_rgb24_and_scale() {
+        let frame = RawVideoFrame {
+            width: 1,
+            height: 1,
+            stride: 3,
+            pts_micros: 7,
+            data: vec![10, 20, 30],
+        };
+        let output = super::upscale_rgb24_nearest(frame, 2).expect("upscale fallback");
+        assert_eq!(
+            (
+                output.width,
+                output.height,
+                output.stride,
+                output.pts_micros
+            ),
+            (2, 2, 6, 7)
+        );
+        assert_eq!(
+            output.data,
+            vec![10, 20, 30, 10, 20, 30, 10, 20, 30, 10, 20, 30]
+        );
+    }
+
+    #[test]
+    fn model_backend_names_active_models_and_degradation_reasons_are_unique() {
+        assert_eq!(
+            super::model_backend_name(Some("ncnn-vulkan"), Some("ncnn-vulkan")).as_deref(),
+            Some("rife:ncnn-vulkan+realesrgan:ncnn-vulkan")
+        );
+        assert_eq!(
+            super::model_backend_name(Some("ncnn-vulkan"), None).as_deref(),
+            Some("rife:ncnn-vulkan")
+        );
+        assert_eq!(super::model_backend_name(None, None), None);
+        assert_eq!(
+            super::join_degradation_reasons(
+                Some("RIFE 超时；显存不足".to_owned()),
+                vec!["RIFE 超时".to_owned(), "Real-ESRGAN 超时".to_owned()]
+            )
+            .as_deref(),
+            Some("RIFE 超时；显存不足；Real-ESRGAN 超时")
+        );
     }
 }
 
