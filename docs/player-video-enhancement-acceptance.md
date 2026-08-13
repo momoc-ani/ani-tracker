@@ -20,13 +20,24 @@ cargo clippy --workspace --all-targets -- -D warnings
 
 ## 2. 模型包验收
 
-每个 Real-CUGAN、Real-ESRGAN 或 RIFE 模型必须提供独立清单，至少包含模型标识、推理后端、权重 SHA-256、输入宽高、所需显存和预计单帧耗时。
+每个 Real-CUGAN、Real-ESRGAN 或 RIFE 模型必须提供独立清单，至少包含模型标识、推理后端、操作类型、输出倍率、权重 SHA-256、输入宽高、所需显存和预计单帧耗时。
+
+当前固定模型：
+
+| 模型 | 上游提交 | 后端/操作 | 资源摘要 |
+| --- | --- | --- | --- |
+| RIFE `rife-v4.6` | `a7532fc3f9f008cd6eecd6f2ffe2a9698e0cf7` | `ncnn-vulkan` / 插帧 / 1x | 以 `scripts/prepare-rife-model-sidecar.mjs` 清单为准 |
+| Real-ESRGAN `realesr-animevideov3-x2` | `37026f49824c5cf84062e7c6a5dd71445dcf610f` | `ncnn-vulkan` / 单帧增强 / 2x | `.bin` `548a36f9c3f4ab8da56cd3b13badf23968bee207b396dad14d04b830e5f2ab2d`；`.param` `b88ff4f00ebf019a7fdac17fdd45a7fd3665d37509efc5baf2e4da2e24420a04` |
+
+Real-ESRGAN 模型归档固定为 `v0.2.5.0/realesrgan-ncnn-vulkan-20220424-windows.zip`，大小 `45474481`，SHA-256 `abc02804e17982a3be33675e4d471e91ea374e65b70167abc09e31acb412802d`。
 
 - 启动前读取实际权重文件并比对 SHA-256，摘要不一致时能力保持关闭。
 - 显存或帧时间超过当前会话预算时，不创建推理会话。
 - 模型初始化失败只允许回退 Shader 或原画，不能中断基础播放。
-- 超分和插帧不得无条件同时满负载；降级顺序固定为插帧、模型超分、Shader。
+- 超分和插帧不得无条件同时满负载；远程组合预算按一次 RIFE 与两次 Real-ESRGAN 处理计算，超限时优先关闭 RIFE。
 - 字幕和 OSD 不得进入模型输入帧，必须在增强后合成。
+- RIFE 运行中失败后，每个源帧继续重复输出并补齐尾帧，维持编码器既定双倍帧率和原始时长。
+- Real-ESRGAN 运行中失败后，使用最近邻 2x 保持编码器固定输入尺寸，同时实际增强状态变为关闭。
 
 结果记录：模型版本、权重摘要、后端版本、GPU/驱动、输入分辨率、目标帧率、显存峰值、P50/P95 帧耗时、累计丢帧和实际降级原因。
 
@@ -59,13 +70,24 @@ cargo clippy --workspace --all-targets -- -D warnings
 
 - 分别在 NVIDIA、AMD、Intel 环境确认 NVENC、AMF、QSV 的实际编码器诊断。
 - 禁用全部硬件编码器后确认回退 `libx264`，且界面显示编码降级。
-- RIFE 远程管线接入后，`enhancedFrameInput` 必须在成功 warmup 和帧处理中为 `true`；sidecar 缺失、显存不足、超时或推理失败时必须记录 `degradationReason` 并回退原始 RGB 帧。Real-ESRGAN 未接入前不得把超分请求标记为模型成功。
-- 软字幕终端保持独立字幕轨；不支持软字幕的终端才允许烧录，并在诊断中标记模式。
+- RIFE 或 Real-ESRGAN 只有在摘要、预算、真实 Vulkan 握手和 warmup 通过后才能出现在 `modelBackend`；运行中失败后 2 秒内通过受认证会话状态读取更新 `degradationReason`、实际增强和插帧状态。
+- 请求 `clear` 时优先使用 Real-ESRGAN 2x；不可用时回退 FFmpeg 清晰滤镜。请求 `balanced` 时保持轻量 FFmpeg 滤镜。
+- 当前远程链固定软字幕并保持字幕不进入模型输入；终端能力探测和烧录字幕尚未完成，不得标记为已验收。
+- 普通 HLS 验收 NVENC/AMF/QSV/libx264；模型 rawvideo 链当前使用 libx264，硬件编码接入前不得记录跨厂商模型编码通过。
 - 播放中断网后恢复，确认会话、HLS 清单、播放位置和字幕状态可恢复。
 
 结果记录：输入管线、实际编码器、是否软件回退、字幕模式、输出分辨率/帧率/码率、首段耗时、重连耗时和失败原因。
 
-## 6. libVLC 移除门槛
+## 6. 证据状态规则
+
+- `implemented`：源码、单元/集成测试和静态门禁已通过，不代表真实硬件通过。
+- `release-runner`：同一候选 SHA 的正式 Release Runner 已完成构建、打包、真实 sidecar 握手和 warmup。
+- `device-passed`：指定系统、GPU、驱动和安装包完成持续播放及降级场景。
+- `stable-version`：正式版本完成全部适用矩阵；只有连续两个版本均为此状态才能删除桌面 libVLC。
+
+`scripts/player-enhancement-matrix.mjs` 只校验必须登记的目标和证据字段，不把任何目标自动标记为通过。
+
+## 7. libVLC 移除门槛
 
 桌面 libVLC 只能在连续两个正式版本完成全部适用真机矩阵后移除。两个版本都必须满足：
 
