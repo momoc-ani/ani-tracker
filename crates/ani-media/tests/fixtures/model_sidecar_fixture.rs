@@ -61,6 +61,32 @@ fn main() -> Result<(), String> {
                     frame,
                 )?;
             }
+            8 => {
+                let frame_bytes = frame_bytes(message.width, message.height, message.stride)?;
+                if message.payload.len() != frame_bytes {
+                    write_message(
+                        &mut output,
+                        6,
+                        message.request_id,
+                        0,
+                        0,
+                        0,
+                        0,
+                        b"invalid frame".to_vec(),
+                    )?;
+                    continue;
+                }
+                write_message(
+                    &mut output,
+                    5,
+                    message.request_id,
+                    message.width,
+                    message.height,
+                    message.stride,
+                    message.pts_micros,
+                    message.payload,
+                )?;
+            }
             7 => break,
             _ => {
                 write_message(

@@ -2,7 +2,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use ani_media::model_sidecar::{ModelSidecarConfig, ModelSidecarRuntime};
-use ani_media::player::{FrameInterpolator, RawVideoFrame};
+use ani_media::player::{FrameInterpolator, ModelEnhancer, RawVideoFrame};
 use sha2::{Digest, Sha256};
 
 #[tokio::test]
@@ -59,7 +59,7 @@ async fn launches_validated_sidecar_and_processes_continuous_rgb_frames() {
     let runtime = ModelSidecarRuntime::launch(config)
         .await
         .expect("launch validated sidecar");
-    assert!(runtime.ready());
+    assert!(FrameInterpolator::ready(&runtime));
 
     let previous = frame(10, 1_000);
     let next = frame(30, 3_000);
@@ -74,6 +74,13 @@ async fn launches_validated_sidecar_and_processes_continuous_rgb_frames() {
     assert_eq!(diagnostics.gpu_device, "fixture-vulkan-device");
     assert_eq!(diagnostics.processed_frames, 1);
     assert_eq!(diagnostics.dropped_frames, 0);
+    let enhanced = runtime
+        .enhance(frame(42, 4_000))
+        .await
+        .expect("enhance frame");
+    assert_eq!(enhanced.data, vec![42; 12]);
+    assert_eq!(enhanced.pts_micros, 4_000);
+    assert_eq!(runtime.diagnostics().await.processed_frames, 2);
     runtime.shutdown().await;
 }
 

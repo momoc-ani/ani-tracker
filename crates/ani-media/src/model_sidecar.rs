@@ -11,7 +11,7 @@ use tokio::sync::Mutex;
 
 use crate::player::{
     validate_model_manifest, EnhancementBudget, EnhancementModelManifest, FrameInterpolator,
-    RawVideoFrame,
+    ModelEnhancer, RawVideoFrame,
 };
 
 const SIDECAR_MANIFEST_NAME: &str = "manifest.json";
@@ -123,6 +123,7 @@ enum MessageKind {
     FrameResponse = 5,
     ErrorResponse = 6,
     ShutdownRequest = 7,
+    EnhanceRequest = 8,
 }
 
 #[derive(Debug)]
@@ -330,6 +331,48 @@ impl ModelSidecarRuntime {
         })
     }
 
+    async fn enhance_frame(&self, frame: RawVideoFrame) -> Result<RawVideoFrame, String> {
+        if !self.ready.load(Ordering::Acquire) {
+            return Err("模型 sidecar 已降级关闭".to_owned());
+        }
+        frame.validate(self.max_frame_bytes)?;
+        let request_id = self.request_sequence.fetch_add(1, Ordering::AcqRel) + 1;
+        let started = Instant::now();
+        let result = tokio::time::timeout(self.frame_timeout, async {
+            let mut connection = self.connection.lock().await;
+            write_frame(
+                &mut connection.stdin,
+                MessageKind::EnhanceRequest,
+                request_id,
+                &frame,
+            )
+            .await?;
+            read_message(&mut connection.stdout, self.max_frame_bytes).await
+        })
+        .await;
+        let response = match result {
+            Ok(Ok(response)) => response,
+            Ok(Err(error)) => return self.degrade(error).await,
+            Err(_) => return self.degrade("模型单帧处理超时".to_owned()).await,
+        };
+        if let Err(error) =
+            validate_frame_response(&response, request_id, &frame, self.max_frame_bytes)
+        {
+            return self.degrade(error).await;
+        }
+        let frame_time_ms = started.elapsed().as_secs_f64() * 1_000.0;
+        let mut diagnostics = self.diagnostics.lock().await;
+        diagnostics.last_frame_time_ms = Some(frame_time_ms);
+        diagnostics.processed_frames = diagnostics.processed_frames.saturating_add(1);
+        Ok(RawVideoFrame {
+            width: response.width,
+            height: response.height,
+            stride: response.stride,
+            pts_micros: frame.pts_micros,
+            data: response.payload,
+        })
+    }
+
     async fn degrade<T>(&self, reason: String) -> Result<T, String> {
         self.ready.store(false, Ordering::Release);
         let mut diagnostics = self.diagnostics.lock().await;
@@ -357,6 +400,25 @@ impl FrameInterpolator for ModelSidecarRuntime {
         next: RawVideoFrame,
     ) -> Result<RawVideoFrame, String> {
         self.interpolate_frame(previous, next).await
+    }
+}
+
+#[async_trait]
+impl ModelEnhancer for ModelSidecarRuntime {
+    fn backend_id(&self) -> &str {
+        &self.manifest.backend
+    }
+
+    fn ready(&self) -> bool {
+        self.ready.load(Ordering::Acquire)
+    }
+
+    fn budget(&self) -> EnhancementBudget {
+        self.budget
+    }
+
+    async fn enhance(&self, frame: RawVideoFrame) -> Result<RawVideoFrame, String> {
+        self.enhance_frame(frame).await
     }
 }
 
@@ -514,6 +576,27 @@ async fn write_frame_pair(
             stride: previous.stride,
             pts_micros: midpoint_pts(previous.pts_micros, next.pts_micros),
             payload,
+        },
+    )
+    .await
+}
+
+async fn write_frame(
+    writer: &mut ChildStdin,
+    kind: MessageKind,
+    request_id: u64,
+    frame: &RawVideoFrame,
+) -> Result<(), String> {
+    write_message(
+        writer,
+        &WireMessage {
+            kind,
+            request_id,
+            width: frame.width,
+            height: frame.height,
+            stride: frame.stride,
+            pts_micros: frame.pts_micros,
+            payload: frame.data.clone(),
         },
     )
     .await
