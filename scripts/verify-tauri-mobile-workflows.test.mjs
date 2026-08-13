@@ -167,6 +167,16 @@ test("三端正式发布使用专用令牌与 Node 24 Release Action", () => {
   }
 });
 
+test("三端同版本发布串行执行并在成功后覆盖资产", () => {
+  const releaseWorkflows = [androidRelease, iosRelease, desktopRelease];
+  for (const releaseWorkflow of releaseWorkflows) {
+    assert.match(releaseWorkflow, /concurrency:[\s\S]*?group: ani-release-\$\{\{ inputs\.release_version \|\| github\.ref_name \}\}[\s\S]*?cancel-in-progress: false/);
+    assert.match(releaseWorkflow, /overwrite_files: true/);
+    assert.match(releaseWorkflow, /fail_on_unmatched_files: true/);
+    assert.doesNotMatch(releaseWorkflow, /gh release delete|git push .*--delete|git tag -d|DELETE .*releases/);
+  }
+});
+
 test("iOS torrent-core 隔离设备与模拟器依赖并在构建前校验", () => {
   assert.match(iosTorrentScript, /printf '%s\/device' "\$\{dependency_root\}"/);
   assert.match(iosTorrentScript, /printf '%s\/simulator' "\$\{dependency_root\}"/);
