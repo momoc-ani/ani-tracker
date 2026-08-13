@@ -333,6 +333,7 @@ test("Tauri P5 播放器命令契约金样可被 TypeScript 接受", () => {
     loadCommand: PlayerCommand;
     rejectedResult: PlayerCommandResult;
     subtitleScaleCommand: PlayerCommand;
+    frameInterpolationCommand: PlayerCommand;
     androidCapabilities: PlayerCapabilities;
     iosCapabilities: PlayerCapabilities;
     playbackSession: RemotePlaybackSession;
@@ -347,6 +348,10 @@ test("Tauri P5 播放器命令契约金样可被 TypeScript 接受", () => {
   assert.equal(fixture.payload.loadCommand.source.subtitles[0].type, "ass");
   assert.equal(fixture.payload.rejectedResult.accepted, false);
   assert.equal(fixture.payload.subtitleScaleCommand.type, "set-subtitle-scale");
+  assert.equal(fixture.payload.frameInterpolationCommand.type, "set-frame-interpolation");
+  if (fixture.payload.frameInterpolationCommand.type === "set-frame-interpolation") {
+    assert.equal(fixture.payload.frameInterpolationCommand.frameInterpolation, "rife-realtime");
+  }
   assert.equal(fixture.payload.androidCapabilities.platform, "android");
   assert.equal(fixture.payload.iosCapabilities.platform, "ios");
   assert.equal(fixture.payload.iosCapabilities.supportsTranscodingFallback, false);

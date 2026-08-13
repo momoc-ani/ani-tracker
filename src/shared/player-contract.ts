@@ -4,6 +4,21 @@ export type PlayerBackend = "artplayer" | "libvlc" | "mpv";
 /** GPU 视频增强预设；字幕和 OSD 在增强后合成。 */
 export type PlayerVideoEnhancement = "off" | "balanced" | "clear";
 
+/** 基于模型的实时补帧模式；当前仅在真实模型运行时可用时展示。 */
+export type PlayerFrameInterpolation = "off" | "rife-realtime";
+
+/** 增强链路的诊断快照，便于区分 Shader、模型和降级状态。 */
+export interface PlayerEnhancementDiagnostics {
+  pipeline: string;
+  gpuVendor?: string;
+  renderer?: string;
+  decoder?: string;
+  modelBackend?: string;
+  frameTimeMs?: number;
+  droppedFrames: number;
+  degradationReason?: string;
+}
+
 /** 播放器宿主平台。 */
 export type PlayerHostPlatform = "remote-web" | "tauri-desktop" | "android" | "ios";
 
@@ -85,6 +100,8 @@ export interface PlayerCapabilities {
   supportsSubtitleTracks: boolean;
   supportsSubtitleScale: boolean;
   supportsVideoEnhancement: boolean;
+  supportsFrameInterpolation: boolean;
+  supportsModelEnhancement: boolean;
   supportsAspectRatio: boolean;
   supportsFullscreen: boolean;
   supportsPictureInPicture: boolean;
@@ -162,6 +179,7 @@ export type PlayerCommand =
   | (PlayerCommandBase & { type: "select-subtitle-track"; trackId?: string })
   | (PlayerCommandBase & { type: "set-subtitle-scale"; subtitleScale: PlayerSubtitleScale })
   | (PlayerCommandBase & { type: "set-video-enhancement"; videoEnhancement: PlayerVideoEnhancement })
+  | (PlayerCommandBase & { type: "set-frame-interpolation"; frameInterpolation: PlayerFrameInterpolation })
   | (PlayerCommandBase & { type: "set-aspect-ratio"; aspectRatio: PlayerAspectRatio; value?: string })
   | (PlayerCommandBase & { type: "set-fullscreen"; fullscreen: boolean })
   | (PlayerCommandBase & { type: "set-picture-in-picture"; enabled: boolean })
@@ -196,6 +214,8 @@ export interface PlayerSnapshot {
   subtitleScale: PlayerSubtitleScale;
   videoEnhancement: PlayerVideoEnhancement;
   videoEnhancementDegraded: boolean;
+  frameInterpolation: PlayerFrameInterpolation;
+  enhancementDiagnostics: PlayerEnhancementDiagnostics;
   aspectRatio: PlayerAspectRatio;
   fullscreen: boolean;
   pictureInPicture: boolean;
@@ -227,6 +247,8 @@ export function createUnavailablePlayerCapabilities(
     supportsSubtitleTracks: false,
     supportsSubtitleScale: false,
     supportsVideoEnhancement: false,
+    supportsFrameInterpolation: false,
+    supportsModelEnhancement: false,
     supportsAspectRatio: false,
     supportsFullscreen: false,
     supportsPictureInPicture: false,
@@ -273,6 +295,11 @@ export function createInitialPlayerSnapshot(input: InitialPlayerSnapshotInput): 
     subtitleScale: 100,
     videoEnhancement: "off",
     videoEnhancementDegraded: false,
+    frameInterpolation: "off",
+    enhancementDiagnostics: {
+      pipeline: "none",
+      droppedFrames: 0
+    },
     aspectRatio: "default",
     fullscreen: false,
     pictureInPicture: false
@@ -291,7 +318,39 @@ export function acceptPlayerSnapshot(
   if (current?.sessionId === incoming.sessionId && incoming.sequence <= current.sequence) {
     return current;
   }
-  return incoming;
+  const legacyPayload = incoming as unknown as {
+    capabilities?: Partial<PlayerCapabilities>;
+    enhancementDiagnostics?: Partial<PlayerEnhancementDiagnostics>;
+    frameInterpolation?: PlayerFrameInterpolation;
+    videoEnhancement?: PlayerVideoEnhancement;
+    videoEnhancementDegraded?: boolean;
+  };
+  const diagnostics = legacyPayload.enhancementDiagnostics;
+  const needsNormalization = legacyPayload.capabilities?.supportsFrameInterpolation === undefined
+    || legacyPayload.capabilities?.supportsModelEnhancement === undefined
+    || legacyPayload.videoEnhancement === undefined
+    || legacyPayload.videoEnhancementDegraded === undefined
+    || legacyPayload.frameInterpolation === undefined
+    || diagnostics?.pipeline === undefined
+    || diagnostics?.droppedFrames === undefined;
+  if (!needsNormalization) return incoming;
+  // 允许旧版原生后端缺少终版增强字段，避免控制层读取 undefined。
+  return {
+    ...incoming,
+    capabilities: {
+      ...incoming.capabilities,
+      supportsFrameInterpolation: legacyPayload.capabilities?.supportsFrameInterpolation ?? false,
+      supportsModelEnhancement: legacyPayload.capabilities?.supportsModelEnhancement ?? false
+    },
+    videoEnhancement: incoming.videoEnhancement ?? "off",
+    videoEnhancementDegraded: incoming.videoEnhancementDegraded ?? false,
+    frameInterpolation: incoming.frameInterpolation ?? "off",
+    enhancementDiagnostics: {
+      ...(diagnostics ?? {}),
+      pipeline: diagnostics?.pipeline ?? "none",
+      droppedFrames: diagnostics?.droppedFrames ?? 0
+    }
+  };
 }
 
 /** 构造后端不支持命令时的统一拒绝结果。 */

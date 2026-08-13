@@ -42,6 +42,12 @@
       "sessionId": "session-contract-1",
       "subtitleScale": 150
     },
+    "frameInterpolationCommand": {
+      "type": "set-frame-interpolation",
+      "commandId": "command-contract-4",
+      "sessionId": "session-contract-1",
+      "frameInterpolation": "rife-realtime"
+    },
     "androidCapabilities": {
       "backend": "libvlc",
       "platform": "android",
@@ -53,6 +59,9 @@
       "supportsAudioTracks": true,
       "supportsSubtitleTracks": true,
       "supportsSubtitleScale": true,
+      "supportsVideoEnhancement": false,
+      "supportsFrameInterpolation": false,
+      "supportsModelEnhancement": false,
       "supportsAspectRatio": true,
       "supportsFullscreen": true,
       "supportsPictureInPicture": false,
@@ -72,6 +81,9 @@
       "supportsAudioTracks": true,
       "supportsSubtitleTracks": true,
       "supportsSubtitleScale": true,
+      "supportsVideoEnhancement": false,
+      "supportsFrameInterpolation": false,
+      "supportsModelEnhancement": false,
       "supportsAspectRatio": true,
       "supportsFullscreen": true,
       "supportsPictureInPicture": false,

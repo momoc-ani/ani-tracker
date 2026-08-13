@@ -154,6 +154,8 @@ final class AniPlayerPlugin: Plugin, UIAdaptivePresentationControllerDelegate {
             setFullscreen((command["fullscreen"] as? Bool) == true)
         case "set-picture-in-picture":
             return Self.rejected(commandID, code: "unsupported", message: "iOS 画中画尚未启用")
+        case "set-frame-interpolation":
+            return Self.rejected(commandID, code: "unsupported", message: "iOS 播放器暂不支持模型补帧")
         case "previous-item": controller.previousEpisode()
         case "next-item": controller.nextEpisode()
         case "retry": controller.retry()
@@ -295,6 +297,10 @@ final class AniPlayerPlugin: Plugin, UIAdaptivePresentationControllerDelegate {
             "audioTracks": Self.trackPayload(snapshot.audioTracks, kind: "audio"),
             "subtitleTracks": Self.trackPayload(snapshot.subtitleTracks, kind: "subtitle"),
             "subtitleScale": snapshot.subtitleScale,
+            "videoEnhancement": "off",
+            "videoEnhancementDegraded": false,
+            "frameInterpolation": "off",
+            "enhancementDiagnostics": ["pipeline": "libvlc", "droppedFrames": 0],
             "aspectRatio": Self.aspectRatioValue(snapshot.aspectRatio),
             "fullscreen": Self.isLandscape,
             "pictureInPicture": false
@@ -395,6 +401,9 @@ final class AniPlayerPlugin: Plugin, UIAdaptivePresentationControllerDelegate {
             "supportsAudioTracks": true,
             "supportsSubtitleTracks": true,
             "supportsSubtitleScale": true,
+            "supportsVideoEnhancement": false,
+            "supportsFrameInterpolation": false,
+            "supportsModelEnhancement": false,
             "supportsAspectRatio": true,
             "supportsFullscreen": true,
             "supportsPictureInPicture": false,

@@ -18,6 +18,9 @@
       "supportsAudioTracks": true,
       "supportsSubtitleTracks": true,
       "supportsSubtitleScale": true,
+      "supportsVideoEnhancement": false,
+      "supportsFrameInterpolation": false,
+      "supportsModelEnhancement": false,
       "supportsAspectRatio": true,
       "supportsFullscreen": true,
       "supportsPictureInPicture": false,
@@ -89,6 +92,13 @@
       }
     ],
     "subtitleScale": 150,
+    "videoEnhancement": "off",
+    "videoEnhancementDegraded": false,
+    "frameInterpolation": "off",
+    "enhancementDiagnostics": {
+      "pipeline": "none",
+      "droppedFrames": 0
+    },
     "aspectRatio": "default",
     "fullscreen": false,
     "pictureInPicture": false

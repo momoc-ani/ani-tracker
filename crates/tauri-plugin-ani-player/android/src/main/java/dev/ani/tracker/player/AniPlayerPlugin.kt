@@ -167,6 +167,9 @@ class AniPlayerPlugin(private val activity: Activity) : Plugin(activity) {
         if (command.optString("type") == "set-picture-in-picture") {
             return rejected(commandId, "unsupported", "Android 画中画尚未启用")
         }
+        if (command.optString("type") == "set-frame-interpolation") {
+            return rejected(commandId, "unsupported", "Android 播放器暂不支持模型补帧")
+        }
         val accepted = NativePlayerBridge.dispatch(command).getOrThrow()
         if (!accepted) return rejected(commandId, "unsupported", "当前播放器不支持该命令")
         if (command.optString("type") == "close") {
@@ -216,6 +219,13 @@ class AniPlayerPlugin(private val activity: Activity) : Plugin(activity) {
             put("audioTracks", normalizeTracks(raw.optJSONArray("audioTracks"), "audio"))
             put("subtitleTracks", normalizeTracks(raw.optJSONArray("subtitleTracks"), "subtitle"))
             put("subtitleScale", raw.optInt("subtitleScale", 100))
+            put("videoEnhancement", "off")
+            put("videoEnhancementDegraded", false)
+            put("frameInterpolation", "off")
+            put("enhancementDiagnostics", JSONObject().apply {
+                put("pipeline", "libvlc")
+                put("droppedFrames", 0)
+            })
             val aspectRatio = raw.opt("aspectRatio")
                 ?.takeUnless { it == JSONObject.NULL }
                 ?.toString()
@@ -247,6 +257,9 @@ class AniPlayerPlugin(private val activity: Activity) : Plugin(activity) {
         put("supportsAudioTracks", true)
         put("supportsSubtitleTracks", true)
         put("supportsSubtitleScale", true)
+        put("supportsVideoEnhancement", false)
+        put("supportsFrameInterpolation", false)
+        put("supportsModelEnhancement", false)
         put("supportsAspectRatio", true)
         put("supportsFullscreen", true)
         put("supportsPictureInPicture", false)

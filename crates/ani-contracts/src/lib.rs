@@ -299,6 +299,37 @@ pub enum PlayerVideoEnhancement {
     Clear,
 }
 
+/// 基于模型的实时补帧模式；只有完成模型运行时接入后才可用。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum PlayerFrameInterpolation {
+    #[default]
+    Off,
+    RifeRealtime,
+}
+
+/// 当前增强链路的可观测信息，不代表模型一定已加载。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct PlayerEnhancementDiagnostics {
+    #[serde(default)]
+    pub pipeline: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gpu_vendor: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub renderer: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decoder: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_backend: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frame_time_ms: Option<f64>,
+    #[serde(default)]
+    pub dropped_frames: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub degradation_reason: Option<String>,
+}
+
 /// 播放器所在的平台宿主。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -400,6 +431,10 @@ pub struct PlayerCapabilities {
     pub supports_subtitle_scale: bool,
     #[serde(default)]
     pub supports_video_enhancement: bool,
+    #[serde(default)]
+    pub supports_frame_interpolation: bool,
+    #[serde(default)]
+    pub supports_model_enhancement: bool,
     pub supports_aspect_ratio: bool,
     pub supports_fullscreen: bool,
     pub supports_picture_in_picture: bool,
@@ -556,6 +591,9 @@ pub enum PlayerCommandAction {
     SetVideoEnhancement {
         video_enhancement: PlayerVideoEnhancement,
     },
+    SetFrameInterpolation {
+        frame_interpolation: PlayerFrameInterpolation,
+    },
     SetAspectRatio {
         aspect_ratio: PlayerAspectRatio,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -588,6 +626,7 @@ impl PlayerCommand {
             PlayerCommandAction::SelectSubtitleTrack { .. } => "select-subtitle-track",
             PlayerCommandAction::SetSubtitleScale { .. } => "set-subtitle-scale",
             PlayerCommandAction::SetVideoEnhancement { .. } => "set-video-enhancement",
+            PlayerCommandAction::SetFrameInterpolation { .. } => "set-frame-interpolation",
             PlayerCommandAction::SetAspectRatio { .. } => "set-aspect-ratio",
             PlayerCommandAction::SetFullscreen { .. } => "set-fullscreen",
             PlayerCommandAction::SetPictureInPicture { .. } => "set-picture-in-picture",
@@ -636,6 +675,10 @@ pub struct PlayerSnapshot {
     pub video_enhancement: PlayerVideoEnhancement,
     #[serde(default)]
     pub video_enhancement_degraded: bool,
+    #[serde(default)]
+    pub frame_interpolation: PlayerFrameInterpolation,
+    #[serde(default)]
+    pub enhancement_diagnostics: PlayerEnhancementDiagnostics,
     pub aspect_ratio: PlayerAspectRatio,
     pub fullscreen: bool,
     pub picture_in_picture: bool,

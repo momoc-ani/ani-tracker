@@ -21,6 +21,8 @@ const capabilities: PlayerCapabilities = {
   supportsSubtitleTracks: true,
   supportsSubtitleScale: true,
   supportsVideoEnhancement: true,
+  supportsFrameInterpolation: false,
+  supportsModelEnhancement: false,
   supportsAspectRatio: true,
   supportsFullscreen: true,
   supportsPictureInPicture: false,
@@ -39,6 +41,8 @@ test("createInitialPlayerSnapshot 创建稳定的空闲状态", () => {
   assert.equal(snapshot.volume, 1);
   assert.equal(snapshot.subtitleScale, 100);
   assert.equal(snapshot.videoEnhancement, "off");
+  assert.equal(snapshot.frameInterpolation, "off");
+  assert.equal(snapshot.enhancementDiagnostics.pipeline, "none");
   assert.deepEqual(snapshot.playlist.items, []);
 });
 
@@ -50,6 +54,8 @@ test("createUnavailablePlayerCapabilities 默认关闭所有原生能力", () =>
   assert.equal(unavailable.supportsDirectPlayback, false);
   assert.equal(unavailable.supportsSubtitleScale, false);
   assert.equal(unavailable.supportsVideoEnhancement, false);
+  assert.equal(unavailable.supportsFrameInterpolation, false);
+  assert.equal(unavailable.supportsModelEnhancement, false);
   assert.deepEqual(unavailable.playbackRates, [1]);
   assert.equal(unavailable.unavailableReason, "运行时缺失");
 });
@@ -63,6 +69,23 @@ test("acceptPlayerSnapshot 丢弃旧会话和乱序事件", () => {
   assert.equal(acceptPlayerSnapshot("session-a", current, stale), current);
   assert.equal(acceptPlayerSnapshot("session-a", current, oldSession), current);
   assert.equal(acceptPlayerSnapshot("session-a", current, next), next);
+});
+
+test("acceptPlayerSnapshot 为旧原生快照补齐增强字段", () => {
+  const legacy = createInitialPlayerSnapshot({ sessionId: "session-a", capabilities });
+  const payload = { ...legacy, sequence: 1 } as Record<string, unknown>;
+  delete payload.frameInterpolation;
+  delete payload.enhancementDiagnostics;
+  const legacyCapabilities = { ...(payload.capabilities as Record<string, unknown>) };
+  delete legacyCapabilities.supportsFrameInterpolation;
+  delete legacyCapabilities.supportsModelEnhancement;
+  payload.capabilities = legacyCapabilities;
+
+  const accepted = acceptPlayerSnapshot("session-a", undefined, payload as unknown as typeof legacy);
+  assert.equal(accepted?.frameInterpolation, "off");
+  assert.deepEqual(accepted?.enhancementDiagnostics, { pipeline: "none", droppedFrames: 0 });
+  assert.equal(accepted?.capabilities.supportsFrameInterpolation, false);
+  assert.equal(accepted?.capabilities.supportsModelEnhancement, false);
 });
 
 test("isPlaybackCompleted 在 90% 边界或自然结束时判定完成", () => {

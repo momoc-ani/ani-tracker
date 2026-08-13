@@ -180,6 +180,7 @@ pub fn validate_command(command: &PlayerCommand) -> Option<PlayerError> {
             }
         }
         PlayerCommandAction::SetVideoEnhancement { .. } => {}
+        PlayerCommandAction::SetFrameInterpolation { .. } => {}
         PlayerCommandAction::SetAspectRatio {
             aspect_ratio: ani_contracts::PlayerAspectRatio::Custom,
             value,
@@ -375,6 +376,8 @@ mod tests {
             supports_subtitle_tracks: true,
             supports_subtitle_scale: true,
             supports_video_enhancement: true,
+            supports_frame_interpolation: false,
+            supports_model_enhancement: false,
             supports_aspect_ratio: true,
             supports_fullscreen: true,
             supports_picture_in_picture: false,
