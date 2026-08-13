@@ -305,6 +305,8 @@ pub enum PlayerVideoEnhancement {
 pub enum PlayerFrameInterpolation {
     #[default]
     Off,
+    DisplayResample,
+    MotionCompensated,
     RifeRealtime,
 }
 
@@ -864,6 +866,20 @@ pub struct RemotePlaybackDiagnostics {
     pub subtitle_mode: Option<String>,
     #[serde(default)]
     pub enhanced_frame_input: bool,
+    #[serde(default)]
+    pub video_enhancement: PlayerVideoEnhancement,
+    #[serde(default)]
+    pub frame_interpolation: PlayerFrameInterpolation,
+}
+
+/// 远程转码实际请求的像素处理链；直传模式必须保持关闭。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemotePlaybackEnhancement {
+    #[serde(default)]
+    pub video_enhancement: PlayerVideoEnhancement,
+    #[serde(default)]
+    pub frame_interpolation: PlayerFrameInterpolation,
 }
 
 /// 远程设备的短期受控播放会话，不暴露本地路径。

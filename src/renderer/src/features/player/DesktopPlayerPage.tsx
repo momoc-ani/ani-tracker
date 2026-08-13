@@ -21,6 +21,7 @@ import {
   type PlayerCapabilities,
   type PlayerCommand,
   type PlayerFrameInterpolation,
+  type PlayerHdrMode,
   type PlayerSnapshot,
   type PlayerSubtitleScale,
   type PlayerVideoEnhancement
@@ -271,7 +272,8 @@ function DesktopVlcControls({
       void desktopPlaybackSessionClient.create(
         activeItem.task.id,
         "direct",
-        activeItem.fileIndex
+        activeItem.fileIndex,
+        { videoEnhancement: "off", frameInterpolation: "off" }
       ).then(async (result) => {
         createdSession = result;
         if (!active) {
@@ -467,6 +469,13 @@ function DesktopVlcControls({
     });
     if (command) void dispatchCommand(command);
   };
+  const changeHdr = (value: PlayerHdrMode): void => {
+    const command = createCommand<Extract<PlayerCommand, { type: "set-hdr" }>>({
+      type: "set-hdr",
+      hdr: value
+    });
+    if (command) void dispatchCommand(command);
+  };
   const toggleFullscreen = (): void => {
     const command = createCommand<Extract<PlayerCommand, { type: "set-fullscreen" }>>({
       type: "set-fullscreen",
@@ -585,6 +594,7 @@ function DesktopVlcControls({
           onChangeSubtitleScale={changeSubtitleScale}
           onChangeVideoEnhancement={changeVideoEnhancement}
           onChangeFrameInterpolation={changeFrameInterpolation}
+          onChangeHdr={changeHdr}
           onClose={() => closeAfterFlush(onClose)}
           onGoNext={() => nextItem && selectItemAfterFlush(nextItem)}
           onGoPrevious={() => previousItem && selectItemAfterFlush(previousItem)}
@@ -610,6 +620,8 @@ function DesktopVlcControls({
           videoEnhancementDegraded={snapshot?.videoEnhancementDegraded ?? false}
           frameInterpolation={snapshot?.frameInterpolation ?? "off"}
           frameInterpolationAvailable={capabilities?.supportsFrameInterpolation ?? false}
+          hdr={snapshot?.hdr ?? "off"}
+          hdrAvailable={capabilities?.supportsHdr ?? false}
           subtitles={subtitleOptions}
           visible={toolbarVisible}
           volume={snapshot?.volume ?? 0.7}

@@ -53,6 +53,7 @@ import {
   PLAYER_SUBTITLE_SCALES,
   type PlayerAspectRatio,
   type PlayerFrameInterpolation,
+  type PlayerHdrMode,
   type PlayerSubtitleScale,
   type PlayerVideoEnhancement
 } from "@shared/player-contract";
@@ -83,6 +84,7 @@ interface PlayerChromeProps {
   onChangeSubtitleScale: (subtitleScale: PlayerSubtitleScale) => void;
   onChangeVideoEnhancement?: (videoEnhancement: PlayerVideoEnhancement) => void;
   onChangeFrameInterpolation?: (frameInterpolation: PlayerFrameInterpolation) => void;
+  onChangeHdr?: (hdr: PlayerHdrMode) => void;
   onClose: () => void;
   onGoNext: () => void;
   onGoPrevious: () => void;
@@ -109,6 +111,9 @@ interface PlayerChromeProps {
   videoEnhancementDegraded?: boolean;
   frameInterpolation?: PlayerFrameInterpolation;
   frameInterpolationAvailable?: boolean;
+  frameInterpolationModes?: PlayerFrameInterpolation[];
+  hdr?: PlayerHdrMode;
+  hdrAvailable?: boolean;
   subtitles: RemotePlaybackSubtitle[];
   visible: boolean;
   volume: number;
@@ -258,6 +263,7 @@ function PlayerBottomBar(
           <AspectRatioMenu {...props} />
           <VideoEnhancementMenu {...props} />
           <FrameInterpolationMenu {...props} />
+          <HdrMenu {...props} />
           {props.mode && props.onChangeMode && <PlaybackModeMenu {...props} mode={props.mode} onChangeMode={props.onChangeMode} />}
           {props.pictureInPictureAvailable !== false && (
             <PlayerIconButton aria-pressed={props.pictureInPicture} label="画中画" onClick={props.onTogglePictureInPicture}>
@@ -436,9 +442,10 @@ function VideoEnhancementMenu(props: PlayerChromeProps) {
   );
 }
 
-/** 仅在实际模型运行时声明可用时提供补帧入口。 */
+/** 仅展示后端真实声明可用的刷新率平滑；模型模式由模型运行时另行开放。 */
 function FrameInterpolationMenu(props: PlayerChromeProps) {
   if (!props.frameInterpolationAvailable || !props.onChangeFrameInterpolation) return null;
+  const modes = props.frameInterpolationModes ?? ["display-resample"];
   return (
     <DropdownMenu>
       <DropdownMenuTrigger asChild>
@@ -451,7 +458,27 @@ function FrameInterpolationMenu(props: PlayerChromeProps) {
           value={props.frameInterpolation ?? "off"}
         >
           <DropdownMenuRadioItem value="off">关闭</DropdownMenuRadioItem>
-          <DropdownMenuRadioItem value="rife-realtime">RIFE 实时</DropdownMenuRadioItem>
+          {modes.map((mode) => (
+            <DropdownMenuRadioItem key={mode} value={mode}>{frameInterpolationLabel(mode)}</DropdownMenuRadioItem>
+          ))}
+        </DropdownMenuRadioGroup>
+      </DropdownMenuContent>
+    </DropdownMenu>
+  );
+}
+
+function HdrMenu(props: PlayerChromeProps) {
+  if (!props.hdrAvailable || !props.onChangeHdr) return null;
+  return (
+    <DropdownMenu>
+      <DropdownMenuTrigger asChild>
+        <Button aria-label="HDR 输出" className="player-wide-control" size="icon" variant="media"><MonitorPlay /></Button>
+      </DropdownMenuTrigger>
+      <DropdownMenuContent align="end">
+        <DropdownMenuLabel>HDR 输出</DropdownMenuLabel>
+        <DropdownMenuRadioGroup onValueChange={(value) => props.onChangeHdr?.(value as PlayerHdrMode)} value={props.hdr ?? "off"}>
+          <DropdownMenuRadioItem value="off">SDR</DropdownMenuRadioItem>
+          <DropdownMenuRadioItem value="auto">HDR 自动</DropdownMenuRadioItem>
         </DropdownMenuRadioGroup>
       </DropdownMenuContent>
     </DropdownMenu>
@@ -516,6 +543,7 @@ function PlayerSettingsSheet(
   props: PlayerChromeProps & { open: boolean; onOpenChange: (open: boolean) => void }
 ) {
   const onChangeMode = props.onChangeMode;
+  const frameInterpolationModes = props.frameInterpolationModes ?? ["display-resample"];
   return (
     <Sheet open={props.open} onOpenChange={props.onOpenChange}>
       <SheetContent className="max-h-[78svh] overflow-y-auto p-0" data-player-sheet side="bottom">
@@ -561,7 +589,24 @@ function PlayerSettingsSheet(
                 variant="outline"
               >
                 <ToggleGroupItem value="off">关闭</ToggleGroupItem>
-                <ToggleGroupItem value="rife-realtime">RIFE 实时</ToggleGroupItem>
+                {frameInterpolationModes.map((mode) => (
+                  <ToggleGroupItem key={mode} value={mode}>{frameInterpolationLabel(mode)}</ToggleGroupItem>
+                ))}
+              </ToggleGroup>
+            </div>
+          )}
+          {props.hdrAvailable && props.onChangeHdr && (
+            <div className="flex flex-col gap-2">
+              <h3 className="text-sm font-medium">HDR 输出</h3>
+              <ToggleGroup
+                className="justify-start"
+                onValueChange={(value) => value && props.onChangeHdr?.(value as PlayerHdrMode)}
+                type="single"
+                value={props.hdr ?? "off"}
+                variant="outline"
+              >
+                <ToggleGroupItem value="off">SDR</ToggleGroupItem>
+                <ToggleGroupItem value="auto">HDR 自动</ToggleGroupItem>
               </ToggleGroup>
             </div>
           )}
@@ -615,6 +660,13 @@ function PlayerSettingsSheet(
       </SheetContent>
     </Sheet>
   );
+}
+
+function frameInterpolationLabel(mode: PlayerFrameInterpolation): string {
+  if (mode === "display-resample") return "刷新率平滑";
+  if (mode === "motion-compensated") return "运动补偿 60 FPS";
+  if (mode === "rife-realtime") return "RIFE 实时";
+  return "关闭";
 }
 
 /** 用旋转方向和秒数共同表达十秒快退或快进。 */

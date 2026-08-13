@@ -5,8 +5,9 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use ani_contracts::{
     PlayerAspectRatio, PlayerAvailability, PlayerBackend, PlayerCapabilities, PlayerCommand,
     PlayerCommandAction, PlayerCommandResult, PlayerError, PlayerErrorCode,
-    PlayerFrameInterpolation, PlayerHostPlatform, PlayerMediaSource, PlayerRecoveryAction,
-    PlayerSnapshot, PlayerStatus, PlayerTrack, PlayerTrackKind, PlayerVideoEnhancement,
+    PlayerFrameInterpolation, PlayerHdrCapabilities, PlayerHdrMode, PlayerHostPlatform,
+    PlayerMediaSource, PlayerRecoveryAction, PlayerSnapshot, PlayerStatus, PlayerTrack,
+    PlayerTrackKind, PlayerVideoEnhancement,
 };
 use ani_media::player::{unsupported, PlayerTransport, PlayerTransportError};
 use async_trait::async_trait;
@@ -286,18 +287,28 @@ impl MpvRuntime {
                 return Ok(unsupported(&command_id, "播放列表切换由页面会话管理"));
             }
             PlayerCommandAction::SetFrameInterpolation {
-                frame_interpolation,
-            } if *frame_interpolation != PlayerFrameInterpolation::Off => {
+                frame_interpolation:
+                    PlayerFrameInterpolation::MotionCompensated | PlayerFrameInterpolation::RifeRealtime,
+            } => {
                 return Ok(unsupported(
                     &command_id,
-                    "当前桌面版本尚未加载 RIFE 模型运行时，无法启用实时补帧",
+                    "当前桌面 libmpv 仅支持刷新率平滑；运动估计和 RIFE 需要独立帧处理后端",
                 ));
             }
-            PlayerCommandAction::SetHdr { hdr } if *hdr != ani_contracts::PlayerHdrMode::Off => {
-                return Ok(unsupported(
-                    &command_id,
-                    "当前桌面版本尚未完成 HDR 源、显示器和输出探测",
-                ));
+            PlayerCommandAction::SetHdr { hdr } if *hdr != PlayerHdrMode::Off => {
+                let state = self.lock_state()?;
+                let available = state.snapshot.as_ref().is_some_and(|snapshot| {
+                    snapshot
+                        .enhancement_diagnostics
+                        .hdr_capabilities
+                        .available()
+                });
+                if !available {
+                    return Ok(unsupported(
+                        &command_id,
+                        "当前媒体、gpu-next 渲染器或显示输出未形成完整 HDR 链路",
+                    ));
+                }
             }
             _ => self.dispatch_media_command(&command)?,
         }
@@ -373,12 +384,17 @@ impl MpvRuntime {
             PlayerCommandAction::SetFrameInterpolation {
                 frame_interpolation,
             } => {
+                self.apply_frame_interpolation(*frame_interpolation)?;
                 state.frame_interpolation = *frame_interpolation;
+                state.enhancement_degraded = false;
+                state.drop_score = 0;
                 if let Some(snapshot) = state.snapshot.as_mut() {
                     snapshot.frame_interpolation = *frame_interpolation;
+                    snapshot.enhancement_diagnostics.degradation_reason = None;
                 }
             }
             PlayerCommandAction::SetHdr { hdr } => {
+                self.apply_hdr(*hdr)?;
                 if let Some(snapshot) = state.snapshot.as_mut() {
                     snapshot.hdr = *hdr;
                 }
@@ -438,6 +454,7 @@ impl MpvRuntime {
             &format!("{:.2}", f64::from(state.subtitle_scale) / 100.0),
         )?;
         self.apply_enhancement(state.enhancement)?;
+        self.apply_frame_interpolation(state.frame_interpolation)?;
         state.sequence = next_media_sequence(
             state.active_session_id.as_deref(),
             state.snapshot.is_some(),
@@ -501,6 +518,42 @@ impl MpvRuntime {
         Ok(())
     }
 
+    /// 使用 libmpv 的显示刷新率重采样平滑播放，不冒充模型运动补帧。
+    fn apply_frame_interpolation(
+        &self,
+        interpolation: PlayerFrameInterpolation,
+    ) -> Result<(), PlayerTransportError> {
+        match interpolation {
+            PlayerFrameInterpolation::Off => {
+                self.set_property("interpolation", "no")?;
+                self.set_property("video-sync", "audio")
+            }
+            PlayerFrameInterpolation::DisplayResample => {
+                self.set_property("video-sync", "display-resample")?;
+                self.set_property("interpolation", "yes")?;
+                self.set_property("tscale", "oversample")
+            }
+            PlayerFrameInterpolation::MotionCompensated
+            | PlayerFrameInterpolation::RifeRealtime => Err(PlayerTransportError::Unavailable(
+                "当前 libmpv 运行时不提供该插帧后端".to_owned(),
+            )),
+        }
+    }
+
+    /// 仅在已探测的 HDR 链路上启用 gpu-next swapchain 色彩提示。
+    fn apply_hdr(&self, hdr: PlayerHdrMode) -> Result<(), PlayerTransportError> {
+        match hdr {
+            PlayerHdrMode::Off => {
+                self.set_property("target-colorspace-hint-mode", "target")?;
+                self.set_property("target-colorspace-hint", "auto")
+            }
+            PlayerHdrMode::Auto => {
+                self.set_property("target-colorspace-hint-mode", "source")?;
+                self.set_property("target-colorspace-hint", "auto")
+            }
+        }
+    }
+
     fn refresh_snapshot_locked(
         &self,
         state: &mut MpvRuntimeState,
@@ -557,6 +610,15 @@ impl MpvRuntime {
         snapshot.playback_rate = self.property_f64("speed").unwrap_or(1.0);
         snapshot.audio_tracks = self.read_tracks(PlayerTrackKind::Audio);
         snapshot.subtitle_tracks = self.read_tracks(PlayerTrackKind::Subtitle);
+        let hdr_capabilities = self.read_hdr_capabilities();
+        snapshot.enhancement_diagnostics.hdr_capabilities = hdr_capabilities;
+        snapshot.capabilities.supports_hdr = hdr_capabilities.available();
+        if snapshot.hdr != PlayerHdrMode::Off && !hdr_capabilities.available() {
+            self.apply_hdr(PlayerHdrMode::Off)?;
+            snapshot.hdr = PlayerHdrMode::Off;
+            snapshot.enhancement_diagnostics.degradation_reason =
+                Some("HDR 输出链路已变化，自动恢复 SDR".to_owned());
+        }
         snapshot.enhancement_diagnostics.dropped_frames = self
             .property_u64("frame-drop-count")
             .unwrap_or(snapshot.enhancement_diagnostics.dropped_frames);
@@ -565,6 +627,24 @@ impl MpvRuntime {
         snapshot.sequence = state.sequence;
         state.snapshot = Some(snapshot);
         Ok(())
+    }
+
+    fn read_hdr_capabilities(&self) -> PlayerHdrCapabilities {
+        let source_hdr = self
+            .property_string("video-params/gamma")
+            .is_some_and(|gamma| is_hdr_transfer(&gamma));
+        let renderer_hdr = self
+            .property_string("current-vo")
+            .is_some_and(|renderer| renderer == "gpu-next");
+        let display_hdr = platform_hdr_output_supported()
+            && self
+                .property_string("video-target-params/gamma")
+                .is_some_and(|gamma| is_hdr_transfer(&gamma));
+        PlayerHdrCapabilities {
+            source_hdr,
+            renderer_hdr,
+            display_hdr,
+        }
     }
 
     /// 非阻塞消费 libmpv 事件，识别异步首帧/解码失败。
@@ -601,7 +681,9 @@ impl MpvRuntime {
         state: &mut MpvRuntimeState,
         snapshot: &mut PlayerSnapshot,
     ) -> Result<(), PlayerTransportError> {
-        if state.enhancement == PlayerVideoEnhancement::Off {
+        if state.enhancement == PlayerVideoEnhancement::Off
+            && state.frame_interpolation == PlayerFrameInterpolation::Off
+        {
             return Ok(());
         }
         let dropped = self
@@ -615,6 +697,21 @@ impl MpvRuntime {
             state.drop_score.saturating_sub(1)
         };
         if state.drop_score < DROP_SCORE_THRESHOLD {
+            return Ok(());
+        }
+        if state.frame_interpolation != PlayerFrameInterpolation::Off {
+            self.apply_frame_interpolation(PlayerFrameInterpolation::Off)?;
+            log::warn!(
+                "libmpv 检测到持续掉帧，自动关闭插帧 from={:?} dropped={dropped}",
+                state.frame_interpolation
+            );
+            state.frame_interpolation = PlayerFrameInterpolation::Off;
+            state.enhancement_degraded = true;
+            state.drop_score = 0;
+            snapshot.frame_interpolation = PlayerFrameInterpolation::Off;
+            snapshot.video_enhancement_degraded = true;
+            snapshot.enhancement_diagnostics.degradation_reason =
+                Some("持续掉帧，已关闭插帧".to_owned());
             return Ok(());
         }
         let next = match state.enhancement {
@@ -1071,6 +1168,15 @@ fn yes_no(value: bool) -> &'static str {
     }
 }
 
+fn is_hdr_transfer(value: &str) -> bool {
+    matches!(value.trim().to_ascii_lowercase().as_str(), "pq" | "hlg")
+}
+
+/// libmpv 当前仅明确支持 D3D11/WinVK/Wayland 的 swapchain colorspace hint。
+fn platform_hdr_output_supported() -> bool {
+    cfg!(target_os = "windows")
+}
+
 fn buffered_seconds(position: f64, cache_duration: f64, duration: f64) -> f64 {
     (position.max(0.0) + cache_duration.max(0.0)).min(duration.max(position))
 }
@@ -1101,7 +1207,7 @@ fn mpv_capabilities(shaders_available: bool) -> PlayerCapabilities {
         supports_subtitle_tracks: true,
         supports_subtitle_scale: true,
         supports_video_enhancement: shaders_available,
-        supports_frame_interpolation: false,
+        supports_frame_interpolation: true,
         supports_model_enhancement: false,
         supports_aspect_ratio: true,
         supports_fullscreen: true,
@@ -1271,6 +1377,14 @@ mod tests {
         let capabilities = mpv_capabilities(true);
         assert!(!capabilities.supports_hdr);
         assert!(!capabilities.supports_model_enhancement);
-        assert!(!capabilities.supports_frame_interpolation);
+        assert!(capabilities.supports_frame_interpolation);
+    }
+
+    #[test]
+    fn recognizes_only_pq_and_hlg_as_hdr_transfers() {
+        assert!(is_hdr_transfer("pq"));
+        assert!(is_hdr_transfer("HLG"));
+        assert!(!is_hdr_transfer("bt.1886"));
+        assert!(!is_hdr_transfer("srgb"));
     }
 }

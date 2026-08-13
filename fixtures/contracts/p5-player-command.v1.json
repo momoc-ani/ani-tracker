@@ -112,7 +112,9 @@
       "diagnostics": {
         "encoderDegraded": false,
         "subtitleMode": "soft",
-        "enhancedFrameInput": false
+        "enhancedFrameInput": false,
+        "videoEnhancement": "off",
+        "frameInterpolation": "off"
       }
     }
   }

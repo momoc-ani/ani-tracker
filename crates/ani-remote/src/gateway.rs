@@ -4,7 +4,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use ani_contracts::{RemoteCertificateInfo, RemoteGatewayStatus, RemotePairingChallenge};
+use ani_contracts::{
+    RemoteCertificateInfo, RemoteGatewayStatus, RemotePairingChallenge, RemotePlaybackEnhancement,
+};
 use axum::body::{to_bytes, Body};
 use axum::extract::{ConnectInfo, Request, State};
 use axum::http::header::{
@@ -537,11 +539,23 @@ async fn handle_request(
         let body: MediaSessionBody = parse_body(request).await?;
         let session = if path.ends_with("external-sessions") {
             core.media
-                .create_external_session(&body.task_id, &device.id, &body.mode, body.file_index)
+                .create_external_session(
+                    &body.task_id,
+                    &device.id,
+                    &body.mode,
+                    body.file_index,
+                    body.enhancement,
+                )
                 .await
         } else {
             core.media
-                .create_session(&body.task_id, &device.id, &body.mode, body.file_index)
+                .create_session(
+                    &body.task_id,
+                    &device.id,
+                    &body.mode,
+                    body.file_index,
+                    body.enhancement,
+                )
                 .await
         }
         .map_err(GatewayHttpError::from_media)?;
@@ -1065,6 +1079,8 @@ struct MediaSessionBody {
     mode: String,
     #[serde(default)]
     file_index: Option<i64>,
+    #[serde(default)]
+    enhancement: RemotePlaybackEnhancement,
 }
 
 struct BrowserMediaRoute {
@@ -1647,6 +1663,41 @@ mod tests {
         let paired: Value =
             serde_json::from_str(&paired.text().await.expect("pair body")).expect("pair response");
         let token = paired["token"].as_str().expect("access token");
+
+        let rejected_enhancement = client
+            .post(format!("{base_url}/api/media/sessions"))
+            .bearer_auth(token)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(
+                json!({
+                    "taskId": "task-1",
+                    "mode": "direct",
+                    "fileIndex": 0,
+                    "enhancement": {
+                        "videoEnhancement": "clear",
+                        "frameInterpolation": "off"
+                    }
+                })
+                .to_string(),
+            )
+            .send()
+            .await
+            .expect("invalid direct enhancement request");
+        assert_eq!(
+            rejected_enhancement.status(),
+            reqwest::StatusCode::BAD_REQUEST
+        );
+        let rejected_enhancement: Value = serde_json::from_str(
+            &rejected_enhancement
+                .text()
+                .await
+                .expect("invalid direct enhancement body"),
+        )
+        .expect("invalid direct enhancement response");
+        assert_eq!(
+            rejected_enhancement["code"],
+            "MEDIA_ENHANCEMENT_REQUIRES_TRANSCODE"
+        );
 
         let rpc_response = client
             .post(format!("{base_url}/api/rpc"))

@@ -4,7 +4,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use ani_contracts::{RemotePlaybackDiagnostics, RemotePlaybackSession, RemotePlaybackSubtitle};
+use ani_contracts::{
+    PlayerFrameInterpolation, PlayerVideoEnhancement, RemotePlaybackDiagnostics,
+    RemotePlaybackEnhancement, RemotePlaybackSession, RemotePlaybackSubtitle,
+};
 use ani_domain::{AppSettings, DownloadTask, MediaFile, PlaybackCheckpoint};
 use async_trait::async_trait;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -157,12 +160,14 @@ impl RemoteMediaSessionService {
         device_id: &str,
         requested_mode: &str,
         file_index: Option<i64>,
+        enhancement: RemotePlaybackEnhancement,
     ) -> Result<RemotePlaybackSession, RemoteMediaError> {
         self.create_session_record(
             task_id,
             device_id,
             requested_mode,
             file_index,
+            enhancement,
             SessionAccess::Browser,
         )
         .await
@@ -175,12 +180,14 @@ impl RemoteMediaSessionService {
         device_id: &str,
         requested_mode: &str,
         file_index: Option<i64>,
+        enhancement: RemotePlaybackEnhancement,
     ) -> Result<RemotePlaybackSession, RemoteMediaError> {
         self.create_session_record(
             task_id,
             device_id,
             requested_mode,
             file_index,
+            enhancement,
             SessionAccess::External,
         )
         .await
@@ -192,6 +199,7 @@ impl RemoteMediaSessionService {
         device_id: &str,
         requested_mode: &str,
         file_index: Option<i64>,
+        enhancement: RemotePlaybackEnhancement,
         access: SessionAccess,
     ) -> Result<RemotePlaybackSession, RemoteMediaError> {
         if !matches!(requested_mode, "direct" | "transcode") {
@@ -208,6 +216,7 @@ impl RemoteMediaSessionService {
                 "媒体文件标识无效",
             ));
         }
+        validate_remote_enhancement(requested_mode, enhancement)?;
         self.cleanup_expired().await;
         let task = self
             .repository
@@ -248,12 +257,15 @@ impl RemoteMediaSessionService {
         let mut process = None;
         let mut diagnostics = RemotePlaybackDiagnostics {
             subtitle_mode: Some("soft".to_owned()),
-            enhanced_frame_input: false,
+            enhanced_frame_input: enhancement.video_enhancement != PlayerVideoEnhancement::Off
+                || enhancement.frame_interpolation != PlayerFrameInterpolation::Off,
+            video_enhancement: enhancement.video_enhancement,
+            frame_interpolation: enhancement.frame_interpolation,
             ..Default::default()
         };
         if mode == "hls" {
             let (child, encoder, degraded) = self
-                .start_hls(&media.path, &temporary_directory)
+                .start_hls(&media.path, &temporary_directory, enhancement)
                 .await
                 .inspect_err(|_| {
                     let _ = std::fs::remove_dir_all(&temporary_directory);
@@ -771,6 +783,7 @@ impl RemoteMediaSessionService {
         &self,
         source_path: &Path,
         output_directory: &Path,
+        enhancement: RemotePlaybackEnhancement,
     ) -> Result<(Child, &'static str, bool), RemoteMediaError> {
         let playlist = output_directory.join("index.m3u8");
         let segments = output_directory.join("segment-%06d.ts");
@@ -783,6 +796,7 @@ impl RemoteMediaSessionService {
                 .arg(source_path)
                 .args(["-map", "0:v:0", "-map", "0:a:0?", "-c:v"])
                 .args(encoder_video_args(codec))
+                .args(remote_video_filter_args(enhancement))
                 .args([
                     "-pix_fmt",
                     "yuv420p",
@@ -837,6 +851,55 @@ impl RemoteMediaSessionService {
     }
 }
 
+fn validate_remote_enhancement(
+    requested_mode: &str,
+    enhancement: RemotePlaybackEnhancement,
+) -> Result<(), RemoteMediaError> {
+    let enabled = enhancement.video_enhancement != PlayerVideoEnhancement::Off
+        || enhancement.frame_interpolation != PlayerFrameInterpolation::Off;
+    if requested_mode != "transcode" && enabled {
+        return Err(RemoteMediaError::new(
+            400,
+            "MEDIA_ENHANCEMENT_REQUIRES_TRANSCODE",
+            "远程画质增强和插帧只能在实时转码模式使用",
+        ));
+    }
+    if matches!(
+        enhancement.frame_interpolation,
+        PlayerFrameInterpolation::DisplayResample | PlayerFrameInterpolation::RifeRealtime
+    ) {
+        return Err(RemoteMediaError::new(
+            400,
+            "MEDIA_INTERPOLATION_UNAVAILABLE",
+            "远程转码仅支持运动估计插帧；RIFE 模型运行时尚未就绪",
+        ));
+    }
+    Ok(())
+}
+
+fn remote_video_filter_args(enhancement: RemotePlaybackEnhancement) -> Vec<String> {
+    let mut filters = Vec::new();
+    match enhancement.video_enhancement {
+        PlayerVideoEnhancement::Off => {}
+        PlayerVideoEnhancement::Balanced => {
+            filters.push("hqdn3d=1.2:1.2:4:4");
+            filters.push("unsharp=5:5:0.45:5:5:0");
+        }
+        PlayerVideoEnhancement::Clear => {
+            filters.push("hqdn3d=0.8:0.8:3:3");
+            filters.push("unsharp=7:7:0.75:5:5:0");
+        }
+    }
+    if enhancement.frame_interpolation == PlayerFrameInterpolation::MotionCompensated {
+        filters.push("minterpolate=fps=60:mi_mode=mci:mc_mode=aobmc:me_mode=bidir:vsbmc=1");
+    }
+    if filters.is_empty() {
+        Vec::new()
+    } else {
+        vec!["-vf".to_owned(), filters.join(",")]
+    }
+}
+
 /// 返回各编码器合法的视频参数，避免把 libx264 参数误传给硬件编码器。
 fn encoder_video_args(codec: &str) -> &'static [&'static str] {
     match codec {
@@ -851,7 +914,13 @@ fn encoder_video_args(codec: &str) -> &'static [&'static str] {
 
 #[cfg(test)]
 mod encoder_tests {
-    use super::{encoder_video_args, ENCODER_CANDIDATES};
+    use super::{
+        encoder_video_args, remote_video_filter_args, validate_remote_enhancement,
+        ENCODER_CANDIDATES,
+    };
+    use ani_contracts::{
+        PlayerFrameInterpolation, PlayerVideoEnhancement, RemotePlaybackEnhancement,
+    };
 
     #[test]
     fn selects_vendor_specific_video_options() {
@@ -873,6 +942,37 @@ mod encoder_tests {
                 ("libx264", "libx264"),
             ]
         );
+    }
+
+    #[test]
+    fn builds_actual_remote_enhancement_filter_chain() {
+        let args = remote_video_filter_args(RemotePlaybackEnhancement {
+            video_enhancement: PlayerVideoEnhancement::Clear,
+            frame_interpolation: PlayerFrameInterpolation::MotionCompensated,
+        });
+        assert_eq!(args[0], "-vf");
+        assert!(args[1].contains("unsharp=7:7"));
+        assert!(args[1].contains("minterpolate=fps=60"));
+    }
+
+    #[test]
+    fn rejects_enhancement_for_direct_and_unready_rife() {
+        assert!(validate_remote_enhancement(
+            "direct",
+            RemotePlaybackEnhancement {
+                video_enhancement: PlayerVideoEnhancement::Balanced,
+                ..Default::default()
+            }
+        )
+        .is_err());
+        assert!(validate_remote_enhancement(
+            "transcode",
+            RemotePlaybackEnhancement {
+                frame_interpolation: PlayerFrameInterpolation::RifeRealtime,
+                ..Default::default()
+            }
+        )
+        .is_err());
     }
 }
 

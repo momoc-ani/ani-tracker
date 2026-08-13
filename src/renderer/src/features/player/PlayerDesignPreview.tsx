@@ -201,7 +201,9 @@ const previewSession: RemotePlaybackSession = {
     encoder: "libx264",
     encoderDegraded: true,
     subtitleMode: "soft",
-    enhancedFrameInput: false
+    enhancedFrameInput: false,
+    videoEnhancement: "off",
+    frameInterpolation: "off"
   }
 };
 

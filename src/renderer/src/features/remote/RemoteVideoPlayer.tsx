@@ -28,6 +28,7 @@ import {
 } from "@/lib/api";
 import { cn } from "@/lib/cn";
 import type {
+  RemotePlaybackEnhancement,
   RemotePlaybackRequestMode,
   RemotePlaybackSession
 } from "@shared/contracts";
@@ -35,8 +36,10 @@ import type { Anime, DownloadTask, Episode } from "@shared/domain";
 import type {
   PlayerAspectRatio,
   PlayerCommand,
+  PlayerFrameInterpolation,
   PlayerSnapshot,
-  PlayerSubtitleScale
+  PlayerSubtitleScale,
+  PlayerVideoEnhancement
 } from "@shared/player-contract";
 import { resolvePlayerShortcut } from "@shared/player-shortcuts";
 import { readStoredSubtitleScale, storeSubtitleScale } from "@/features/player/subtitle-scale";
@@ -52,7 +55,10 @@ import {
   type RemotePlaylistItem
 } from "@/features/player/playback-list-model";
 import {
+  DEFAULT_REMOTE_PLAYBACK_ENHANCEMENT,
+  readRemotePlaybackEnhancement,
   readRemotePlaybackMode,
+  storeRemotePlaybackEnhancement,
   storeRemotePlaybackMode
 } from "@/features/player/remote-playback-preferences";
 
@@ -108,6 +114,7 @@ export function RemoteVideoPlayer({
   const [subtitleScale, setSubtitleScale] = useState<PlayerSubtitleScale>(readStoredSubtitleScale);
   const subtitleScaleRef = useRef(subtitleScale);
   const [requestedMode, setRequestedMode] = useState<RemotePlaybackRequestMode>(readRemotePlaybackMode);
+  const [enhancement, setEnhancement] = useState<RemotePlaybackEnhancement>(readRemotePlaybackEnhancement);
   const [session, setSession] = useState<RemotePlaybackSession | null>(null);
   const [playbackError, setPlaybackError] = useState<string | null>(null);
   const [retryNonce, setRetryNonce] = useState(0);
@@ -148,6 +155,10 @@ export function RemoteVideoPlayer({
   const pictureInPicture = playerSnapshot?.pictureInPicture ?? false;
   const animeTitle = anime?.title ?? activeItem?.task.animeTitle ?? "Ani Tracker";
   const episodeLabel = activeItem ? playlistItemLabel(activeItem) : "当前视频";
+  const sessionEnhancement = useMemo<RemotePlaybackEnhancement>(
+    () => requestedMode === "transcode" ? enhancement : DEFAULT_REMOTE_PLAYBACK_ENHANCEMENT,
+    [enhancement, requestedMode]
+  );
   const episodeItems = useMemo(() => buildPlayerEpisodeItems({
     activeItem,
     currentTimeSeconds,
@@ -240,9 +251,10 @@ export function RemoteVideoPlayer({
       console.info("[remote] 正在创建播放会话", {
         taskId: activeItem.task.id,
         fileIndex: activeItem.fileIndex,
-        requestedMode
+        requestedMode,
+        enhancement: sessionEnhancement
       });
-      void sessionClient.create(activeItem.task.id, requestedMode, activeItem.fileIndex)
+      void sessionClient.create(activeItem.task.id, requestedMode, activeItem.fileIndex, sessionEnhancement)
         .then((result) => {
           createdSession = result;
           if (!active) return sessionClient.close(result.id);
@@ -269,7 +281,7 @@ export function RemoteVideoPlayer({
       active = false;
       if (createdSession) void sessionClient.close(createdSession.id);
     };
-  }, [activeItem, requestedMode, retryNonce, sessionClient]);
+  }, [activeItem, requestedMode, retryNonce, sessionClient, sessionEnhancement]);
 
   /** 原文件发生媒体错误时仅自动升级一次实时转码。 */
   const startAutomaticTranscode = useCallback((): void => {
@@ -358,6 +370,20 @@ export function RemoteVideoPlayer({
     });
   };
 
+  /** 更新 FFmpeg 画质滤镜；依赖项变化会关闭旧会话并创建新转码会话。 */
+  const handleVideoEnhancementChange = (value: PlayerVideoEnhancement): void => {
+    const next = { ...enhancement, videoEnhancement: value };
+    setEnhancement(next);
+    storeRemotePlaybackEnhancement(next);
+  };
+
+  /** 更新远程运动估计插帧；RIFE 在真实 sidecar 就绪前不提供入口。 */
+  const handleFrameInterpolationChange = (value: PlayerFrameInterpolation): void => {
+    const next = { ...enhancement, frameInterpolation: value };
+    setEnhancement(next);
+    storeRemotePlaybackEnhancement(next);
+  };
+
   /** 为当前远程媒体会话构造并发送统一播放器命令。 */
   const dispatchPlayerCommand = useCallback(async (command: PlayerCommand): Promise<boolean> => {
     const adapter = playerAdapterRef.current;
@@ -396,7 +422,8 @@ export function RemoteVideoPlayer({
       externalSession = await createRemoteExternalPlaybackSession(
         activeItem.task.id,
         requestedMode,
-        activeItem.fileIndex
+        activeItem.fileIndex,
+        sessionEnhancement
       );
       const mediaUrl = new URL(externalSession.streamUrl, window.location.origin).toString();
       window.location.assign(buildExternalPlayerProtocolUrl(externalPlayer.kind, mediaUrl));
@@ -611,6 +638,8 @@ export function RemoteVideoPlayer({
     session?.mode === "hls" ? "实时转码" : session ? "原文件直传" : undefined,
     session?.diagnostics?.encoder ? `编码 ${session.diagnostics.encoder}` : undefined,
     session?.diagnostics?.encoderDegraded ? "编码器已降级" : undefined,
+    session?.diagnostics?.videoEnhancement !== "off" ? "画质增强" : undefined,
+    session?.diagnostics?.frameInterpolation === "motion-compensated" ? "60 FPS 运动补偿" : undefined,
     session ? `${session.subtitles.length} 条字幕` : undefined,
     activeItem?.task.resolution?.toUpperCase()
   ].filter((value): value is string => Boolean(value));
@@ -685,8 +714,10 @@ export function RemoteVideoPlayer({
           onActivity={revealToolbar}
           onChangeMode={handleModeChange}
           onChangeRate={setPlayerRate}
+          onChangeFrameInterpolation={requestedMode === "transcode" ? handleFrameInterpolationChange : undefined}
           onChangeSubtitle={changeSubtitle}
           onChangeSubtitleScale={changeSubtitleScale}
+          onChangeVideoEnhancement={requestedMode === "transcode" ? handleVideoEnhancementChange : undefined}
           onClose={() => closeAfterFlush(onClose)}
           onGoNext={() => nextItem && selectItemAfterFlush(nextItem)}
           onGoPrevious={() => previousItem && selectItemAfterFlush(previousItem)}
@@ -703,11 +734,16 @@ export function RemoteVideoPlayer({
           pictureInPicture={pictureInPicture}
           playbackRate={playbackRate}
           playing={playing}
+          frameInterpolation={sessionEnhancement.frameInterpolation}
+          frameInterpolationAvailable={requestedMode === "transcode"}
+          frameInterpolationModes={["motion-compensated"]}
           selectedSubtitleId={selectedSubtitleId}
           statusBadges={statusBadges}
           subtitleScale={subtitleScale}
           subtitleScaleAvailable={playerSnapshot?.capabilities.supportsSubtitleScale ?? true}
           subtitles={session?.subtitles ?? []}
+          videoEnhancement={sessionEnhancement.videoEnhancement}
+          videoEnhancementAvailable={requestedMode === "transcode"}
           visible={toolbarVisible}
           volume={volume}
         />

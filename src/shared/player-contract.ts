@@ -4,8 +4,8 @@ export type PlayerBackend = "artplayer" | "libvlc" | "mpv";
 /** GPU 视频增强预设；字幕和 OSD 在增强后合成。 */
 export type PlayerVideoEnhancement = "off" | "balanced" | "clear";
 
-/** 基于模型的实时补帧模式；当前仅在真实模型运行时可用时展示。 */
-export type PlayerFrameInterpolation = "off" | "rife-realtime";
+/** 插帧模式；RIFE 仅在真实模型运行时可用时展示。 */
+export type PlayerFrameInterpolation = "off" | "display-resample" | "motion-compensated" | "rife-realtime";
 
 /** HDR 输出模式；当前仅在真实显示链路探测通过时可用。 */
 export type PlayerHdrMode = "off" | "auto";

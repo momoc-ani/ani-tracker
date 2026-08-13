@@ -650,6 +650,11 @@ export type RemotePlaybackMode = "direct" | "hls";
 
 export type RemotePlaybackRequestMode = "direct" | "transcode";
 
+export interface RemotePlaybackEnhancement {
+  videoEnhancement: import("./player-contract").PlayerVideoEnhancement;
+  frameInterpolation: import("./player-contract").PlayerFrameInterpolation;
+}
+
 export interface DesktopPlayerWindowInput {
   taskId: string;
   fileIndex?: number;
@@ -694,6 +699,8 @@ export interface RemotePlaybackDiagnostics {
   encoderDegraded: boolean;
   subtitleMode?: "soft" | "burned";
   enhancedFrameInput: boolean;
+  videoEnhancement: import("./player-contract").PlayerVideoEnhancement;
+  frameInterpolation: import("./player-contract").PlayerFrameInterpolation;
 }
 
 export interface RemotePlaybackSession {
