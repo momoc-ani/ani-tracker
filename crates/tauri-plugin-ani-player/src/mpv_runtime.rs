@@ -293,6 +293,12 @@ impl MpvRuntime {
                     "当前桌面版本尚未加载 RIFE 模型运行时，无法启用实时补帧",
                 ));
             }
+            PlayerCommandAction::SetHdr { hdr } if *hdr != ani_contracts::PlayerHdrMode::Off => {
+                return Ok(unsupported(
+                    &command_id,
+                    "当前桌面版本尚未完成 HDR 源、显示器和输出探测",
+                ));
+            }
             _ => self.dispatch_media_command(&command)?,
         }
         Ok(accepted(command_id))
@@ -370,6 +376,11 @@ impl MpvRuntime {
                 state.frame_interpolation = *frame_interpolation;
                 if let Some(snapshot) = state.snapshot.as_mut() {
                     snapshot.frame_interpolation = *frame_interpolation;
+                }
+            }
+            PlayerCommandAction::SetHdr { hdr } => {
+                if let Some(snapshot) = state.snapshot.as_mut() {
+                    snapshot.hdr = *hdr;
                 }
             }
             PlayerCommandAction::SetAspectRatio {
@@ -1160,6 +1171,7 @@ fn initial_snapshot(
         video_enhancement,
         video_enhancement_degraded: false,
         frame_interpolation,
+        hdr: ani_contracts::PlayerHdrMode::Off,
         enhancement_diagnostics: ani_contracts::PlayerEnhancementDiagnostics {
             pipeline,
             renderer: Some("gpu-next".to_owned()),
@@ -1252,5 +1264,13 @@ mod tests {
     fn advances_same_session_snapshot_sequence() {
         assert_eq!(next_media_sequence(Some("a"), true, "a", 4), 5);
         assert_eq!(next_media_sequence(Some("a"), true, "b", 4), 1);
+    }
+
+    #[test]
+    fn keeps_hdr_disabled_until_full_output_chain_is_probed() {
+        let capabilities = mpv_capabilities(true);
+        assert!(!capabilities.supports_hdr);
+        assert!(!capabilities.supports_model_enhancement);
+        assert!(!capabilities.supports_frame_interpolation);
     }
 }

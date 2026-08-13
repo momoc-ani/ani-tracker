@@ -308,6 +308,34 @@ pub enum PlayerFrameInterpolation {
     RifeRealtime,
 }
 
+/// HDR 输出模式；Auto 只有在源、渲染器和显示器能力齐全时才允许开启。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum PlayerHdrMode {
+    #[default]
+    Off,
+    Auto,
+}
+
+/// HDR 自动输出所需的三项独立能力；三者同时满足前不得声明 HDR 可用。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct PlayerHdrCapabilities {
+    #[serde(default)]
+    pub source_hdr: bool,
+    #[serde(default)]
+    pub renderer_hdr: bool,
+    #[serde(default)]
+    pub display_hdr: bool,
+}
+
+impl PlayerHdrCapabilities {
+    /// 返回源、渲染器和显示器是否形成完整 HDR 输出链路。
+    pub fn available(self) -> bool {
+        self.source_hdr && self.renderer_hdr && self.display_hdr
+    }
+}
+
 /// 当前增强链路的可观测信息，不代表模型一定已加载。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
@@ -328,6 +356,8 @@ pub struct PlayerEnhancementDiagnostics {
     pub dropped_frames: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub degradation_reason: Option<String>,
+    #[serde(default)]
+    pub hdr_capabilities: PlayerHdrCapabilities,
 }
 
 /// 播放器所在的平台宿主。
@@ -594,6 +624,9 @@ pub enum PlayerCommandAction {
     SetFrameInterpolation {
         frame_interpolation: PlayerFrameInterpolation,
     },
+    SetHdr {
+        hdr: PlayerHdrMode,
+    },
     SetAspectRatio {
         aspect_ratio: PlayerAspectRatio,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -627,6 +660,7 @@ impl PlayerCommand {
             PlayerCommandAction::SetSubtitleScale { .. } => "set-subtitle-scale",
             PlayerCommandAction::SetVideoEnhancement { .. } => "set-video-enhancement",
             PlayerCommandAction::SetFrameInterpolation { .. } => "set-frame-interpolation",
+            PlayerCommandAction::SetHdr { .. } => "set-hdr",
             PlayerCommandAction::SetAspectRatio { .. } => "set-aspect-ratio",
             PlayerCommandAction::SetFullscreen { .. } => "set-fullscreen",
             PlayerCommandAction::SetPictureInPicture { .. } => "set-picture-in-picture",
@@ -677,6 +711,8 @@ pub struct PlayerSnapshot {
     pub video_enhancement_degraded: bool,
     #[serde(default)]
     pub frame_interpolation: PlayerFrameInterpolation,
+    #[serde(default)]
+    pub hdr: PlayerHdrMode,
     #[serde(default)]
     pub enhancement_diagnostics: PlayerEnhancementDiagnostics,
     pub aspect_ratio: PlayerAspectRatio,
@@ -816,6 +852,20 @@ pub struct RemotePlaybackSubtitle {
     pub default: bool,
 }
 
+/// 远程增强输出的实际编码诊断，不代表请求一定使用了硬件编码。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemotePlaybackDiagnostics {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encoder: Option<String>,
+    #[serde(default)]
+    pub encoder_degraded: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subtitle_mode: Option<String>,
+    #[serde(default)]
+    pub enhanced_frame_input: bool,
+}
+
 /// 远程设备的短期受控播放会话，不暴露本地路径。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -833,6 +883,8 @@ pub struct RemotePlaybackSession {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub start_position_seconds: Option<f64>,
     pub subtitles: Vec<RemotePlaybackSubtitle>,
+    #[serde(default)]
+    pub diagnostics: RemotePlaybackDiagnostics,
 }
 
 #[cfg(test)]
@@ -843,10 +895,26 @@ mod tests {
         ContractFixture, DesktopMediaToolsStatus, DownloadServiceMode, DownloadServiceState,
         DownloadServiceStatus, EmbeddedTorrentCoreStatus, ImageCacheResolveResult, PlaybackSession,
         PlayerCommand, PlayerCommandAction, PlayerCommandResult, PlayerDetectionResult,
-        PlayerHostPlatform, PlayerSnapshot, PlayerStatus, QbittorrentManagedStatus,
-        RemoteGatewayStatus, RemotePairingChallenge, RemotePlaybackSession,
-        TorrentConnectionTestResult,
+        PlayerHdrCapabilities, PlayerHostPlatform, PlayerSnapshot, PlayerStatus,
+        QbittorrentManagedStatus, RemoteGatewayStatus, RemotePairingChallenge,
+        RemotePlaybackSession, TorrentConnectionTestResult,
     };
+
+    #[test]
+    fn hdr_requires_source_renderer_and_display_capabilities() {
+        assert!(!PlayerHdrCapabilities {
+            source_hdr: true,
+            renderer_hdr: true,
+            display_hdr: false,
+        }
+        .available());
+        assert!(PlayerHdrCapabilities {
+            source_hdr: true,
+            renderer_hdr: true,
+            display_hdr: true,
+        }
+        .available());
+    }
 
     #[derive(Deserialize)]
     #[serde(rename_all = "camelCase")]

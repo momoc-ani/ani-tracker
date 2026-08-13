@@ -370,6 +370,12 @@ impl VlcRuntime {
             PlayerCommandAction::SetFrameInterpolation { .. } => {
                 return Ok(unsupported(&command_id, "桌面 libVLC 不支持模型补帧"));
             }
+            PlayerCommandAction::SetHdr { hdr } if *hdr != ani_contracts::PlayerHdrMode::Off => {
+                return Ok(unsupported(
+                    &command_id,
+                    "桌面 libVLC 尚未完成 HDR 输出能力探测",
+                ));
+            }
             PlayerCommandAction::PreviousItem | PlayerCommandAction::NextItem => {
                 return Ok(unsupported(&command_id, "播放列表切换由页面会话管理"));
             }
@@ -520,6 +526,7 @@ impl VlcRuntime {
             PlayerCommandAction::Close
             | PlayerCommandAction::SetVideoEnhancement { .. }
             | PlayerCommandAction::SetFrameInterpolation { .. }
+            | PlayerCommandAction::SetHdr { .. }
             | PlayerCommandAction::SetPictureInPicture { .. }
             | PlayerCommandAction::PreviousItem
             | PlayerCommandAction::NextItem => {}
@@ -1064,7 +1071,7 @@ fn desktop_capabilities() -> PlayerCapabilities {
         supports_playlist_navigation: false,
         supports_direct_playback: true,
         supports_transcoding_fallback: false,
-        supports_hdr: true,
+        supports_hdr: false,
         unavailable_reason: None,
     }
 }
@@ -1122,6 +1129,7 @@ fn initial_snapshot(
         video_enhancement: ani_contracts::PlayerVideoEnhancement::Off,
         video_enhancement_degraded: false,
         frame_interpolation: ani_contracts::PlayerFrameInterpolation::Off,
+        hdr: ani_contracts::PlayerHdrMode::Off,
         enhancement_diagnostics: Default::default(),
         aspect_ratio: PlayerAspectRatio::Default,
         fullscreen: false,
@@ -1257,6 +1265,14 @@ mod tests {
         assert!(!options
             .iter()
             .any(|value| value.starts_with("--avcodec-hw=")));
+    }
+
+    #[test]
+    fn keeps_unprobed_hdr_and_model_features_disabled() {
+        let capabilities = desktop_capabilities();
+        assert!(!capabilities.supports_hdr);
+        assert!(!capabilities.supports_model_enhancement);
+        assert!(!capabilities.supports_frame_interpolation);
     }
 
     /// VLC 状态码必须稳定映射到跨平台快照状态。

@@ -196,7 +196,13 @@ const previewSession: RemotePlaybackSession = {
     { id: "chs-ass", label: "简体中文", language: "zh-CN", type: "ass", url: "preview://chs", default: true },
     { id: "cht-ass", label: "繁体中文", language: "zh-TW", type: "ass", url: "preview://cht", default: false },
     { id: "jpn-vtt", label: "日文", language: "ja", type: "vtt", url: "preview://jpn", default: false }
-  ]
+  ],
+  diagnostics: {
+    encoder: "libx264",
+    encoderDegraded: true,
+    subtitleMode: "soft",
+    enhancedFrameInput: false
+  }
 };
 
 /** 构造与 Stitch 稿一致的十二集预览状态。 */

@@ -27,7 +27,7 @@
       "supportsPlaylistNavigation": true,
       "supportsDirectPlayback": true,
       "supportsTranscodingFallback": false,
-      "supportsHdr": true
+      "supportsHdr": false
     },
     "source": {
       "taskId": "task-contract-001",
@@ -95,9 +95,15 @@
     "videoEnhancement": "off",
     "videoEnhancementDegraded": false,
     "frameInterpolation": "off",
+    "hdr": "off",
     "enhancementDiagnostics": {
       "pipeline": "none",
-      "droppedFrames": 0
+      "droppedFrames": 0,
+      "hdrCapabilities": {
+        "sourceHdr": false,
+        "rendererHdr": false,
+        "displayHdr": false
+      }
     },
     "aspectRatio": "default",
     "fullscreen": false,

@@ -609,6 +609,8 @@ export function RemoteVideoPlayer({
 
   const statusBadges = [
     session?.mode === "hls" ? "实时转码" : session ? "原文件直传" : undefined,
+    session?.diagnostics?.encoder ? `编码 ${session.diagnostics.encoder}` : undefined,
+    session?.diagnostics?.encoderDegraded ? "编码器已降级" : undefined,
     session ? `${session.subtitles.length} 条字幕` : undefined,
     activeItem?.task.resolution?.toUpperCase()
   ].filter((value): value is string => Boolean(value));

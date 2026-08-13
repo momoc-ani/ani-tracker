@@ -156,6 +156,8 @@ final class AniPlayerPlugin: Plugin, UIAdaptivePresentationControllerDelegate {
             return Self.rejected(commandID, code: "unsupported", message: "iOS 画中画尚未启用")
         case "set-frame-interpolation":
             return Self.rejected(commandID, code: "unsupported", message: "iOS 播放器暂不支持模型补帧")
+        case "set-hdr":
+            return Self.rejected(commandID, code: "unsupported", message: "iOS 播放器暂不支持 HDR 输出")
         case "previous-item": controller.previousEpisode()
         case "next-item": controller.nextEpisode()
         case "retry": controller.retry()
@@ -300,7 +302,12 @@ final class AniPlayerPlugin: Plugin, UIAdaptivePresentationControllerDelegate {
             "videoEnhancement": "off",
             "videoEnhancementDegraded": false,
             "frameInterpolation": "off",
-            "enhancementDiagnostics": ["pipeline": "libvlc", "droppedFrames": 0],
+            "hdr": "off",
+            "enhancementDiagnostics": [
+                "pipeline": "libvlc",
+                "droppedFrames": 0,
+                "hdrCapabilities": ["sourceHdr": false, "rendererHdr": false, "displayHdr": false]
+            ],
             "aspectRatio": Self.aspectRatioValue(snapshot.aspectRatio),
             "fullscreen": Self.isLandscape,
             "pictureInPicture": false
@@ -410,7 +417,7 @@ final class AniPlayerPlugin: Plugin, UIAdaptivePresentationControllerDelegate {
             "supportsPlaylistNavigation": true,
             "supportsDirectPlayback": true,
             "supportsTranscodingFallback": false,
-            "supportsHdr": true
+            "supportsHdr": false
         ]
     }
 

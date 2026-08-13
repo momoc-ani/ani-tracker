@@ -48,6 +48,12 @@
       "sessionId": "session-contract-1",
       "frameInterpolation": "rife-realtime"
     },
+    "hdrCommand": {
+      "type": "set-hdr",
+      "commandId": "command-contract-5",
+      "sessionId": "session-contract-1",
+      "hdr": "auto"
+    },
     "androidCapabilities": {
       "backend": "libvlc",
       "platform": "android",
@@ -68,7 +74,7 @@
       "supportsPlaylistNavigation": true,
       "supportsDirectPlayback": true,
       "supportsTranscodingFallback": false,
-      "supportsHdr": true
+      "supportsHdr": false
     },
     "iosCapabilities": {
       "backend": "libvlc",
@@ -90,7 +96,7 @@
       "supportsPlaylistNavigation": true,
       "supportsDirectPlayback": true,
       "supportsTranscodingFallback": false,
-      "supportsHdr": true
+      "supportsHdr": false
     },
     "playbackSession": {
       "id": "session-contract-1",
@@ -102,7 +108,12 @@
       "expiresAt": "2026-07-25T13:00:00.000Z",
       "durationSeconds": 1440,
       "startPositionSeconds": 42.5,
-      "subtitles": []
+      "subtitles": [],
+      "diagnostics": {
+        "encoderDegraded": false,
+        "subtitleMode": "soft",
+        "enhancedFrameInput": false
+      }
     }
   }
 }

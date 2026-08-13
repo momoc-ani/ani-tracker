@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use ani_contracts::{RemotePlaybackSession, RemotePlaybackSubtitle};
+use ani_contracts::{RemotePlaybackDiagnostics, RemotePlaybackSession, RemotePlaybackSubtitle};
 use ani_domain::{AppSettings, DownloadTask, MediaFile, PlaybackCheckpoint};
 use async_trait::async_trait;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -21,6 +21,12 @@ use tokio::sync::Mutex;
 const SESSION_TTL: Duration = Duration::from_secs(30 * 60);
 const TRANSCODER_START_TIMEOUT: Duration = Duration::from_secs(20);
 const MAX_SESSIONS: usize = 2;
+const ENCODER_CANDIDATES: &[(&str, &str)] = &[
+    ("h264_nvenc", "nvenc"),
+    ("h264_amf", "amf"),
+    ("h264_qsv", "qsv"),
+    ("libx264", "libx264"),
+];
 const MEDIA_FILE_SEGMENT_ENCODE_SET: &AsciiSet = &CONTROLS
     .add(b' ')
     .add(b'"')
@@ -240,14 +246,21 @@ impl RemoteMediaSessionService {
             "direct"
         };
         let mut process = None;
+        let mut diagnostics = RemotePlaybackDiagnostics {
+            subtitle_mode: Some("soft".to_owned()),
+            enhanced_frame_input: false,
+            ..Default::default()
+        };
         if mode == "hls" {
-            process = Some(
-                self.start_hls(&media.path, &temporary_directory)
-                    .await
-                    .inspect_err(|_| {
-                        let _ = std::fs::remove_dir_all(&temporary_directory);
-                    })?,
-            );
+            let (child, encoder, degraded) = self
+                .start_hls(&media.path, &temporary_directory)
+                .await
+                .inspect_err(|_| {
+                    let _ = std::fs::remove_dir_all(&temporary_directory);
+                })?;
+            process = Some(child);
+            diagnostics.encoder = Some(encoder.to_owned());
+            diagnostics.encoder_degraded = degraded;
         }
         let now = Utc::now();
         let direct_asset_name =
@@ -271,6 +284,7 @@ impl RemoteMediaSessionService {
             duration_seconds: media.duration_seconds,
             start_position_seconds: resolve_resume_position(checkpoint.as_ref()),
             subtitles,
+            diagnostics,
         };
         let record = Arc::new(SessionRecord {
             public: Mutex::new(public.clone()),
@@ -757,74 +771,108 @@ impl RemoteMediaSessionService {
         &self,
         source_path: &Path,
         output_directory: &Path,
-    ) -> Result<Child, RemoteMediaError> {
+    ) -> Result<(Child, &'static str, bool), RemoteMediaError> {
         let playlist = output_directory.join("index.m3u8");
         let segments = output_directory.join("segment-%06d.ts");
-        let mut command = hidden_command(&self.tools.ffmpeg_path);
-        command
-            .args(["-nostdin", "-hide_banner", "-loglevel", "warning", "-i"])
-            .arg(source_path)
-            .args([
-                "-map",
-                "0:v:0",
-                "-map",
-                "0:a:0?",
-                "-c:v",
-                "libx264",
-                "-preset",
-                "veryfast",
-                "-crf",
-                "23",
-                "-pix_fmt",
-                "yuv420p",
-                "-c:a",
-                "aac",
-                "-b:a",
-                "160k",
-                "-ac",
-                "2",
-                "-f",
-                "hls",
-                "-hls_time",
-                "4",
-                "-hls_list_size",
-                "0",
-                "-hls_playlist_type",
-                "event",
-                "-hls_segment_filename",
-            ])
-            .arg(&segments)
-            .arg(&playlist)
-            .kill_on_drop(true);
-        let mut child = command.spawn().map_err(|error| {
-            RemoteMediaError::new(
-                503,
-                "TRANSCODER_UNAVAILABLE",
-                format!("FFmpeg 不可用：{error}"),
-            )
-        })?;
-        let started = tokio::time::Instant::now();
-        loop {
-            if tokio::fs::try_exists(&playlist).await.unwrap_or(false) {
-                return Ok(child);
+        let mut last_error = None;
+        for (index, (codec, encoder)) in ENCODER_CANDIDATES.iter().enumerate() {
+            let _ = tokio::fs::remove_file(&playlist).await;
+            let mut command = hidden_command(&self.tools.ffmpeg_path);
+            command
+                .args(["-nostdin", "-hide_banner", "-loglevel", "warning", "-i"])
+                .arg(source_path)
+                .args(["-map", "0:v:0", "-map", "0:a:0?", "-c:v"])
+                .args(encoder_video_args(codec))
+                .args([
+                    "-pix_fmt",
+                    "yuv420p",
+                    "-c:a",
+                    "aac",
+                    "-b:a",
+                    "160k",
+                    "-ac",
+                    "2",
+                    "-f",
+                    "hls",
+                    "-hls_time",
+                    "4",
+                    "-hls_list_size",
+                    "0",
+                    "-hls_playlist_type",
+                    "event",
+                    "-hls_segment_filename",
+                ])
+                .arg(&segments)
+                .arg(&playlist)
+                .kill_on_drop(true);
+            let mut child = match command.spawn() {
+                Ok(child) => child,
+                Err(error) => {
+                    last_error = Some(error.to_string());
+                    continue;
+                }
+            };
+            let started = tokio::time::Instant::now();
+            loop {
+                if tokio::fs::try_exists(&playlist).await.unwrap_or(false) {
+                    return Ok((child, *encoder, index > 0));
+                }
+                if let Ok(Some(status)) = child.try_wait() {
+                    last_error = Some(format!("编码器 {encoder} 提前退出：{status}"));
+                    break;
+                }
+                if started.elapsed() >= TRANSCODER_START_TIMEOUT {
+                    let _ = child.kill().await;
+                    last_error = Some(format!("编码器 {encoder} 启动超时"));
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
             }
-            if let Ok(Some(status)) = child.try_wait() {
-                return Err(RemoteMediaError::new(
-                    503,
-                    "TRANSCODER_UNAVAILABLE",
-                    format!("FFmpeg 提前退出：{status}"),
-                ));
-            }
-            if started.elapsed() >= TRANSCODER_START_TIMEOUT {
-                let _ = child.kill().await;
-                return Err(RemoteMediaError::new(
-                    504,
-                    "TRANSCODER_TIMEOUT",
-                    "实时转码启动超时",
-                ));
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
         }
+        Err(RemoteMediaError::new(
+            503,
+            "TRANSCODER_UNAVAILABLE",
+            last_error.unwrap_or_else(|| "没有可用的 HLS 编码器".to_owned()),
+        ))
+    }
+}
+
+/// 返回各编码器合法的视频参数，避免把 libx264 参数误传给硬件编码器。
+fn encoder_video_args(codec: &str) -> &'static [&'static str] {
+    match codec {
+        "h264_nvenc" => &["h264_nvenc", "-preset", "p4", "-rc", "vbr", "-cq", "23"],
+        "h264_amf" => &[
+            "h264_amf", "-quality", "balanced", "-qp_i", "23", "-qp_p", "23",
+        ],
+        "h264_qsv" => &["h264_qsv", "-global_quality", "23"],
+        _ => &["libx264", "-preset", "veryfast", "-crf", "23"],
+    }
+}
+
+#[cfg(test)]
+mod encoder_tests {
+    use super::{encoder_video_args, ENCODER_CANDIDATES};
+
+    #[test]
+    fn selects_vendor_specific_video_options() {
+        assert_eq!(encoder_video_args("h264_nvenc")[0], "h264_nvenc");
+        assert!(encoder_video_args("h264_nvenc").contains(&"-cq"));
+        assert!(encoder_video_args("h264_amf").contains(&"-qp_i"));
+        assert!(encoder_video_args("h264_qsv").contains(&"-global_quality"));
+        assert!(encoder_video_args("libx264").contains(&"-crf"));
+    }
+
+    #[test]
+    fn tries_nvidia_amd_intel_before_software_fallback() {
+        assert_eq!(
+            ENCODER_CANDIDATES,
+            &[
+                ("h264_nvenc", "nvenc"),
+                ("h264_amf", "amf"),
+                ("h264_qsv", "qsv"),
+                ("libx264", "libx264"),
+            ]
+        );
     }
 }
 

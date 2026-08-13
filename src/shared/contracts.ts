@@ -688,6 +688,14 @@ export interface RemotePlaybackSubtitle {
   default: boolean;
 }
 
+/** 远程转码实际采用的编码器和字幕传递方式。 */
+export interface RemotePlaybackDiagnostics {
+  encoder?: string;
+  encoderDegraded: boolean;
+  subtitleMode?: "soft" | "burned";
+  enhancedFrameInput: boolean;
+}
+
 export interface RemotePlaybackSession {
   id: string;
   taskId: string;
@@ -699,6 +707,7 @@ export interface RemotePlaybackSession {
   durationSeconds?: number;
   startPositionSeconds?: number;
   subtitles: RemotePlaybackSubtitle[];
+  diagnostics?: RemotePlaybackDiagnostics;
 }
 
 export interface MetadataProvider {

@@ -7,6 +7,16 @@ export type PlayerVideoEnhancement = "off" | "balanced" | "clear";
 /** 基于模型的实时补帧模式；当前仅在真实模型运行时可用时展示。 */
 export type PlayerFrameInterpolation = "off" | "rife-realtime";
 
+/** HDR 输出模式；当前仅在真实显示链路探测通过时可用。 */
+export type PlayerHdrMode = "off" | "auto";
+
+/** HDR 自动输出必须同时具备的源、渲染器和显示器能力。 */
+export interface PlayerHdrCapabilities {
+  sourceHdr: boolean;
+  rendererHdr: boolean;
+  displayHdr: boolean;
+}
+
 /** 增强链路的诊断快照，便于区分 Shader、模型和降级状态。 */
 export interface PlayerEnhancementDiagnostics {
   pipeline: string;
@@ -17,6 +27,7 @@ export interface PlayerEnhancementDiagnostics {
   frameTimeMs?: number;
   droppedFrames: number;
   degradationReason?: string;
+  hdrCapabilities: PlayerHdrCapabilities;
 }
 
 /** 播放器宿主平台。 */
@@ -180,6 +191,7 @@ export type PlayerCommand =
   | (PlayerCommandBase & { type: "set-subtitle-scale"; subtitleScale: PlayerSubtitleScale })
   | (PlayerCommandBase & { type: "set-video-enhancement"; videoEnhancement: PlayerVideoEnhancement })
   | (PlayerCommandBase & { type: "set-frame-interpolation"; frameInterpolation: PlayerFrameInterpolation })
+  | (PlayerCommandBase & { type: "set-hdr"; hdr: PlayerHdrMode })
   | (PlayerCommandBase & { type: "set-aspect-ratio"; aspectRatio: PlayerAspectRatio; value?: string })
   | (PlayerCommandBase & { type: "set-fullscreen"; fullscreen: boolean })
   | (PlayerCommandBase & { type: "set-picture-in-picture"; enabled: boolean })
@@ -215,6 +227,7 @@ export interface PlayerSnapshot {
   videoEnhancement: PlayerVideoEnhancement;
   videoEnhancementDegraded: boolean;
   frameInterpolation: PlayerFrameInterpolation;
+  hdr: PlayerHdrMode;
   enhancementDiagnostics: PlayerEnhancementDiagnostics;
   aspectRatio: PlayerAspectRatio;
   fullscreen: boolean;
@@ -296,9 +309,15 @@ export function createInitialPlayerSnapshot(input: InitialPlayerSnapshotInput): 
     videoEnhancement: "off",
     videoEnhancementDegraded: false,
     frameInterpolation: "off",
+    hdr: "off",
     enhancementDiagnostics: {
       pipeline: "none",
-      droppedFrames: 0
+      droppedFrames: 0,
+      hdrCapabilities: {
+        sourceHdr: false,
+        rendererHdr: false,
+        displayHdr: false
+      }
     },
     aspectRatio: "default",
     fullscreen: false,
@@ -322,6 +341,7 @@ export function acceptPlayerSnapshot(
     capabilities?: Partial<PlayerCapabilities>;
     enhancementDiagnostics?: Partial<PlayerEnhancementDiagnostics>;
     frameInterpolation?: PlayerFrameInterpolation;
+    hdr?: PlayerHdrMode;
     videoEnhancement?: PlayerVideoEnhancement;
     videoEnhancementDegraded?: boolean;
   };
@@ -331,8 +351,10 @@ export function acceptPlayerSnapshot(
     || legacyPayload.videoEnhancement === undefined
     || legacyPayload.videoEnhancementDegraded === undefined
     || legacyPayload.frameInterpolation === undefined
+    || legacyPayload.hdr === undefined
     || diagnostics?.pipeline === undefined
-    || diagnostics?.droppedFrames === undefined;
+    || diagnostics?.droppedFrames === undefined
+    || diagnostics?.hdrCapabilities === undefined;
   if (!needsNormalization) return incoming;
   // 允许旧版原生后端缺少终版增强字段，避免控制层读取 undefined。
   return {
@@ -345,10 +367,16 @@ export function acceptPlayerSnapshot(
     videoEnhancement: incoming.videoEnhancement ?? "off",
     videoEnhancementDegraded: incoming.videoEnhancementDegraded ?? false,
     frameInterpolation: incoming.frameInterpolation ?? "off",
+    hdr: incoming.hdr ?? "off",
     enhancementDiagnostics: {
       ...(diagnostics ?? {}),
       pipeline: diagnostics?.pipeline ?? "none",
-      droppedFrames: diagnostics?.droppedFrames ?? 0
+      droppedFrames: diagnostics?.droppedFrames ?? 0,
+      hdrCapabilities: diagnostics?.hdrCapabilities ?? {
+        sourceHdr: false,
+        rendererHdr: false,
+        displayHdr: false
+      }
     }
   };
 }

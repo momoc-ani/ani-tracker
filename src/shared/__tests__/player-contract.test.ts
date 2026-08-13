@@ -42,6 +42,7 @@ test("createInitialPlayerSnapshot 创建稳定的空闲状态", () => {
   assert.equal(snapshot.subtitleScale, 100);
   assert.equal(snapshot.videoEnhancement, "off");
   assert.equal(snapshot.frameInterpolation, "off");
+  assert.equal(snapshot.hdr, "off");
   assert.equal(snapshot.enhancementDiagnostics.pipeline, "none");
   assert.deepEqual(snapshot.playlist.items, []);
 });
@@ -75,6 +76,7 @@ test("acceptPlayerSnapshot 为旧原生快照补齐增强字段", () => {
   const legacy = createInitialPlayerSnapshot({ sessionId: "session-a", capabilities });
   const payload = { ...legacy, sequence: 1 } as Record<string, unknown>;
   delete payload.frameInterpolation;
+  delete payload.hdr;
   delete payload.enhancementDiagnostics;
   const legacyCapabilities = { ...(payload.capabilities as Record<string, unknown>) };
   delete legacyCapabilities.supportsFrameInterpolation;
@@ -83,7 +85,12 @@ test("acceptPlayerSnapshot 为旧原生快照补齐增强字段", () => {
 
   const accepted = acceptPlayerSnapshot("session-a", undefined, payload as unknown as typeof legacy);
   assert.equal(accepted?.frameInterpolation, "off");
-  assert.deepEqual(accepted?.enhancementDiagnostics, { pipeline: "none", droppedFrames: 0 });
+  assert.equal(accepted?.hdr, "off");
+  assert.deepEqual(accepted?.enhancementDiagnostics, {
+    pipeline: "none",
+    droppedFrames: 0,
+    hdrCapabilities: { sourceHdr: false, rendererHdr: false, displayHdr: false }
+  });
   assert.equal(accepted?.capabilities.supportsFrameInterpolation, false);
   assert.equal(accepted?.capabilities.supportsModelEnhancement, false);
 });
