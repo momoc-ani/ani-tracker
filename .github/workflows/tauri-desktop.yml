@@ -36,6 +36,8 @@ on:
       - "scripts/prepare-windows-libmpv-dev.mjs"
       - "scripts/prepare-windows-libmpv-dev.test.mjs"
       - "scripts/verify-tauri-desktop-workflow.test.mjs"
+      - "scripts/player-enhancement-matrix.mjs"
+      - "scripts/player-enhancement-matrix.test.mjs"
       - "resources/shaders/**"
       - "scripts/verify-tauri-mobile-package.mjs"
       - "scripts/verify-tauri-mobile-package.test.mjs"
@@ -188,6 +190,7 @@ jobs:
         run: |
           pnpm run typecheck
           pnpm run test:desktop-gates
+          pnpm run test:player-matrix
 
       - name: Check Rust formatting
         run: cargo fmt --all -- --check

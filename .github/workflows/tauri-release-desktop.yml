@@ -321,6 +321,7 @@ jobs:
         run: |
           pnpm run typecheck
           pnpm run test:theme
+          pnpm run test:player-matrix
           cargo fmt --all -- --check
           cargo test --workspace
           cargo clippy --workspace --all-targets -- -D warnings
