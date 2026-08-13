@@ -166,6 +166,7 @@ impl EnhancementBudget {
 }
 
 /// 模型超分后端端口；真实推理 SDK 由桌面平台另行实现。
+#[async_trait]
 pub trait ModelEnhancer: Send + Sync {
     /// 返回后端稳定标识。
     fn backend_id(&self) -> &str;
@@ -173,9 +174,12 @@ pub trait ModelEnhancer: Send + Sync {
     fn ready(&self) -> bool;
     /// 返回本次处理的资源预算。
     fn budget(&self) -> EnhancementBudget;
+    /// 对一帧不含字幕和 OSD 的 RGB24 视频数据执行模型增强。
+    async fn enhance(&self, frame: RawVideoFrame) -> Result<RawVideoFrame, String>;
 }
 
 /// 模型插帧后端端口；输入帧队列由具体实现负责保持有界。
+#[async_trait]
 pub trait FrameInterpolator: Send + Sync {
     /// 返回后端稳定标识。
     fn backend_id(&self) -> &str;
@@ -183,6 +187,50 @@ pub trait FrameInterpolator: Send + Sync {
     fn ready(&self) -> bool;
     /// 返回本次处理的资源预算。
     fn budget(&self) -> EnhancementBudget;
+    /// 在两帧 RGB24 视频数据之间生成一帧，字幕必须在该阶段之后合成。
+    async fn interpolate(
+        &self,
+        previous: RawVideoFrame,
+        next: RawVideoFrame,
+    ) -> Result<RawVideoFrame, String>;
+}
+
+/// 交给模型 sidecar 的无字幕 RGB24 视频帧。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RawVideoFrame {
+    pub width: u32,
+    pub height: u32,
+    pub stride: u32,
+    pub pts_micros: i64,
+    pub data: Vec<u8>,
+}
+
+impl RawVideoFrame {
+    /// 拒绝尺寸溢出、非紧凑 RGB24 和长度不一致的帧。
+    pub fn validate(&self, max_frame_bytes: usize) -> Result<(), String> {
+        if self.width == 0 || self.height == 0 {
+            return Err("模型输入帧尺寸无效".to_owned());
+        }
+        let expected_stride = self
+            .width
+            .checked_mul(3)
+            .ok_or_else(|| "模型输入帧步长溢出".to_owned())?;
+        if self.stride != expected_stride {
+            return Err("模型输入只接受紧凑 RGB24 帧".to_owned());
+        }
+        let expected_bytes = usize::try_from(self.stride)
+            .ok()
+            .and_then(|stride| {
+                usize::try_from(self.height)
+                    .ok()
+                    .and_then(|height| stride.checked_mul(height))
+            })
+            .ok_or_else(|| "模型输入帧长度溢出".to_owned())?;
+        if expected_bytes > max_frame_bytes || self.data.len() != expected_bytes {
+            return Err("模型输入帧长度无效或超过限制".to_owned());
+        }
+        Ok(())
+    }
 }
 
 /// 按“插帧 -> 模型超分 -> Shader”顺序做安全降级的调度结果。
@@ -503,6 +551,7 @@ mod tests {
         budget: EnhancementBudget,
     }
 
+    #[async_trait]
     impl ModelEnhancer for TestModel {
         fn backend_id(&self) -> &str {
             "test-model"
@@ -513,6 +562,9 @@ mod tests {
         fn budget(&self) -> EnhancementBudget {
             self.budget
         }
+        async fn enhance(&self, frame: RawVideoFrame) -> Result<RawVideoFrame, String> {
+            Ok(frame)
+        }
     }
 
     struct TestInterpolator {
@@ -520,6 +572,7 @@ mod tests {
         budget: EnhancementBudget,
     }
 
+    #[async_trait]
     impl FrameInterpolator for TestInterpolator {
         fn backend_id(&self) -> &str {
             "test-interpolator"
@@ -529,6 +582,13 @@ mod tests {
         }
         fn budget(&self) -> EnhancementBudget {
             self.budget
+        }
+        async fn interpolate(
+            &self,
+            previous: RawVideoFrame,
+            _next: RawVideoFrame,
+        ) -> Result<RawVideoFrame, String> {
+            Ok(previous)
         }
     }
 
