@@ -37,11 +37,27 @@ pub struct ModelSidecarManifest {
 pub struct EnhancementModelManifestFile {
     pub model_id: String,
     pub backend: String,
+    #[serde(default)]
+    pub operation: ModelOperation,
+    #[serde(default = "default_output_scale")]
+    pub output_scale: u32,
     pub directory: String,
     pub input_width: u32,
     pub input_height: u32,
     pub required_vram_bytes: u64,
     pub estimated_frame_time_ms: u32,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ModelOperation {
+    #[default]
+    Interpolate,
+    Enhance,
+}
+
+const fn default_output_scale() -> u32 {
+    1
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -88,6 +104,8 @@ pub struct ModelSidecarDiagnostics {
 
 pub struct ModelSidecarRuntime {
     manifest: EnhancementModelManifest,
+    operation: ModelOperation,
+    output_scale: u32,
     budget: EnhancementBudget,
     connection: Mutex<SidecarConnection>,
     frame_timeout: Duration,
@@ -210,19 +228,39 @@ impl ModelSidecarRuntime {
         };
         let warmup_started = Instant::now();
         let warmup_response = tokio::time::timeout(config.startup_timeout, async {
-            write_frame_pair(
-                &mut connection.stdin,
-                MessageKind::WarmupRequest,
-                2,
-                &warmup_frame,
-                &warmup_frame,
-            )
-            .await?;
+            match validated.manifest.model.operation {
+                ModelOperation::Interpolate => {
+                    write_frame_pair(
+                        &mut connection.stdin,
+                        MessageKind::WarmupRequest,
+                        2,
+                        &warmup_frame,
+                        &warmup_frame,
+                    )
+                    .await?;
+                }
+                ModelOperation::Enhance => {
+                    write_frame(
+                        &mut connection.stdin,
+                        MessageKind::EnhanceRequest,
+                        2,
+                        &warmup_frame,
+                    )
+                    .await?;
+                }
+            }
             read_message(&mut connection.stdout, config.max_frame_bytes).await
         })
         .await
         .map_err(|_| "模型 sidecar warmup 超时".to_owned())??;
-        validate_frame_response(&warmup_response, 2, &warmup_frame, config.max_frame_bytes)?;
+        validate_frame_response(
+            &warmup_response,
+            2,
+            &warmup_frame,
+            config.max_frame_bytes,
+            validated.manifest.model.operation,
+            validated.manifest.model.output_scale,
+        )?;
         let warmup_frame_time_ms = warmup_started.elapsed().as_secs_f64() * 1_000.0;
         if warmup_frame_time_ms > config.target_frame_time_ms {
             return Err(format!(
@@ -233,6 +271,8 @@ impl ModelSidecarRuntime {
 
         Ok(Self {
             manifest: validated.model_manifest,
+            operation: validated.manifest.model.operation,
+            output_scale: validated.manifest.model.output_scale,
             budget: validated.budget,
             connection: Mutex::new(connection),
             frame_timeout: config.frame_timeout,
@@ -282,6 +322,9 @@ impl ModelSidecarRuntime {
         previous: RawVideoFrame,
         next: RawVideoFrame,
     ) -> Result<RawVideoFrame, String> {
+        if self.operation != ModelOperation::Interpolate {
+            return Err("当前模型 sidecar 不提供插帧操作".to_owned());
+        }
         if !self.ready.load(Ordering::Acquire) {
             return Err("模型 sidecar 已降级关闭".to_owned());
         }
@@ -313,9 +356,14 @@ impl ModelSidecarRuntime {
             Ok(Err(error)) => return self.degrade(error).await,
             Err(_) => return self.degrade("模型单帧处理超时".to_owned()).await,
         };
-        if let Err(error) =
-            validate_frame_response(&response, request_id, &previous, self.max_frame_bytes)
-        {
+        if let Err(error) = validate_frame_response(
+            &response,
+            request_id,
+            &previous,
+            self.max_frame_bytes,
+            ModelOperation::Interpolate,
+            1,
+        ) {
             return self.degrade(error).await;
         }
         let frame_time_ms = started.elapsed().as_secs_f64() * 1_000.0;
@@ -332,6 +380,9 @@ impl ModelSidecarRuntime {
     }
 
     async fn enhance_frame(&self, frame: RawVideoFrame) -> Result<RawVideoFrame, String> {
+        if self.operation != ModelOperation::Enhance {
+            return Err("当前模型 sidecar 不提供单帧增强操作".to_owned());
+        }
         if !self.ready.load(Ordering::Acquire) {
             return Err("模型 sidecar 已降级关闭".to_owned());
         }
@@ -355,9 +406,14 @@ impl ModelSidecarRuntime {
             Ok(Err(error)) => return self.degrade(error).await,
             Err(_) => return self.degrade("模型单帧处理超时".to_owned()).await,
         };
-        if let Err(error) =
-            validate_frame_response(&response, request_id, &frame, self.max_frame_bytes)
-        {
+        if let Err(error) = validate_frame_response(
+            &response,
+            request_id,
+            &frame,
+            self.max_frame_bytes,
+            ModelOperation::Enhance,
+            self.output_scale,
+        ) {
             return self.degrade(error).await;
         }
         let frame_time_ms = started.elapsed().as_secs_f64() * 1_000.0;
@@ -388,7 +444,7 @@ impl FrameInterpolator for ModelSidecarRuntime {
         &self.manifest.backend
     }
     fn ready(&self) -> bool {
-        self.ready.load(Ordering::Acquire)
+        self.operation == ModelOperation::Interpolate && self.ready.load(Ordering::Acquire)
     }
     fn budget(&self) -> EnhancementBudget {
         self.budget
@@ -410,7 +466,7 @@ impl ModelEnhancer for ModelSidecarRuntime {
     }
 
     fn ready(&self) -> bool {
-        self.ready.load(Ordering::Acquire)
+        self.operation == ModelOperation::Enhance && self.ready.load(Ordering::Acquire)
     }
 
     fn budget(&self) -> EnhancementBudget {
@@ -440,6 +496,12 @@ async fn validate_sidecar_bundle(config: &ModelSidecarConfig) -> Result<Validate
         .map_err(|error| format!("模型 sidecar 清单无效：{error}"))?;
     if manifest.schema_version != 1 || manifest.protocol_version != PROTOCOL_VERSION {
         return Err("模型 sidecar 清单或协议版本不兼容".to_owned());
+    }
+    if manifest.model.output_scale == 0
+        || (manifest.model.operation == ModelOperation::Interpolate
+            && manifest.model.output_scale != 1)
+    {
+        return Err("模型 sidecar 输出倍率无效".to_owned());
     }
     let executable = resolve_bundle_file(&root, &manifest.executable)?;
     validate_sha256(&executable, &manifest.executable_sha256).await?;
@@ -708,6 +770,8 @@ fn validate_frame_response(
     request_id: u64,
     input: &RawVideoFrame,
     max_frame_bytes: usize,
+    operation: ModelOperation,
+    output_scale: u32,
 ) -> Result<(), String> {
     if response.kind != MessageKind::FrameResponse || response.request_id != request_id {
         return Err("模型 sidecar 帧响应与请求不匹配".to_owned());
@@ -720,11 +784,26 @@ fn validate_frame_response(
         data: response.payload.clone(),
     }
     .validate(max_frame_bytes)?;
-    if response.width != input.width
-        || response.height != input.height
-        || response.stride != input.stride
+    let scale = match operation {
+        ModelOperation::Interpolate => 1,
+        ModelOperation::Enhance => output_scale,
+    };
+    let expected_width = input
+        .width
+        .checked_mul(scale)
+        .ok_or_else(|| "模型输出宽度溢出".to_owned())?;
+    let expected_height = input
+        .height
+        .checked_mul(scale)
+        .ok_or_else(|| "模型输出高度溢出".to_owned())?;
+    let expected_stride = expected_width
+        .checked_mul(3)
+        .ok_or_else(|| "模型输出步长溢出".to_owned())?;
+    if response.width != expected_width
+        || response.height != expected_height
+        || response.stride != expected_stride
     {
-        return Err("RIFE sidecar 返回了意外帧尺寸".to_owned());
+        return Err("模型 sidecar 返回了意外帧尺寸".to_owned());
     }
     Ok(())
 }
@@ -789,6 +868,8 @@ mod tests {
             model: EnhancementModelManifestFile {
                 model_id: "rife-v4.6".to_owned(),
                 backend: "ncnn-vulkan".to_owned(),
+                operation: ModelOperation::Interpolate,
+                output_scale: 1,
                 directory: "models/rife-v4.6".to_owned(),
                 input_width: 8,
                 input_height: 8,

@@ -99,6 +99,8 @@ export async function createBundleManifest(targetDirectory, executableName, targ
     model: {
       modelId: RIFE_SIDECAR_SOURCE.modelId,
       backend: RIFE_SIDECAR_SOURCE.backend,
+      operation: "interpolate",
+      outputScale: 1,
       directory: `models/${RIFE_SIDECAR_SOURCE.modelId}`,
       inputWidth: 320,
       inputHeight: 180,

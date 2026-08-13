@@ -30,6 +30,8 @@ test("RIFE sidecar manifest binds executable and every model file digest", async
   const manifest = await createBundleManifest(root, executableName, "test-x64");
   assert.equal(manifest.protocolVersion, 1);
   assert.equal(manifest.model.backend, "ncnn-vulkan");
+  assert.equal(manifest.model.operation, "interpolate");
+  assert.equal(manifest.model.outputScale, 1);
   assert.equal(manifest.files.length, 2);
   assert.equal(
     manifest.executableSha256,

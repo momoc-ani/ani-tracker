@@ -7,6 +7,40 @@ use sha2::{Digest, Sha256};
 
 #[tokio::test]
 async fn launches_validated_sidecar_and_processes_continuous_rgb_frames() {
+    let runtime = launch_fixture("interpolate").await;
+    assert!(FrameInterpolator::ready(&runtime));
+
+    let previous = frame(10, 1_000);
+    let next = frame(30, 3_000);
+    let result = runtime
+        .interpolate(previous, next)
+        .await
+        .expect("interpolate frame");
+    assert_eq!(result.data, vec![20; 12]);
+    assert_eq!(result.pts_micros, 2_000);
+    let diagnostics = runtime.diagnostics().await;
+    assert_eq!(diagnostics.backend, "ncnn-vulkan");
+    assert_eq!(diagnostics.gpu_device, "fixture-vulkan-device");
+    assert_eq!(diagnostics.processed_frames, 1);
+    assert_eq!(diagnostics.dropped_frames, 0);
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn launches_validated_single_frame_enhancer() {
+    let runtime = launch_fixture("enhance").await;
+    assert!(ModelEnhancer::ready(&runtime));
+    let enhanced = runtime
+        .enhance(frame(42, 4_000))
+        .await
+        .expect("enhance frame");
+    assert_eq!(enhanced.data, vec![42; 12]);
+    assert_eq!(enhanced.pts_micros, 4_000);
+    assert_eq!(runtime.diagnostics().await.processed_frames, 1);
+    runtime.shutdown().await;
+}
+
+async fn launch_fixture(operation: &str) -> ModelSidecarRuntime {
     let directory = tempfile::tempdir().expect("temporary model bundle");
     let executable_source = Path::new(env!("CARGO_BIN_EXE_ani-model-sidecar-fixture"));
     let executable_name = if cfg!(target_os = "windows") {
@@ -38,6 +72,8 @@ async fn launches_validated_sidecar_and_processes_continuous_rgb_frames() {
             "model": {
                 "modelId": "rife-v4.6",
                 "backend": "ncnn-vulkan",
+                "operation": operation,
+                "outputScale": 1,
                 "directory": "models/rife-v4.6",
                 "inputWidth": 2,
                 "inputHeight": 2,
@@ -59,29 +95,7 @@ async fn launches_validated_sidecar_and_processes_continuous_rgb_frames() {
     let runtime = ModelSidecarRuntime::launch(config)
         .await
         .expect("launch validated sidecar");
-    assert!(FrameInterpolator::ready(&runtime));
-
-    let previous = frame(10, 1_000);
-    let next = frame(30, 3_000);
-    let result = runtime
-        .interpolate(previous, next)
-        .await
-        .expect("interpolate frame");
-    assert_eq!(result.data, vec![20; 12]);
-    assert_eq!(result.pts_micros, 2_000);
-    let diagnostics = runtime.diagnostics().await;
-    assert_eq!(diagnostics.backend, "ncnn-vulkan");
-    assert_eq!(diagnostics.gpu_device, "fixture-vulkan-device");
-    assert_eq!(diagnostics.processed_frames, 1);
-    assert_eq!(diagnostics.dropped_frames, 0);
-    let enhanced = runtime
-        .enhance(frame(42, 4_000))
-        .await
-        .expect("enhance frame");
-    assert_eq!(enhanced.data, vec![42; 12]);
-    assert_eq!(enhanced.pts_micros, 4_000);
-    assert_eq!(runtime.diagnostics().await.processed_frames, 2);
-    runtime.shutdown().await;
+    runtime
 }
 
 fn frame(value: u8, pts_micros: i64) -> RawVideoFrame {
