@@ -9,6 +9,7 @@ import {
   Minimize2,
   MonitorPlay,
   MoreVertical,
+  Sparkles,
   Pause,
   PictureInPicture2,
   Play,
@@ -51,7 +52,8 @@ import type { RemotePlaybackRequestMode, RemotePlaybackSubtitle } from "@shared/
 import {
   PLAYER_SUBTITLE_SCALES,
   type PlayerAspectRatio,
-  type PlayerSubtitleScale
+  type PlayerSubtitleScale,
+  type PlayerVideoEnhancement
 } from "@shared/player-contract";
 import { formatPlaybackTime } from "./player-ui-model";
 import type { DesktopWindowDragHandlers } from "./use-desktop-window-drag";
@@ -78,6 +80,7 @@ interface PlayerChromeProps {
   onChangeRate: (rate: number) => void;
   onChangeSubtitle: (subtitleId?: string) => void;
   onChangeSubtitleScale: (subtitleScale: PlayerSubtitleScale) => void;
+  onChangeVideoEnhancement?: (videoEnhancement: PlayerVideoEnhancement) => void;
   onClose: () => void;
   onGoNext: () => void;
   onGoPrevious: () => void;
@@ -99,6 +102,9 @@ interface PlayerChromeProps {
   statusBadges: string[];
   subtitleScale: PlayerSubtitleScale;
   subtitleScaleAvailable: boolean;
+  videoEnhancement?: PlayerVideoEnhancement;
+  videoEnhancementAvailable?: boolean;
+  videoEnhancementDegraded?: boolean;
   subtitles: RemotePlaybackSubtitle[];
   visible: boolean;
   volume: number;
@@ -246,6 +252,7 @@ function PlayerBottomBar(
           <SubtitleMenu {...props} />
           <PlaybackRateMenu {...props} />
           <AspectRatioMenu {...props} />
+          <VideoEnhancementMenu {...props} />
           {props.mode && props.onChangeMode && <PlaybackModeMenu {...props} mode={props.mode} onChangeMode={props.onChangeMode} />}
           {props.pictureInPictureAvailable !== false && (
             <PlayerIconButton aria-pressed={props.pictureInPicture} label="画中画" onClick={props.onTogglePictureInPicture}>
@@ -393,6 +400,37 @@ function AspectRatioMenu(props: PlayerChromeProps) {
   );
 }
 
+/** 仅在原生 GPU shader 可用时提供三档画质增强。 */
+function VideoEnhancementMenu(props: PlayerChromeProps) {
+  if (!props.videoEnhancementAvailable || !props.onChangeVideoEnhancement) return null;
+  return (
+    <DropdownMenu>
+      <DropdownMenuTrigger asChild>
+        <Button aria-label="画质增强" size="icon" variant="media"><Sparkles /></Button>
+      </DropdownMenuTrigger>
+      <DropdownMenuContent align="end">
+        <DropdownMenuLabel>画质增强</DropdownMenuLabel>
+        <DropdownMenuRadioGroup
+          onValueChange={(value) => props.onChangeVideoEnhancement?.(value as PlayerVideoEnhancement)}
+          value={props.videoEnhancement ?? "off"}
+        >
+          <DropdownMenuRadioItem value="off">关闭</DropdownMenuRadioItem>
+          <DropdownMenuRadioItem value="balanced">均衡</DropdownMenuRadioItem>
+          <DropdownMenuRadioItem value="clear">清晰</DropdownMenuRadioItem>
+        </DropdownMenuRadioGroup>
+        {props.videoEnhancementDegraded && (
+          <>
+            <DropdownMenuSeparator />
+            <p className="max-w-56 px-2 py-1.5 text-xs text-muted-foreground">
+              已根据实时渲染性能自动降低档位
+            </p>
+          </>
+        )}
+      </DropdownMenuContent>
+    </DropdownMenu>
+  );
+}
+
 /** 提供原文件与实时转码模式切换。 */
 function PlaybackModeMenu(
   props: PlayerChromeProps & {
@@ -466,6 +504,25 @@ function PlayerSettingsSheet(
               <ToggleGroupItem value="transcode">实时转码</ToggleGroupItem>
             </ToggleGroup>
           </div>}
+          {props.videoEnhancementAvailable && props.onChangeVideoEnhancement && (
+            <div className="flex flex-col gap-2">
+              <h3 className="text-sm font-medium">画质增强</h3>
+              <ToggleGroup
+                className="justify-start"
+                onValueChange={(value) => value && props.onChangeVideoEnhancement?.(value as PlayerVideoEnhancement)}
+                type="single"
+                value={props.videoEnhancement ?? "off"}
+                variant="outline"
+              >
+                <ToggleGroupItem value="off">关闭</ToggleGroupItem>
+                <ToggleGroupItem value="balanced">均衡</ToggleGroupItem>
+                <ToggleGroupItem value="clear">清晰</ToggleGroupItem>
+              </ToggleGroup>
+              {props.videoEnhancementDegraded && (
+                <p className="text-xs text-muted-foreground">已根据实时渲染性能自动降低档位</p>
+              )}
+            </div>
+          )}
           <div className="flex flex-col gap-2">
             <h3 className="text-sm font-medium">播放速度</h3>
             <ToggleGroup className="flex-wrap justify-start" onValueChange={(value) => value && props.onChangeRate(Number(value))} type="single" value={String(props.playbackRate)} variant="outline">

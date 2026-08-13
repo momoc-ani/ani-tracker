@@ -21,7 +21,8 @@ import {
   type PlayerCapabilities,
   type PlayerCommand,
   type PlayerSnapshot,
-  type PlayerSubtitleScale
+  type PlayerSubtitleScale,
+  type PlayerVideoEnhancement
 } from "@shared/player-contract";
 import { resolvePlayerShortcut } from "@shared/player-shortcuts";
 import {
@@ -40,6 +41,7 @@ import { buildPlayerEpisodeItems, type PlayerEpisodeUiItem } from "./player-ui-m
 import { useDesktopWindowDrag } from "./use-desktop-window-drag";
 import { usePlaybackBusiness } from "./use-playback-business";
 import { readStoredSubtitleScale, storeSubtitleScale } from "./subtitle-scale";
+import { readStoredVideoEnhancement, storeVideoEnhancement } from "./video-enhancement";
 
 const TOOLBAR_HIDE_DELAY_MS = 3_000;
 
@@ -172,6 +174,8 @@ function DesktopVlcControls({
   const commandSequenceRef = useRef(0);
   const [subtitleScale, setSubtitleScale] = useState<PlayerSubtitleScale>(readStoredSubtitleScale);
   const initialSubtitleScaleRef = useRef(subtitleScale);
+  const [videoEnhancement, setVideoEnhancement] = useState<PlayerVideoEnhancement>(readStoredVideoEnhancement);
+  const initialVideoEnhancementRef = useRef(videoEnhancement);
   const [capabilities, setCapabilities] = useState<PlayerCapabilities>();
   const [session, setSession] = useState<RemotePlaybackSession | null>(null);
   const [snapshot, setSnapshot] = useState<PlayerSnapshot>();
@@ -195,7 +199,7 @@ function DesktopVlcControls({
   const animeTitle = anime?.title ?? activeItem?.task.animeTitle ?? "Ani Tracker";
   const episodeLabel = activeItem ? playlistItemLabel(activeItem) : "当前视频";
   const runtimeError = capabilities?.availability === "unavailable"
-    ? capabilities.unavailableReason ?? "libVLC 原生运行时不可用"
+    ? capabilities.unavailableReason ?? "原生播放器运行时不可用"
     : null;
   const currentError = loadError ?? playbackError ?? snapshot?.error?.message ?? runtimeError;
   const episodeItems = useMemo(() => buildPlayerEpisodeItems({
@@ -245,6 +249,7 @@ function DesktopVlcControls({
   useEffect(() => appApi.onDesktopPlayerSnapshot((incoming) => {
     const activeSessionId = activeSessionIdRef.current;
     if (!activeSessionId) return;
+    setCapabilities(incoming.capabilities);
     setSnapshot((current) => acceptPlayerSnapshot(activeSessionId, current, incoming));
   }), []);
 
@@ -310,6 +315,21 @@ function DesktopVlcControls({
             subtitleScale: initialSubtitleScaleRef.current,
             error: subtitleScaleResult.error.message
           });
+        }
+        if (capabilities.supportsVideoEnhancement) {
+          const enhancementCommand: Extract<PlayerCommand, { type: "set-video-enhancement" }> = {
+            type: "set-video-enhancement",
+            commandId: createCommandId(commandSequenceRef),
+            sessionId: result.id,
+            videoEnhancement: initialVideoEnhancementRef.current
+          };
+          const enhancementResult = await appApi.dispatchDesktopPlayerCommand(enhancementCommand);
+          if (!enhancementResult.accepted) {
+            console.warn("[player] 桌面画质增强恢复失败", {
+              videoEnhancement: initialVideoEnhancementRef.current,
+              error: enhancementResult.error.message
+            });
+          }
         }
       }).catch((caught) => {
         if (!active) return;
@@ -425,6 +445,20 @@ function DesktopVlcControls({
       console.info("[player] 桌面字幕大小已保存", { subtitleScale: value });
     });
   };
+  const changeVideoEnhancement = (value: PlayerVideoEnhancement): void => {
+    const command = createCommand<Extract<PlayerCommand, { type: "set-video-enhancement" }>>({
+      type: "set-video-enhancement",
+      videoEnhancement: value
+    });
+    if (!command) return;
+    void dispatchCommand(command).then((accepted) => {
+      if (!accepted) return;
+      initialVideoEnhancementRef.current = value;
+      setVideoEnhancement(value);
+      storeVideoEnhancement(value);
+      console.info("[player] 桌面画质增强预设已保存", { videoEnhancement: value });
+    });
+  };
   const toggleFullscreen = (): void => {
     const command = createCommand<Extract<PlayerCommand, { type: "set-fullscreen" }>>({
       type: "set-fullscreen",
@@ -475,7 +509,7 @@ function DesktopVlcControls({
     else setRetryNonce((value) => value + 1);
   };
   const statusBadges = [
-    "libVLC",
+    snapshot?.backend === "mpv" ? "libmpv" : "libVLC",
     session ? "原文件直放" : undefined,
     snapshot ? `${snapshot.subtitleTracks.length} 条字幕` : undefined,
     activeItem?.task.resolution?.toUpperCase()
@@ -501,7 +535,7 @@ function DesktopVlcControls({
           <div className="absolute inset-0 z-10 flex items-center justify-center text-white">
             <div className="flex flex-col items-center gap-2 text-sm">
               <LoaderCircle className="animate-spin" aria-hidden="true" />
-              <span>正在准备 libVLC</span>
+              <span>正在准备原生播放器</span>
             </div>
           </div>
         )}
@@ -510,7 +544,7 @@ function DesktopVlcControls({
             message={currentError}
             onClose={() => closeAfterFlush(onClose)}
             onRetry={capabilities?.availability === "available" ? retry : undefined}
-            title={runtimeError ? "libVLC 无法启动" : loadError ? "播放器无法打开" : "播放失败"}
+            title={runtimeError ? "原生播放器无法启动" : loadError ? "播放器无法打开" : "播放失败"}
           />
         )}
         {autoNextSeconds !== undefined && nextItem && (
@@ -537,6 +571,7 @@ function DesktopVlcControls({
           onChangeRate={setRate}
           onChangeSubtitle={changeSubtitle}
           onChangeSubtitleScale={changeSubtitleScale}
+          onChangeVideoEnhancement={changeVideoEnhancement}
           onClose={() => closeAfterFlush(onClose)}
           onGoNext={() => nextItem && selectItemAfterFlush(nextItem)}
           onGoPrevious={() => previousItem && selectItemAfterFlush(previousItem)}
@@ -557,6 +592,9 @@ function DesktopVlcControls({
           statusBadges={statusBadges}
           subtitleScale={subtitleScale}
           subtitleScaleAvailable={capabilities?.supportsSubtitleScale ?? false}
+          videoEnhancement={snapshot?.videoEnhancement ?? videoEnhancement}
+          videoEnhancementAvailable={capabilities?.supportsVideoEnhancement ?? false}
+          videoEnhancementDegraded={snapshot?.videoEnhancementDegraded ?? false}
           subtitles={subtitleOptions}
           visible={toolbarVisible}
           volume={snapshot?.volume ?? 0.7}
