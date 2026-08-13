@@ -286,6 +286,17 @@ pub struct SelectPlayerExecutableInput {
 pub enum PlayerBackend {
     Artplayer,
     Libvlc,
+    Mpv,
+}
+
+/// GPU 视频增强预设；字幕和 OSD 在该阶段之后由播放器合成。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum PlayerVideoEnhancement {
+    #[default]
+    Off,
+    Balanced,
+    Clear,
 }
 
 /// 播放器所在的平台宿主。
@@ -387,6 +398,8 @@ pub struct PlayerCapabilities {
     pub supports_subtitle_tracks: bool,
     #[serde(default)]
     pub supports_subtitle_scale: bool,
+    #[serde(default)]
+    pub supports_video_enhancement: bool,
     pub supports_aspect_ratio: bool,
     pub supports_fullscreen: bool,
     pub supports_picture_in_picture: bool,
@@ -540,6 +553,9 @@ pub enum PlayerCommandAction {
     SetSubtitleScale {
         subtitle_scale: u16,
     },
+    SetVideoEnhancement {
+        video_enhancement: PlayerVideoEnhancement,
+    },
     SetAspectRatio {
         aspect_ratio: PlayerAspectRatio,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -571,6 +587,7 @@ impl PlayerCommand {
             PlayerCommandAction::SelectAudioTrack { .. } => "select-audio-track",
             PlayerCommandAction::SelectSubtitleTrack { .. } => "select-subtitle-track",
             PlayerCommandAction::SetSubtitleScale { .. } => "set-subtitle-scale",
+            PlayerCommandAction::SetVideoEnhancement { .. } => "set-video-enhancement",
             PlayerCommandAction::SetAspectRatio { .. } => "set-aspect-ratio",
             PlayerCommandAction::SetFullscreen { .. } => "set-fullscreen",
             PlayerCommandAction::SetPictureInPicture { .. } => "set-picture-in-picture",
@@ -615,6 +632,10 @@ pub struct PlayerSnapshot {
     pub subtitle_tracks: Vec<PlayerTrack>,
     #[serde(default = "default_subtitle_scale")]
     pub subtitle_scale: u16,
+    #[serde(default)]
+    pub video_enhancement: PlayerVideoEnhancement,
+    #[serde(default)]
+    pub video_enhancement_degraded: bool,
     pub aspect_ratio: PlayerAspectRatio,
     pub fullscreen: bool,
     pub picture_in_picture: bool,

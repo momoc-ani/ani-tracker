@@ -9,6 +9,8 @@ mod desktop;
 mod desktop_runtime;
 #[cfg(mobile)]
 mod mobile;
+#[cfg(desktop)]
+mod mpv_runtime;
 
 mod error;
 

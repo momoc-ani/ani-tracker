@@ -1,5 +1,8 @@
 /** 播放器后端类型，网页端与原生端通过同一行为契约接入。 */
-export type PlayerBackend = "artplayer" | "libvlc";
+export type PlayerBackend = "artplayer" | "libvlc" | "mpv";
+
+/** GPU 视频增强预设；字幕和 OSD 在增强后合成。 */
+export type PlayerVideoEnhancement = "off" | "balanced" | "clear";
 
 /** 播放器宿主平台。 */
 export type PlayerHostPlatform = "remote-web" | "tauri-desktop" | "android" | "ios";
@@ -81,6 +84,7 @@ export interface PlayerCapabilities {
   supportsAudioTracks: boolean;
   supportsSubtitleTracks: boolean;
   supportsSubtitleScale: boolean;
+  supportsVideoEnhancement: boolean;
   supportsAspectRatio: boolean;
   supportsFullscreen: boolean;
   supportsPictureInPicture: boolean;
@@ -157,6 +161,7 @@ export type PlayerCommand =
   | (PlayerCommandBase & { type: "select-audio-track"; trackId: string })
   | (PlayerCommandBase & { type: "select-subtitle-track"; trackId?: string })
   | (PlayerCommandBase & { type: "set-subtitle-scale"; subtitleScale: PlayerSubtitleScale })
+  | (PlayerCommandBase & { type: "set-video-enhancement"; videoEnhancement: PlayerVideoEnhancement })
   | (PlayerCommandBase & { type: "set-aspect-ratio"; aspectRatio: PlayerAspectRatio; value?: string })
   | (PlayerCommandBase & { type: "set-fullscreen"; fullscreen: boolean })
   | (PlayerCommandBase & { type: "set-picture-in-picture"; enabled: boolean })
@@ -189,6 +194,8 @@ export interface PlayerSnapshot {
   audioTracks: PlayerTrack[];
   subtitleTracks: PlayerTrack[];
   subtitleScale: PlayerSubtitleScale;
+  videoEnhancement: PlayerVideoEnhancement;
+  videoEnhancementDegraded: boolean;
   aspectRatio: PlayerAspectRatio;
   fullscreen: boolean;
   pictureInPicture: boolean;
@@ -219,6 +226,7 @@ export function createUnavailablePlayerCapabilities(
     supportsAudioTracks: false,
     supportsSubtitleTracks: false,
     supportsSubtitleScale: false,
+    supportsVideoEnhancement: false,
     supportsAspectRatio: false,
     supportsFullscreen: false,
     supportsPictureInPicture: false,
@@ -263,6 +271,8 @@ export function createInitialPlayerSnapshot(input: InitialPlayerSnapshotInput): 
     audioTracks: [],
     subtitleTracks: [],
     subtitleScale: 100,
+    videoEnhancement: "off",
+    videoEnhancementDegraded: false,
     aspectRatio: "default",
     fullscreen: false,
     pictureInPicture: false

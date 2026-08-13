@@ -361,6 +361,12 @@ impl VlcRuntime {
             PlayerCommandAction::SetPictureInPicture { .. } => {
                 return Ok(unsupported(&command_id, "桌面 libVLC 暂不支持画中画"));
             }
+            PlayerCommandAction::SetVideoEnhancement { .. } => {
+                return Ok(unsupported(
+                    &command_id,
+                    "桌面 libVLC 不支持 GPU shader 画质增强",
+                ));
+            }
             PlayerCommandAction::PreviousItem | PlayerCommandAction::NextItem => {
                 return Ok(unsupported(&command_id, "播放列表切换由页面会话管理"));
             }
@@ -509,6 +515,7 @@ impl VlcRuntime {
                 }
             }
             PlayerCommandAction::Close
+            | PlayerCommandAction::SetVideoEnhancement { .. }
             | PlayerCommandAction::SetPictureInPicture { .. }
             | PlayerCommandAction::PreviousItem
             | PlayerCommandAction::NextItem => {}
@@ -1044,6 +1051,7 @@ fn desktop_capabilities() -> PlayerCapabilities {
         supports_audio_tracks: true,
         supports_subtitle_tracks: true,
         supports_subtitle_scale: true,
+        supports_video_enhancement: false,
         supports_aspect_ratio: true,
         supports_fullscreen: true,
         supports_picture_in_picture: false,
@@ -1105,6 +1113,8 @@ fn initial_snapshot(
         audio_tracks: Vec::new(),
         subtitle_tracks: Vec::new(),
         subtitle_scale,
+        video_enhancement: ani_contracts::PlayerVideoEnhancement::Off,
+        video_enhancement_degraded: false,
         aspect_ratio: PlayerAspectRatio::Default,
         fullscreen: false,
         picture_in_picture: false,

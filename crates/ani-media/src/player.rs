@@ -177,6 +177,7 @@ pub fn validate_command(command: &PlayerCommand) -> Option<PlayerError> {
                 return Some(invalid_command("字幕缩放比例无效"));
             }
         }
+        PlayerCommandAction::SetVideoEnhancement { .. } => {}
         PlayerCommandAction::SetAspectRatio {
             aspect_ratio: ani_contracts::PlayerAspectRatio::Custom,
             value,
@@ -371,6 +372,7 @@ mod tests {
             supports_audio_tracks: true,
             supports_subtitle_tracks: true,
             supports_subtitle_scale: true,
+            supports_video_enhancement: true,
             supports_aspect_ratio: true,
             supports_fullscreen: true,
             supports_picture_in_picture: false,

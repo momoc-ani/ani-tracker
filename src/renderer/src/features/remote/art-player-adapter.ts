@@ -26,6 +26,7 @@ const ART_PLAYER_CAPABILITIES: PlayerCapabilities = {
   supportsAudioTracks: false,
   supportsSubtitleTracks: true,
   supportsSubtitleScale: true,
+  supportsVideoEnhancement: false,
   supportsAspectRatio: true,
   supportsFullscreen: true,
   supportsPictureInPicture: true,
@@ -134,6 +135,8 @@ export class ArtPlayerAdapter implements UnifiedPlayerAdapter {
           }
           this.setSubtitleScale(command.subtitleScale);
           break;
+        case "set-video-enhancement":
+          return rejectUnsupportedPlayerCommand(command.commandId, "网页播放器不支持 GPU 画质增强");
         case "set-aspect-ratio":
           if (!this.player || !isValidAspectRatio(command.aspectRatio, command.value)) {
             return reject(command, createPlayerError("unknown", "画面比例无效", false, []));

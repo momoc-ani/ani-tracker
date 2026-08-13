@@ -20,6 +20,7 @@ const capabilities: PlayerCapabilities = {
   supportsAudioTracks: true,
   supportsSubtitleTracks: true,
   supportsSubtitleScale: true,
+  supportsVideoEnhancement: true,
   supportsAspectRatio: true,
   supportsFullscreen: true,
   supportsPictureInPicture: false,
@@ -37,6 +38,7 @@ test("createInitialPlayerSnapshot 创建稳定的空闲状态", () => {
   assert.equal(snapshot.status, "idle");
   assert.equal(snapshot.volume, 1);
   assert.equal(snapshot.subtitleScale, 100);
+  assert.equal(snapshot.videoEnhancement, "off");
   assert.deepEqual(snapshot.playlist.items, []);
 });
 
@@ -47,6 +49,7 @@ test("createUnavailablePlayerCapabilities 默认关闭所有原生能力", () =>
   assert.equal(unavailable.canSeek, false);
   assert.equal(unavailable.supportsDirectPlayback, false);
   assert.equal(unavailable.supportsSubtitleScale, false);
+  assert.equal(unavailable.supportsVideoEnhancement, false);
   assert.deepEqual(unavailable.playbackRates, [1]);
   assert.equal(unavailable.unavailableReason, "运行时缺失");
 });
