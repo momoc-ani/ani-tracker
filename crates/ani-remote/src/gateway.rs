@@ -545,6 +545,7 @@ async fn handle_request(
                     &body.mode,
                     body.file_index,
                     body.enhancement,
+                    body.start_position_seconds,
                 )
                 .await
         } else {
@@ -555,6 +556,7 @@ async fn handle_request(
                     &body.mode,
                     body.file_index,
                     body.enhancement,
+                    body.start_position_seconds,
                 )
                 .await
         }
@@ -1092,6 +1094,8 @@ struct MediaSessionBody {
     file_index: Option<i64>,
     #[serde(default)]
     enhancement: RemotePlaybackEnhancement,
+    #[serde(default)]
+    start_position_seconds: Option<f64>,
 }
 
 struct BrowserMediaRoute {

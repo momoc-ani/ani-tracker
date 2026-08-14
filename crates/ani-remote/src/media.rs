@@ -34,6 +34,7 @@ const SESSION_TTL: Duration = Duration::from_secs(30 * 60);
 const TRANSCODER_START_TIMEOUT: Duration = Duration::from_secs(20);
 const ENCODER_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 const HLS_SEGMENT_SECONDS: &str = "2";
+const HLS_SEEK_PREROLL_SECONDS: f64 = 3.0;
 const FFMPEG_STDERR_LIMIT: usize = 32 * 1024;
 const MAX_SESSIONS: usize = 2;
 const RIFE_FRAME_QUEUE_CAPACITY: usize = 2;
@@ -142,6 +143,17 @@ impl RemoteMediaError {
 enum SessionAccess {
     Browser,
     External,
+}
+
+/// 汇总创建远程媒体会话所需参数，避免调用链散落位置参数。
+struct SessionCreateRequest<'a> {
+    task_id: &'a str,
+    device_id: &'a str,
+    requested_mode: &'a str,
+    file_index: Option<i64>,
+    enhancement: RemotePlaybackEnhancement,
+    start_position_seconds: Option<f64>,
+    access: SessionAccess,
 }
 
 struct SessionRecord {
@@ -314,15 +326,17 @@ impl RemoteMediaSessionService {
         requested_mode: &str,
         file_index: Option<i64>,
         enhancement: RemotePlaybackEnhancement,
+        start_position_seconds: Option<f64>,
     ) -> Result<RemotePlaybackSession, RemoteMediaError> {
-        self.create_session_record(
+        self.create_session_record(SessionCreateRequest {
             task_id,
             device_id,
             requested_mode,
             file_index,
             enhancement,
-            SessionAccess::Browser,
-        )
+            start_position_seconds,
+            access: SessionAccess::Browser,
+        })
         .await
     }
 
@@ -334,27 +348,33 @@ impl RemoteMediaSessionService {
         requested_mode: &str,
         file_index: Option<i64>,
         enhancement: RemotePlaybackEnhancement,
+        start_position_seconds: Option<f64>,
     ) -> Result<RemotePlaybackSession, RemoteMediaError> {
-        self.create_session_record(
+        self.create_session_record(SessionCreateRequest {
             task_id,
             device_id,
             requested_mode,
             file_index,
             enhancement,
-            SessionAccess::External,
-        )
+            start_position_seconds,
+            access: SessionAccess::External,
+        })
         .await
     }
 
     async fn create_session_record(
         self: &Arc<Self>,
-        task_id: &str,
-        device_id: &str,
-        requested_mode: &str,
-        file_index: Option<i64>,
-        enhancement: RemotePlaybackEnhancement,
-        access: SessionAccess,
+        request: SessionCreateRequest<'_>,
     ) -> Result<RemotePlaybackSession, RemoteMediaError> {
+        let SessionCreateRequest {
+            task_id,
+            device_id,
+            requested_mode,
+            file_index,
+            enhancement,
+            start_position_seconds: requested_start_position_seconds,
+            access,
+        } = request;
         if !matches!(requested_mode, "direct" | "transcode") {
             return Err(RemoteMediaError::new(
                 400,
@@ -383,6 +403,23 @@ impl RemoteMediaSessionService {
             .get_playback_checkpoint(&task.id, media.file_index)
             .await
             .map_err(internal_media_error)?;
+        let mode = if requested_mode == "transcode" {
+            "hls"
+        } else {
+            "direct"
+        };
+        let start_position_seconds = resolve_session_start_position(
+            requested_start_position_seconds,
+            checkpoint.as_ref(),
+            media.duration_seconds,
+        )?;
+        let stream_start_position_seconds = if mode == "hls" {
+            start_position_seconds
+                .map(|position| (position - HLS_SEEK_PREROLL_SECONDS).max(0.0))
+                .unwrap_or(0.0)
+        } else {
+            0.0
+        };
         self.close_matching(device_id, task_id, access).await;
         self.reserve_slot().await;
 
@@ -400,13 +437,13 @@ impl RemoteMediaSessionService {
             |token| format!("/api/media/external/{token}/sessions/{id}"),
         );
         let subtitles = self
-            .prepare_subtitles(&media.path, &temporary_directory, &asset_base)
+            .prepare_subtitles(
+                &media.path,
+                &temporary_directory,
+                &asset_base,
+                stream_start_position_seconds,
+            )
             .await;
-        let mode = if requested_mode == "transcode" {
-            "hls"
-        } else {
-            "direct"
-        };
         let mut process = None;
         let mut diagnostics = RemotePlaybackDiagnostics {
             subtitle_mode: Some("soft".to_owned()),
@@ -418,7 +455,12 @@ impl RemoteMediaSessionService {
         };
         if mode == "hls" {
             let started = self
-                .start_hls(&media.path, &temporary_directory, enhancement)
+                .start_hls(
+                    &media.path,
+                    &temporary_directory,
+                    enhancement,
+                    stream_start_position_seconds,
+                )
                 .await
                 .inspect_err(|_| {
                     let _ = std::fs::remove_dir_all(&temporary_directory);
@@ -455,7 +497,8 @@ impl RemoteMediaSessionService {
                 + chrono::Duration::from_std(SESSION_TTL).unwrap_or(chrono::Duration::minutes(30)))
             .to_rfc3339_opts(SecondsFormat::Millis, true),
             duration_seconds: media.duration_seconds,
-            start_position_seconds: resolve_resume_position(checkpoint.as_ref()),
+            start_position_seconds,
+            stream_start_position_seconds,
             subtitles,
             diagnostics,
         };
@@ -478,8 +521,9 @@ impl RemoteMediaSessionService {
             service.close_if_expired(&expiration_id).await;
         });
         log::info!(
-            "Rust 远程媒体会话已创建 session_id={id} task_id={} mode={mode}",
-            task.id
+            "Rust 远程媒体会话已创建 session_id={id} task_id={} mode={mode} start_position={:?} stream_start={stream_start_position_seconds:.3}",
+            task.id,
+            start_position_seconds
         );
         Ok(public)
     }
@@ -834,10 +878,13 @@ impl RemoteMediaSessionService {
             if !extensions.contains(&extension(&path.to_string_lossy())) {
                 continue;
             }
-            let duration_seconds = media
-                .as_ref()
-                .and_then(|media| media.duration_seconds)
-                .or(self.probe_duration(&path).await);
+            let duration_seconds = self.probe_duration(&path).await.or_else(|| {
+                let fallback = media.as_ref().and_then(|media| media.duration_seconds);
+                if fallback.is_some() {
+                    log::warn!("FFprobe 未返回媒体总时长，回退数据库媒体时长");
+                }
+                fallback
+            });
             return Ok(ResolvedMedia {
                 content_type: direct_content_type(&path),
                 path,
@@ -888,6 +935,7 @@ impl RemoteMediaSessionService {
         source_path: &Path,
         output_directory: &Path,
         asset_base: &str,
+        stream_start_position_seconds: f64,
     ) -> Vec<RemotePlaybackSubtitle> {
         let streams = match self.probe_subtitles(source_path).await {
             Ok(streams) => streams,
@@ -905,8 +953,10 @@ impl RemoteMediaSessionService {
             let asset_name = format!("subtitle-{order:03}.{}", stream.output_type);
             let output_path = output_directory.join(&asset_name);
             let mut command = hidden_command(&self.tools.ffmpeg_path);
+            command.args(["-nostdin", "-hide_banner", "-loglevel", "error"]);
+            append_input_seek_args(&mut command, stream_start_position_seconds);
             command
-                .args(["-nostdin", "-hide_banner", "-loglevel", "error", "-i"])
+                .arg("-i")
                 .arg(source_path)
                 .args([
                     "-map",
@@ -977,6 +1027,7 @@ impl RemoteMediaSessionService {
         source_path: &Path,
         output_directory: &Path,
         enhancement: RemotePlaybackEnhancement,
+        stream_start_position_seconds: f64,
     ) -> Result<HlsStart, RemoteMediaError> {
         let wants_rife = enhancement.frame_interpolation == PlayerFrameInterpolation::RifeRealtime;
         let wants_realesrgan = enhancement.video_enhancement == PlayerVideoEnhancement::Clear;
@@ -1058,6 +1109,7 @@ impl RemoteMediaSessionService {
                             video_probe,
                             interpolation_capacity: interpolation_capacity.clone(),
                         },
+                        stream_start_position_seconds,
                     )
                     .await
                 {
@@ -1086,6 +1138,7 @@ impl RemoteMediaSessionService {
                         },
                         ..enhancement
                     },
+                    stream_start_position_seconds,
                 )
                 .await
                 .map(|mut started| {
@@ -1098,8 +1151,13 @@ impl RemoteMediaSessionService {
                     started
                 });
         }
-        self.start_hls_ffmpeg(source_path, output_directory, enhancement)
-            .await
+        self.start_hls_ffmpeg(
+            source_path,
+            output_directory,
+            enhancement,
+            stream_start_position_seconds,
+        )
+        .await
     }
 
     async fn ensure_rife_runtime(&self) -> Result<Arc<ModelSidecarRuntime>, String> {
@@ -1174,6 +1232,7 @@ impl RemoteMediaSessionService {
         source_path: &Path,
         output_directory: &Path,
         enhancement: RemotePlaybackEnhancement,
+        stream_start_position_seconds: f64,
     ) -> Result<HlsStart, RemoteMediaError> {
         let playlist = output_directory.join("index.m3u8");
         let segments = output_directory.join("segment-%06d.ts");
@@ -1186,8 +1245,10 @@ impl RemoteMediaSessionService {
             for &(codec, encoder) in &candidates {
                 let _ = tokio::fs::remove_file(&playlist).await;
                 let mut command = hidden_command(&self.tools.ffmpeg_path);
+                command.args(["-nostdin", "-hide_banner", "-loglevel", "warning"]);
+                append_input_seek_args(&mut command, stream_start_position_seconds);
                 command
-                    .args(["-nostdin", "-hide_banner", "-loglevel", "warning", "-i"])
+                    .arg("-i")
                     .arg(source_path)
                     .args(["-map", "0:v:0", "-map", "0:a:0?", "-c:v"])
                     .args(encoder_video_args(codec))
@@ -1278,6 +1339,7 @@ impl RemoteMediaSessionService {
         source_path: &Path,
         output_directory: &Path,
         config: ModelHlsConfig,
+        stream_start_position_seconds: f64,
     ) -> Result<HlsStart, RemoteMediaError> {
         let ModelHlsConfig {
             enhancement,
@@ -1316,8 +1378,10 @@ impl RemoteMediaSessionService {
             RemoteMediaError::new(503, "MODEL_ENCODER_UNAVAILABLE", "没有可用的视频编码器")
         })?;
         let mut decoder = hidden_command(&self.tools.ffmpeg_path);
+        decoder.args(["-nostdin", "-hide_banner", "-loglevel", "error"]);
+        append_input_seek_args(&mut decoder, stream_start_position_seconds);
         decoder
-            .args(["-nostdin", "-hide_banner", "-loglevel", "error", "-i"])
+            .arg("-i")
             .arg(source_path)
             .args([
                 "-map", "0:v:0", "-an", "-vsync", "0", "-f", "rawvideo", "-pix_fmt", "rgb24",
@@ -1343,24 +1407,25 @@ impl RemoteMediaSessionService {
 
         let mut encoder = hidden_command(&self.tools.ffmpeg_path);
         let fps_arg = format!("{output_fps:.6}");
+        encoder.args([
+            "-nostdin",
+            "-hide_banner",
+            "-loglevel",
+            "warning",
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "rgb24",
+            "-s",
+            &dimensions,
+            "-r",
+            &fps_arg,
+            "-i",
+            "pipe:0",
+        ]);
+        append_input_seek_args(&mut encoder, stream_start_position_seconds);
         encoder
-            .args([
-                "-nostdin",
-                "-hide_banner",
-                "-loglevel",
-                "warning",
-                "-f",
-                "rawvideo",
-                "-pix_fmt",
-                "rgb24",
-                "-s",
-                &dimensions,
-                "-r",
-                &fps_arg,
-                "-i",
-                "pipe:0",
-                "-i",
-            ])
+            .arg("-i")
             .arg(source_path)
             .args(["-map", "0:v:0", "-map", "1:a:0?", "-c:v"])
             .args(encoder_video_args(encoder_codec))
@@ -2087,6 +2152,14 @@ fn append_hls_output_args(command: &mut Command, segments: &Path, playlist: &Pat
         .arg(playlist);
 }
 
+/// 为视频、音频或字幕输入追加统一的快速定位参数。
+fn append_input_seek_args(command: &mut Command, position_seconds: f64) {
+    if position_seconds <= 0.0 {
+        return;
+    }
+    command.arg("-ss").arg(format!("{position_seconds:.3}"));
+}
+
 /// 确认播放列表已包含可播放分片，而不只判断空文件存在。
 async fn hls_playlist_ready(playlist: &Path) -> bool {
     tokio::fs::read(playlist).await.ok().is_some_and(|content| {
@@ -2588,6 +2661,29 @@ fn resolve_resume_position(checkpoint: Option<&PlaybackCheckpoint>) -> Option<f6
     Some(checkpoint.position_seconds)
 }
 
+/// 优先采用显式跳转位置，否则读取续播点，并限制在媒体总时长内。
+fn resolve_session_start_position(
+    requested_position_seconds: Option<f64>,
+    checkpoint: Option<&PlaybackCheckpoint>,
+    duration_seconds: Option<i64>,
+) -> Result<Option<f64>, RemoteMediaError> {
+    if requested_position_seconds.is_some_and(|position| !position.is_finite() || position < 0.0) {
+        return Err(RemoteMediaError::new(
+            400,
+            "MEDIA_START_POSITION_INVALID",
+            "播放起点无效",
+        ));
+    }
+    let Some(position) = requested_position_seconds.or_else(|| resolve_resume_position(checkpoint))
+    else {
+        return Ok(None);
+    };
+    let position = duration_seconds
+        .filter(|duration| *duration >= 0)
+        .map_or(position, |duration| position.min(duration as f64));
+    Ok(Some(position))
+}
+
 fn random_token(size: usize) -> String {
     let mut bytes = vec![0_u8; size];
     OsRng.fill_bytes(&mut bytes);
@@ -2705,5 +2801,25 @@ mod tests {
             updated_at: "2026-07-25T00:00:00.000Z".to_owned(),
         };
         assert_eq!(resolve_resume_position(Some(&checkpoint)), None);
+    }
+
+    /// 验证显式跳转覆盖续播点，并按总时长裁剪。
+    #[test]
+    fn resolves_explicit_session_start_position() {
+        let checkpoint = PlaybackCheckpoint {
+            task_id: "task-1".to_owned(),
+            file_index: Some(0),
+            position_seconds: 90.0,
+            duration_seconds: 200.0,
+            completed: false,
+            watched_reported: false,
+            updated_at: "2026-08-14T00:00:00.000Z".to_owned(),
+        };
+        assert_eq!(
+            resolve_session_start_position(Some(240.0), Some(&checkpoint), Some(200))
+                .expect("显式播放起点应有效"),
+            Some(200.0)
+        );
+        assert!(resolve_session_start_position(Some(-1.0), None, Some(200)).is_err());
     }
 }

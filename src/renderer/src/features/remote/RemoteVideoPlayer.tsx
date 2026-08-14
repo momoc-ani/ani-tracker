@@ -113,6 +113,8 @@ export function RemoteVideoPlayer({
   const toolbarTimerRef = useRef<number>();
   const automaticFallbackStartedRef = useRef(false);
   const commandSequenceRef = useRef(0);
+  const sessionStartRequestCounterRef = useRef(0);
+  const sessionStartRequestRef = useRef<{ id: number; itemId: string; positionSeconds: number }>();
   const [subtitleScale, setSubtitleScale] = useState<PlayerSubtitleScale>(readStoredSubtitleScale);
   const subtitleScaleRef = useRef(subtitleScale);
   const [requestedMode, setRequestedMode] = useState<RemotePlaybackRequestMode>(readRemotePlaybackMode);
@@ -121,6 +123,7 @@ export function RemoteVideoPlayer({
   const [sessionDiagnostics, setSessionDiagnostics] = useState<RemotePlaybackDiagnostics>();
   const [playbackError, setPlaybackError] = useState<string | null>(null);
   const [retryNonce, setRetryNonce] = useState(0);
+  const [sessionStartRequestId, setSessionStartRequestId] = useState(0);
   const [toolbarVisible, setToolbarVisible] = useState(true);
   const [remoteFullscreenMode, setRemoteFullscreenMode] = useState<RemoteFullscreenMode | null>(null);
   const [playlistOpen, setPlaylistOpen] = useState(false);
@@ -244,6 +247,10 @@ export function RemoteVideoPlayer({
     }
     let active = true;
     let createdSession: RemotePlaybackSession | undefined;
+    const startRequest = sessionStartRequestRef.current?.id === sessionStartRequestId
+      && sessionStartRequestRef.current.itemId === activeItem.id
+      ? sessionStartRequestRef.current
+      : undefined;
     setSession(null);
     setSessionDiagnostics(undefined);
     setPlayerSnapshot(undefined);
@@ -256,12 +263,22 @@ export function RemoteVideoPlayer({
         taskId: activeItem.task.id,
         fileIndex: activeItem.fileIndex,
         requestedMode,
-        enhancement: sessionEnhancement
+        enhancement: sessionEnhancement,
+        startPositionSeconds: startRequest?.positionSeconds
       });
-      void sessionClient.create(activeItem.task.id, requestedMode, activeItem.fileIndex, sessionEnhancement)
+      void sessionClient.create(
+        activeItem.task.id,
+        requestedMode,
+        activeItem.fileIndex,
+        sessionEnhancement,
+        startRequest?.positionSeconds
+      )
         .then((result) => {
           createdSession = result;
           if (!active) return sessionClient.close(result.id);
+          if (sessionStartRequestRef.current?.id === startRequest?.id) {
+            sessionStartRequestRef.current = undefined;
+          }
           setSession(result);
           setSessionDiagnostics(result.diagnostics);
           console.info("[remote] 播放会话已创建", {
@@ -286,7 +303,7 @@ export function RemoteVideoPlayer({
       active = false;
       if (createdSession) void sessionClient.close(createdSession.id);
     };
-  }, [activeItem, requestedMode, retryNonce, sessionClient, sessionEnhancement]);
+  }, [activeItem, requestedMode, retryNonce, sessionClient, sessionEnhancement, sessionStartRequestId]);
 
   useEffect(() => {
     if (!session || session.mode !== "hls" || !sessionClient.refresh) return;
@@ -349,6 +366,7 @@ export function RemoteVideoPlayer({
         uri: session.streamUrl,
         mode: session.mode,
         durationSeconds: session.durationSeconds,
+        streamStartPositionSeconds: session.streamStartPositionSeconds,
         subtitles: session.subtitles.map((subtitle) => ({
           id: subtitle.id,
           label: subtitle.label,
@@ -440,7 +458,8 @@ export function RemoteVideoPlayer({
         activeItem.task.id,
         requestedMode,
         activeItem.fileIndex,
-        sessionEnhancement
+        sessionEnhancement,
+        currentTimeSeconds
       );
       const mediaUrl = new URL(externalSession.streamUrl, window.location.origin).toString();
       window.location.assign(buildExternalPlayerProtocolUrl(externalPlayer.kind, mediaUrl));
@@ -493,9 +512,27 @@ export function RemoteVideoPlayer({
 
   /** 跳转到合法媒体时间。 */
   const seekTo = (seconds: number): void => {
+    const targetPositionSeconds = Math.max(0, Math.min(durationSeconds, seconds));
+    const adapter = playerAdapterRef.current;
+    if (session?.mode === "hls" && (!adapter || !adapter.canSeekTo(targetPositionSeconds))) {
+      sessionStartRequestCounterRef.current += 1;
+      const request = {
+        id: sessionStartRequestCounterRef.current,
+        itemId: activeItem?.id ?? session.taskId,
+        positionSeconds: targetPositionSeconds
+      };
+      sessionStartRequestRef.current = request;
+      setPlaybackError(null);
+      setSessionStartRequestId(request.id);
+      console.info("[remote] 目标时间超出当前 HLS 窗口，正在重建会话", {
+        sessionId: session.id,
+        targetPositionSeconds
+      });
+      return;
+    }
     const command = createPlayerCommand<Extract<PlayerCommand, { type: "seek" }>>({
       type: "seek",
-      positionSeconds: Math.max(0, Math.min(durationSeconds, seconds))
+      positionSeconds: targetPositionSeconds
     });
     if (command) void dispatchPlayerCommand(command);
   };

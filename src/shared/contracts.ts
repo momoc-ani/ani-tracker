@@ -730,6 +730,7 @@ export interface RemotePlaybackSession {
   expiresAt: string;
   durationSeconds?: number;
   startPositionSeconds?: number;
+  streamStartPositionSeconds?: number;
   subtitles: RemotePlaybackSubtitle[];
   diagnostics?: RemotePlaybackDiagnostics;
 }

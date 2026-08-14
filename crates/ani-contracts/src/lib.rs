@@ -921,6 +921,8 @@ pub struct RemotePlaybackSession {
     pub duration_seconds: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub start_position_seconds: Option<f64>,
+    #[serde(default)]
+    pub stream_start_position_seconds: f64,
     pub subtitles: Vec<RemotePlaybackSubtitle>,
     #[serde(default)]
     pub diagnostics: RemotePlaybackDiagnostics,

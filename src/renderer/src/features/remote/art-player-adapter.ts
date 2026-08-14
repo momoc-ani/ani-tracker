@@ -78,6 +78,17 @@ export class ArtPlayerAdapter implements UnifiedPlayerAdapter {
     return this.snapshot;
   }
 
+  /** 判断绝对媒体时间是否位于当前浏览器可跳转范围。 */
+  canSeekTo(positionSeconds: number): boolean {
+    if (!this.player || !this.source || !Number.isFinite(positionSeconds) || positionSeconds < 0) {
+      return false;
+    }
+    if (this.source.mode !== "hls") return positionSeconds <= this.resolveDurationSeconds();
+    const localPositionSeconds = positionSeconds - this.timelineOffsetSeconds();
+    if (localPositionSeconds < 0) return false;
+    return timeRangesContain(this.player.template.$video.seekable, localPositionSeconds);
+  }
+
   /** 订阅完整快照，并立即收到当前状态。 */
   subscribe(listener: (snapshot: PlayerSnapshot) => void): () => void {
     this.listeners.add(listener);
@@ -109,7 +120,14 @@ export class ArtPlayerAdapter implements UnifiedPlayerAdapter {
           if (!this.player || !isFiniteRange(command.positionSeconds, 0, Number.MAX_SAFE_INTEGER)) {
             return reject(command, createPlayerError("unknown", "跳转时间无效", false, []));
           }
-          this.player.currentTime = clamp(command.positionSeconds, 0, this.player.duration || this.snapshot.durationSeconds);
+          if (this.source?.mode === "hls" && !this.canSeekTo(command.positionSeconds)) {
+            return reject(command, createPlayerError("resource-unavailable", "目标时间不在当前转码窗口", true, ["retry"]));
+          }
+          this.player.currentTime = clamp(
+            this.toLocalPosition(command.positionSeconds),
+            0,
+            this.resolveLocalDurationSeconds()
+          );
           break;
         case "set-volume":
           if (!this.player || !isFiniteRange(command.volume, 0, 1)) {
@@ -210,6 +228,7 @@ export class ArtPlayerAdapter implements UnifiedPlayerAdapter {
       sequence: this.sequence,
       status: "loading",
       source,
+      positionSeconds: startPositionSeconds ?? source.streamStartPositionSeconds ?? 0,
       durationSeconds: source.durationSeconds ?? 0,
       volume: this.snapshot.volume,
       muted: this.snapshot.muted,
@@ -252,11 +271,16 @@ export class ArtPlayerAdapter implements UnifiedPlayerAdapter {
     }, () => {
       if (this.player !== player || this.disposed) return;
       if (startPositionSeconds !== undefined && Number.isFinite(startPositionSeconds)) {
-        player.currentTime = clamp(startPositionSeconds, 0, player.duration || source.durationSeconds || 0);
+        player.currentTime = clamp(
+          this.toLocalPosition(startPositionSeconds),
+          0,
+          this.resolveLocalDurationSeconds()
+        );
       }
       this.patch({
         status: "ready",
-        durationSeconds: player.duration || source.durationSeconds || 0,
+        positionSeconds: this.toAbsolutePosition(player.currentTime),
+        durationSeconds: this.resolveDurationSeconds(),
         error: undefined
       });
     });
@@ -295,7 +319,7 @@ export class ArtPlayerAdapter implements UnifiedPlayerAdapter {
     }
     this.hls?.destroy();
     const startPosition = startPositionSeconds !== undefined && Number.isFinite(startPositionSeconds)
-      ? Math.max(0, startPositionSeconds)
+      ? this.toLocalPosition(startPositionSeconds)
       : 0;
     const hls = new Hls({
       enableWorker: false,
@@ -347,9 +371,12 @@ export class ArtPlayerAdapter implements UnifiedPlayerAdapter {
     player.on("video:waiting", () => active() && this.patch({ status: "buffering" }));
     player.on("video:stalled", () => active() && this.patch({ status: "buffering" }));
     player.on("video:loadedmetadata", () => active() && this.patch({
-      durationSeconds: player.duration || this.source?.durationSeconds || 0
+      positionSeconds: this.toAbsolutePosition(player.currentTime),
+      durationSeconds: this.resolveDurationSeconds()
     }));
-    player.on("video:progress", () => active() && this.patch({ bufferedSeconds: player.loadedTime || 0 }));
+    player.on("video:progress", () => active() && this.patch({
+      bufferedSeconds: this.toAbsolutePosition(player.loadedTime || 0)
+    }));
     player.on("video:volumechange", () => active() && this.patch({
       volume: player.volume,
       muted: player.muted
@@ -359,13 +386,13 @@ export class ArtPlayerAdapter implements UnifiedPlayerAdapter {
     player.on("fullscreenWeb", (fullscreen: boolean) => active() && this.patch({ fullscreen }));
     player.on("pip", (pictureInPicture: boolean) => active() && this.patch({ pictureInPicture }));
     player.on("video:timeupdate", () => active() && this.patch({
-      positionSeconds: player.currentTime || 0,
-      durationSeconds: player.duration || this.source?.durationSeconds || 0,
-      bufferedSeconds: player.loadedTime || 0
+      positionSeconds: this.toAbsolutePosition(player.currentTime || 0),
+      durationSeconds: this.resolveDurationSeconds(),
+      bufferedSeconds: this.toAbsolutePosition(player.loadedTime || 0)
     }));
     player.on("video:ended", () => active() && this.patch({
       status: "ended",
-      positionSeconds: player.duration || this.snapshot.durationSeconds
+      positionSeconds: this.resolveDurationSeconds()
     }));
     player.on("subtitleLoad", (cues: unknown[]) => {
       if (active()) console.info("[remote] ArtPlayer 字幕加载完成", { cueCount: cues.length });
@@ -416,6 +443,40 @@ export class ArtPlayerAdapter implements UnifiedPlayerAdapter {
       "--art-subtitle-font-size",
       `${20 * subtitleScale / 100}px`
     );
+  }
+
+  /** 将 HLS 窗口内时间转换为整部媒体的绝对时间。 */
+  private toAbsolutePosition(localPositionSeconds: number): number {
+    const position = localPositionSeconds + this.timelineOffsetSeconds();
+    const duration = this.resolveDurationSeconds();
+    return clamp(position, 0, duration > 0 ? duration : Number.MAX_SAFE_INTEGER);
+  }
+
+  /** 将整部媒体的绝对时间转换为当前 HLS 窗口内时间。 */
+  private toLocalPosition(absolutePositionSeconds: number): number {
+    return Math.max(0, absolutePositionSeconds - this.timelineOffsetSeconds());
+  }
+
+  /** 返回当前流相对整部媒体的时间偏移。 */
+  private timelineOffsetSeconds(): number {
+    const offset = this.source?.mode === "hls" ? this.source.streamStartPositionSeconds ?? 0 : 0;
+    return Number.isFinite(offset) && offset > 0 ? offset : 0;
+  }
+
+  /** 总时长优先使用 FFprobe 会话值，避免 HLS EVENT 列表增长改写进度。 */
+  private resolveDurationSeconds(): number {
+    const duration = this.source?.durationSeconds;
+    if (duration !== undefined && Number.isFinite(duration) && duration > 0) return duration;
+    const playerDuration = this.player?.duration ?? 0;
+    return Number.isFinite(playerDuration) && playerDuration > 0 ? playerDuration : 0;
+  }
+
+  /** 返回当前媒体元素使用的局部时长上限。 */
+  private resolveLocalDurationSeconds(): number {
+    const duration = this.resolveDurationSeconds();
+    return this.source?.mode === "hls"
+      ? Math.max(0, duration - this.timelineOffsetSeconds())
+      : duration;
   }
 
   private setAspectRatio(aspectRatio: PlayerAspectRatio, customValue?: string): void {
@@ -498,4 +559,16 @@ function isFiniteRange(value: unknown, min: number, max: number): value is numbe
 
 function clamp(value: number, min: number, max: number): number {
   return Math.min(max, Math.max(min, value));
+}
+
+/** 判断浏览器 TimeRanges 是否包含指定时间，容忍分片边界的小量浮点误差。 */
+function timeRangesContain(ranges: TimeRanges, positionSeconds: number): boolean {
+  const toleranceSeconds = 0.25;
+  for (let index = 0; index < ranges.length; index += 1) {
+    if (
+      positionSeconds >= ranges.start(index) - toleranceSeconds
+      && positionSeconds <= ranges.end(index) + toleranceSeconds
+    ) return true;
+  }
+  return false;
 }

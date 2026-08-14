@@ -10,7 +10,8 @@ export interface PlaybackSessionClient {
     taskId: string,
     mode: RemotePlaybackRequestMode,
     fileIndex: number | undefined,
-    enhancement: RemotePlaybackEnhancement
+    enhancement: RemotePlaybackEnhancement,
+    startPositionSeconds?: number
   ): Promise<RemotePlaybackSession>;
   refresh?(sessionId: string): Promise<RemotePlaybackSession>;
   close(sessionId: string): Promise<void>;
@@ -18,7 +19,7 @@ export interface PlaybackSessionClient {
 
 /** 使用本地 AppClient 创建受控播放器会话。 */
 export const desktopPlaybackSessionClient: PlaybackSessionClient = {
-  create: (taskId, _mode, fileIndex, _enhancement) => appApi.createDesktopPlaybackSession({
+  create: (taskId, _mode, fileIndex, _enhancement, _startPositionSeconds) => appApi.createDesktopPlaybackSession({
     taskId,
     ...(fileIndex === undefined ? {} : { fileIndex })
   }),

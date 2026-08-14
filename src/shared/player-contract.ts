@@ -144,6 +144,7 @@ export interface PlayerMediaSource {
   uri: string;
   mode: "direct" | "hls";
   durationSeconds?: number;
+  streamStartPositionSeconds?: number;
   subtitles: PlayerSubtitleSource[];
 }
 

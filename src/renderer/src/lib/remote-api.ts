@@ -125,9 +125,17 @@ export async function createRemotePlaybackSession(
   taskId: string,
   mode: RemotePlaybackRequestMode,
   fileIndex: number | undefined,
-  enhancement: RemotePlaybackEnhancement
+  enhancement: RemotePlaybackEnhancement,
+  startPositionSeconds?: number
 ): Promise<RemotePlaybackSession> {
-  return createRemoteMediaSession("/api/media/sessions", taskId, mode, fileIndex, enhancement);
+  return createRemoteMediaSession(
+    "/api/media/sessions",
+    taskId,
+    mode,
+    fileIndex,
+    enhancement,
+    startPositionSeconds
+  );
 }
 
 /** 为 PotPlayer 或 IINA 创建无需 Cookie 的短期拉流会话。 */
@@ -135,9 +143,17 @@ export async function createRemoteExternalPlaybackSession(
   taskId: string,
   mode: RemotePlaybackRequestMode,
   fileIndex: number | undefined,
-  enhancement: RemotePlaybackEnhancement
+  enhancement: RemotePlaybackEnhancement,
+  startPositionSeconds?: number
 ): Promise<RemotePlaybackSession> {
-  return createRemoteMediaSession("/api/media/external-sessions", taskId, mode, fileIndex, enhancement);
+  return createRemoteMediaSession(
+    "/api/media/external-sessions",
+    taskId,
+    mode,
+    fileIndex,
+    enhancement,
+    startPositionSeconds
+  );
 }
 
 /** 调用指定媒体入口创建远程播放会话。 */
@@ -146,7 +162,8 @@ async function createRemoteMediaSession(
   taskId: string,
   mode: RemotePlaybackRequestMode,
   fileIndex: number | undefined,
-  enhancement: RemotePlaybackEnhancement
+  enhancement: RemotePlaybackEnhancement,
+  startPositionSeconds?: number
 ): Promise<RemotePlaybackSession> {
   const baseUrl = getRemoteBaseUrl();
   const accessToken = window.localStorage.getItem(REMOTE_TOKEN_STORAGE_KEY);
@@ -158,7 +175,13 @@ async function createRemoteMediaSession(
       "Content-Type": "application/json",
       Authorization: `Bearer ${accessToken}`
     },
-    body: JSON.stringify({ taskId, mode, enhancement, ...(fileIndex === undefined ? {} : { fileIndex }) })
+    body: JSON.stringify({
+      taskId,
+      mode,
+      enhancement,
+      ...(fileIndex === undefined ? {} : { fileIndex }),
+      ...(startPositionSeconds === undefined ? {} : { startPositionSeconds })
+    })
   });
   const payload = (await response.json().catch(() => ({}))) as RemotePlaybackSession & { error?: string };
   if (!response.ok || !payload.id) {
