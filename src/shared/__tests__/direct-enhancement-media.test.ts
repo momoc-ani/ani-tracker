@@ -6,7 +6,9 @@ import {
   DirectEnhancementPerformanceMonitor,
   evaluateDirectEnhancementGpuResources,
   evaluateDirectEnhancementMediaCandidate,
+  isDirectEnhancementRetryableStatus,
   normalizeDirectEnhancementVideoCodec,
+  parseDirectEnhancementContentRange,
   parseDirectEnhancementSubtitleCues
 } from "../direct-enhancement-media";
 
@@ -148,6 +150,30 @@ test("F5-G GPU 资源门禁拒绝纹理上限和估算工作集超限", () => {
   assert.match(textureLimit.reason ?? "", /纹理上限/);
   assert.equal(memoryLimit.supported, false);
   assert.match(memoryLimit.reason ?? "", /工作集/);
+});
+
+test("F5-H Range 恢复只接受严格 Content-Range", () => {
+  assert.deepEqual(parseDirectEnhancementContentRange("bytes 100-199/1000"), {
+    startByte: 100,
+    endByte: 199,
+    totalBytes: 1_000
+  });
+  assert.deepEqual(parseDirectEnhancementContentRange("bytes 0-9/*"), {
+    startByte: 0,
+    endByte: 9
+  });
+  assert.equal(parseDirectEnhancementContentRange("bytes 200-100/1000"), undefined);
+  assert.equal(parseDirectEnhancementContentRange("bytes 0-100/100"), undefined);
+  assert.equal(parseDirectEnhancementContentRange("items 0-9/10"), undefined);
+});
+
+test("F5-H Range 重试状态排除权限和范围错误", () => {
+  for (const status of [408, 429, 500, 502, 503, 504]) {
+    assert.equal(isDirectEnhancementRetryableStatus(status), true);
+  }
+  for (const status of [400, 401, 403, 404, 416]) {
+    assert.equal(isDirectEnhancementRetryableStatus(status), false);
+  }
 });
 
 test("F5-B 拒绝 MKV、H.265 和 WebM/H.264", () => {

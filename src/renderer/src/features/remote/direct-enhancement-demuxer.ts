@@ -12,7 +12,15 @@ import {
   type DirectEnhancementContainer,
   type DirectEnhancementMediaSupport
 } from "@shared/direct-enhancement-media";
+import {
+  createDirectEnhancementRangeFetch,
+  createDirectEnhancementRangeTelemetry,
+  type DirectEnhancementRangeOptions,
+  type DirectEnhancementRangeTelemetry
+} from "@shared/direct-enhancement-range";
 import { createDirectEnhancementWebGpuRenderer } from "./direct-enhancement-webgpu";
+
+export type { DirectEnhancementRangeTelemetry } from "@shared/direct-enhancement-range";
 
 export const DIRECT_ENHANCEMENT_CACHE_BYTES = 32 * 1024 * 1024;
 const MAX_RANGE_BYTES = 64 * 1024 * 1024;
@@ -32,17 +40,8 @@ interface BrowserDecoderGlobals {
   AudioDecoder?: BrowserDecoderConstructor<AudioDecoderConfig>;
 }
 
-export interface DirectEnhancementRangeTelemetry {
-  requestCount: number;
-  rangeRequestCount: number;
-  receivedRangeBytes: number;
-  contentRanges: string[];
-}
-
-export interface DirectEnhancementMediaInputOptions {
+export interface DirectEnhancementMediaInputOptions extends DirectEnhancementRangeOptions {
   fetchFn?: typeof fetch;
-  maximumRangeRequests?: number;
-  maximumReceivedBytes?: number;
 }
 
 export interface DirectEnhancementMediaInputHandle {
@@ -61,6 +60,10 @@ export interface DirectEnhancementDemuxDiagnostics extends DirectEnhancementMedi
   rangeRequestCount: number;
   receivedRangeBytes: number;
   contentRanges: string[];
+  retryCount: number;
+  recoveredRangeCount: number;
+  networkFailureCount: number;
+  lastNetworkError?: string;
 }
 
 export interface DirectEnhancementDemuxProbeOptions {
@@ -116,12 +119,7 @@ export function createDirectEnhancementMediaInput(
   streamUrl: string,
   options: DirectEnhancementMediaInputOptions = {}
 ): DirectEnhancementMediaInputHandle {
-  const telemetry: DirectEnhancementRangeTelemetry = {
-    requestCount: 0,
-    rangeRequestCount: 0,
-    receivedRangeBytes: 0,
-    contentRanges: []
-  };
+  const telemetry = createDirectEnhancementRangeTelemetry();
   const fetchFn = createDirectEnhancementRangeFetch(
     options.fetchFn ?? fetch,
     telemetry,
@@ -266,81 +264,6 @@ async function decoderSupports<Config>(
   }
 }
 
-function createDirectEnhancementRangeFetch(
-  baseFetch: typeof fetch,
-  telemetry: DirectEnhancementRangeTelemetry,
-  limits: DirectEnhancementMediaInputOptions
-): typeof fetch {
-  return async (input, init) => {
-    telemetry.requestCount += 1;
-    const requestHeaders = new Headers(input instanceof Request ? input.headers : undefined);
-    new Headers(init?.headers).forEach((value, key) => requestHeaders.set(key, value));
-    const range = requestHeaders.get("range");
-    if (range) {
-      telemetry.rangeRequestCount += 1;
-      if (
-        limits.maximumRangeRequests !== undefined
-        && telemetry.rangeRequestCount > limits.maximumRangeRequests
-      ) {
-        throw new Error(`F5-B Range 请求超过 ${limits.maximumRangeRequests} 次上限`);
-      }
-    }
-
-    const response = await baseFetch(input, init);
-    if (!range) return response;
-    if (response.status !== 206) {
-      void response.body?.cancel();
-      throw new Error(`F5-B Range 请求未返回 206，实际状态 ${response.status}`);
-    }
-
-    const contentRange = response.headers.get("content-range");
-    if (!contentRange) {
-      void response.body?.cancel();
-      throw new Error("F5-B Range 响应缺少 Content-Range");
-    }
-    telemetry.contentRanges.push(contentRange);
-    return monitorResponseBody(response, telemetry, limits.maximumReceivedBytes);
-  };
-}
-
-function monitorResponseBody(
-  response: Response,
-  telemetry: DirectEnhancementRangeTelemetry,
-  maximumReceivedBytes?: number
-): Response {
-  if (!response.body) return response;
-  const reader = response.body.getReader();
-  const body = new ReadableStream<Uint8Array>({
-    async pull(controller) {
-      const result = await reader.read();
-      if (result.done) {
-        controller.close();
-        return;
-      }
-      telemetry.receivedRangeBytes += result.value.byteLength;
-      if (maximumReceivedBytes !== undefined && telemetry.receivedRangeBytes > maximumReceivedBytes) {
-        await reader.cancel();
-        controller.error(new Error(`F5-B Range 实际读取超过 ${maximumReceivedBytes} 字节上限`));
-        return;
-      }
-      controller.enqueue(result.value);
-    },
-    cancel(reason) {
-      return reader.cancel(reason);
-    }
-  });
-  const monitored = new Response(body, {
-    status: response.status,
-    statusText: response.statusText,
-    headers: response.headers
-  });
-  Object.defineProperties(monitored, {
-    redirected: { value: response.redirected },
-    url: { value: response.url }
-  });
-  return monitored;
-}
-
 function unsupportedDiagnostics(
   reason: string,
   telemetry: DirectEnhancementRangeTelemetry
@@ -357,12 +280,17 @@ function unsupportedDiagnostics(
 function telemetryResult(telemetry: DirectEnhancementRangeTelemetry): Pick<
   DirectEnhancementDemuxDiagnostics,
   "requestCount" | "rangeRequestCount" | "receivedRangeBytes" | "contentRanges"
+  | "retryCount" | "recoveredRangeCount" | "networkFailureCount" | "lastNetworkError"
 > {
   return {
     requestCount: telemetry.requestCount,
     rangeRequestCount: telemetry.rangeRequestCount,
     receivedRangeBytes: telemetry.receivedRangeBytes,
-    contentRanges: [...telemetry.contentRanges]
+    contentRanges: [...telemetry.contentRanges],
+    retryCount: telemetry.retryCount,
+    recoveredRangeCount: telemetry.recoveredRangeCount,
+    networkFailureCount: telemetry.networkFailureCount,
+    ...(telemetry.lastNetworkError ? { lastNetworkError: telemetry.lastNetworkError } : {})
   };
 }
 

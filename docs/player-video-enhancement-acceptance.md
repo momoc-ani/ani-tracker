@@ -102,6 +102,7 @@ Real-ESRGAN 模型归档固定为 `v0.2.5.0/realesrgan-ncnn-vulkan-20220424-wind
 - 能力探测必须同时确认 `VideoDecoder`、`AudioDecoder`、目标 codec 的 `isConfigSupported`、WebGPU adapter/device、WGSL shader 摘要和音视频时钟；任一项失败都不能展示“直传增强已启用”。
 - 直传增强必须从原文件的 HTTP Range 读取并在终端解码，不得启动服务端 FFmpeg/模型转码进程；网络面板和服务端会话诊断必须能区分 `direct` 与 `direct-enhanced`。
 - 首批只验收 `mediabunny 1.53.1` 受控适配器支持的 MP4/WebM 组合；诊断阶段必须遵守 32 MiB 缓存、2 个并发、24 次 Range、64 MiB 累计响应和 8 秒窗口。H.265、MKV、HDR 和浏览器不支持的 codec 必须明确回退原始直传或 HLS，不能输出黑帧或假增强状态。
+- 人为中断一个 Range 建连和一个响应体，确认客户端最多重试两次、从已交付的下一字节继续、严格核对 `Content-Range`，且重试仍计入请求/字节总预算；401/403/416 和取消操作不得重试。恢复成功时播放时间轴不能倒退或重复音频，恢复失败必须回退原画。
 - WebGPU shader 只处理视频帧；F5-D 只有在增强首帧成功后才显示画布，并通过 ArtPlayer DOM 保留字幕层。F5-F 将 ASS 转为 VTT cue，再由 AudioContext 主时钟直接选择活动字幕；仍须用真实 ASS/VTT 样本确认默认字幕、切换、拖动和缩放不会被锐化、遮挡、重复绘制或丢失。
 - 连续播放 30 分钟，确认首帧、暂停/恢复、关键帧拖动、全屏、音画同步、GPU 资源释放和页面重新进入；核对页面诊断的源帧率预算、GPU P95、估算工作集/资源预算、丢帧率和漂移值。清晰档超限必须先显示均衡实际档位；均衡持续超限、连续漂移、无帧或 WebGPU OOM 时必须回退原画直传。WebGPU 不提供真实 VRAM 遥测，验收记录不得把估算工作集写成显存占用。
 - Chrome/Edge、Safari macOS、Firefox（若能力未开放）分别记录 `device-passed` 或结构化回退原因；不能以桌面浏览器支持代替移动浏览器证据。

@@ -54,6 +54,12 @@ export interface DirectEnhancementGpuResourceBudget {
   reason?: string;
 }
 
+export interface DirectEnhancementContentRange {
+  startByte: number;
+  endByte: number;
+  totalBytes?: number;
+}
+
 export type DirectEnhancementPerformanceAction = "keep" | "degrade" | "fallback";
 
 export interface DirectEnhancementPerformanceSnapshot {
@@ -141,6 +147,38 @@ export function evaluateDirectEnhancementGpuResources(
     };
   }
   return { supported: true, estimatedWorkingSetBytes, resourceBudgetBytes };
+}
+
+/** 解析严格的 HTTP Content-Range，供中断后从下一字节继续请求。 */
+export function parseDirectEnhancementContentRange(
+  value: string | null | undefined
+): DirectEnhancementContentRange | undefined {
+  const match = /^bytes\s+(\d+)-(\d+)\/(\d+|\*)$/i.exec(value?.trim() ?? "");
+  if (!match) return undefined;
+  const startByte = Number(match[1]);
+  const endByte = Number(match[2]);
+  const totalBytes = match[3] === "*" ? undefined : Number(match[3]);
+  if (
+    !Number.isSafeInteger(startByte)
+    || !Number.isSafeInteger(endByte)
+    || startByte < 0
+    || endByte < startByte
+    || (totalBytes !== undefined && (
+      !Number.isSafeInteger(totalBytes)
+      || totalBytes <= endByte
+    ))
+  ) return undefined;
+  return { startByte, endByte, ...(totalBytes === undefined ? {} : { totalBytes }) };
+}
+
+/** 只重试可恢复的网关或上游状态，权限和范围协议错误立即失败。 */
+export function isDirectEnhancementRetryableStatus(status: number): boolean {
+  return status === 408
+    || status === 429
+    || status === 500
+    || status === 502
+    || status === 503
+    || status === 504;
 }
 
 /** 汇总短窗口性能样本，并给出清晰档降级或增强链退出建议。 */

@@ -43,6 +43,9 @@ export interface DirectEnhancementPlaybackDiagnostics {
   effectivePreset: "balanced" | "clear";
   rangeRequestCount: number;
   receivedRangeBytes: number;
+  rangeRetryCount: number;
+  recoveredRangeCount: number;
+  networkFailureCount: number;
   gpuQueueP95Ms?: number;
   gpuEstimatedWorkingSetBytes?: number;
   gpuResourceBudgetBytes?: number;
@@ -338,6 +341,9 @@ class DirectEnhancementPlayback implements DirectEnhancementPlaybackController {
       effectivePreset: this.effectivePreset,
       rangeRequestCount: this.telemetry.rangeRequestCount,
       receivedRangeBytes: this.telemetry.receivedRangeBytes,
+      rangeRetryCount: this.telemetry.retryCount,
+      recoveredRangeCount: this.telemetry.recoveredRangeCount,
+      networkFailureCount: this.telemetry.networkFailureCount,
       ...(performanceSnapshot.gpuQueueP95Ms === undefined
         ? {}
         : { gpuQueueP95Ms: performanceSnapshot.gpuQueueP95Ms }),
