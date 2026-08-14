@@ -31,7 +31,9 @@ use tauri::window::{Color, WindowBuilder};
 use tauri::LogicalPosition;
 #[cfg(desktop)]
 use tauri::Manager;
-use tauri::{AppHandle, Emitter, Runtime, WebviewWindow, Window, WindowEvent};
+#[cfg(target_os = "macos")]
+use tauri::WebviewWindow;
+use tauri::{AppHandle, Emitter, Runtime, Window, WindowEvent};
 #[cfg(desktop)]
 use tauri::{PhysicalPosition, PhysicalSize, WebviewUrl, WebviewWindowBuilder};
 use tauri_plugin_ani_player::AniPlayerExt;
@@ -293,11 +295,12 @@ impl AppPlayerState {
                 .map_err(|error| format!("读取播放器父窗口 NSWindow 失败：{error}"))?,
         );
         #[cfg(target_os = "linux")]
-        let video_gtk_window = video
-            .gtk_window()
-            .map_err(|error| format!("读取播放器父窗口 GTK Window 失败：{error}"))?;
-        #[cfg(target_os = "linux")]
-        let controls_builder = controls_builder.transient_for_raw(&video_gtk_window);
+        let controls_builder = {
+            let video_gtk_window = video
+                .gtk_window()
+                .map_err(|error| format!("读取播放器父窗口 GTK Window 失败：{error}"))?;
+            controls_builder.transient_for_raw(&video_gtk_window)
+        };
         let controls = match controls_builder.build() {
             Ok(window) => window,
             Err(error) => {

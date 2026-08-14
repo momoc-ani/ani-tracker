@@ -861,7 +861,6 @@ fn hidden_command(path: &Path) -> Command {
     let command = Command::new(path);
     #[cfg(target_os = "windows")]
     {
-        use std::os::windows::process::CommandExt;
         let mut command = command;
         command.creation_flags(0x0800_0000);
         return command;
