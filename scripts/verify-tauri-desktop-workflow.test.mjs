@@ -13,14 +13,22 @@ const windowsConfig = JSON.parse(await readFile("src-tauri/tauri.windows.conf.js
 const macosConfig = JSON.parse(await readFile("src-tauri/tauri.macos.conf.json", "utf8"));
 const linuxConfig = JSON.parse(await readFile("src-tauri/tauri.linux.conf.json", "utf8"));
 
-test("桌面原生依赖按平台使用独立步骤和工具链", () => {
-  assert.match(workflow, /name: Prepare Windows libVLC[\s\S]*?if: matrix\.platform == 'win32'[\s\S]*?shell: pwsh/);
-  assert.match(workflow, /pnpm run prepare:tauri:win-libvlc[\s\S]*?pnpm run prepare:tauri:win-libmpv/);
-  assert.match(desktopWorkflow, /pnpm run prepare:tauri:win-libvlc[\s\S]*?pnpm run prepare:tauri:win-libmpv/);
+test("桌面原生依赖统一使用 libmpv 且不再准备 VLC", () => {
+  assert.match(workflow, /name: Prepare Windows libmpv[\s\S]*?if: matrix\.platform == 'win32'[\s\S]*?shell: pwsh/);
+  assert.match(workflow, /pnpm run prepare:tauri:win-libmpv/);
+  assert.match(desktopWorkflow, /name: Prepare Windows Tauri libmpv runtime[\s\S]*?pnpm run prepare:tauri:win-libmpv/);
   assert.match(desktopWorkflow, /Install Linux Tauri dependencies[\s\S]*?libmpv1/);
   assert.match(workflow, /Install Linux desktop dependencies[\s\S]*?libmpv1/);
-  assert.match(workflow, /name: Prepare macOS libVLC[\s\S]*?if: matrix\.platform == 'darwin'[\s\S]*?shell: bash/);
-  assert.match(workflow, /name: Prepare Linux libVLC[\s\S]*?if: matrix\.platform == 'linux'[\s\S]*?shell: bash/);
+  assert.match(workflow, /name: Prepare macOS libmpv[\s\S]*?if: matrix\.platform == 'darwin'[\s\S]*?--pinned/);
+  assert.match(desktopWorkflow, /name: Prepare macOS Tauri libmpv runtime[\s\S]*?--pinned/);
+  assert.match(workflow, /name: Verify desktop libmpv runtime[\s\S]*?--require-pinned/);
+  assert.match(desktopWorkflow, /name: Verify desktop libmpv runtime[\s\S]*?--require-pinned/);
+  assert.doesNotMatch(workflow, /prepare:tauri:.*libvlc|\bvlc\b/i);
+  assert.doesNotMatch(desktopWorkflow, /prepare:tauri:.*libvlc|\bvlc\b/i);
+  assert.equal(windowsConfig.bundle.resources["../out/libmpv/win32-x64/"], "libmpv/win32-x64/");
+  assert.equal(macosConfig.bundle.resources["../out/libmpv/"], "libmpv/");
+  assert.equal(linuxConfig.bundle.linux.deb.depends.includes("libmpv1"), true);
+  assert.equal(linuxConfig.bundle.linux.deb.depends.some((value) => /vlc/i.test(value)), false);
   assert.match(workflow, /name: Build Windows torrent-core[\s\S]*?shell: pwsh/);
   assert.match(workflow, /name: Build macOS torrent-core[\s\S]*?shell: bash/);
   assert.match(workflow, /name: Build Linux torrent-core[\s\S]*?shell: bash/);
@@ -174,6 +182,9 @@ test("macOS 发布修复最终应用内的 qBittorrent 签名后再生成 DMG", 
   assert.match(workflow, /--sign "\$\{APPLE_SIGNING_IDENTITY\}" "\$\{managed_executable\}"/);
   assert.match(workflow, /--sign "\$\{APPLE_SIGNING_IDENTITY\}" "\$\{managed_app\}"/);
   assert.match(workflow, /codesign --verify --deep --strict "\$\{managed_app\}"/);
+  assert.match(workflow, /mpv_directory="\$\{final_app\}\/Contents\/Resources\/libmpv\/darwin-\$\{\{ matrix\.arch \}\}"/);
+  assert.match(workflow, /find "\$\{mpv_directory\}" -type f -name '\*\.dylib'/);
+  assert.match(workflow, /签名最终包 libmpv 动态库/);
   assert.match(workflow, /--sign "\$\{APPLE_SIGNING_IDENTITY\}" "\$\{final_app\}"/);
   assert.match(workflow, /codesign --verify --deep --strict "\$\{final_app\}"/);
   assert.match(workflow, /echo "ANI_FINAL_MACOS_APP=\$\{final_app\}" >> "\$\{GITHUB_ENV\}"/);

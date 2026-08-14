@@ -106,7 +106,7 @@ jobs:
           sudo apt-get install -y \
             build-essential cmake ffmpeg libayatana-appindicator3-dev \
             libboost-system-dev libmpv1 librsvg2-dev libssl-dev libwebkit2gtk-4.1-dev \
-            libx11-dev libxdo-dev ninja-build patchelf pax-utils vlc wget
+            libx11-dev libxdo-dev ninja-build patchelf pax-utils wget
 
       - name: Install macOS native dependencies
         if: matrix.platform == 'darwin'
@@ -165,22 +165,18 @@ jobs:
             fi
           done
 
-      - name: Prepare Windows libVLC
+      - name: Prepare Windows libmpv
         if: matrix.platform == 'win32'
         shell: pwsh
-        run: |
-          pnpm run prepare:tauri:win-libvlc -- --arch "${{ matrix.arch }}"
-          pnpm run prepare:tauri:win-libmpv -- --arch "${{ matrix.arch }}"
+        run: pnpm run prepare:tauri:win-libmpv -- --arch "${{ matrix.arch }}"
 
-      - name: Prepare macOS libVLC
+      - name: Prepare macOS libmpv
         if: matrix.platform == 'darwin'
         shell: bash
-        run: pnpm run prepare:tauri:mac-libvlc -- --arch "${{ matrix.arch }}"
+        run: pnpm run prepare:tauri:mac-libmpv -- --arch "${{ matrix.arch }}" --pinned
 
-      - name: Prepare Linux libVLC
-        if: matrix.platform == 'linux'
-        shell: bash
-        run: pnpm run prepare:tauri:linux-libvlc -- --arch "${{ matrix.arch }}"
+      - name: Verify desktop libmpv runtime
+        run: pnpm run verify:libmpv -- --platform "${{ matrix.platform }}" --arch "${{ matrix.arch }}" --require-pinned
 
       - name: Build Windows torrent-core
         if: matrix.platform == 'win32'
@@ -434,6 +430,17 @@ jobs:
           codesign --force --options runtime --timestamp=none \
             --sign "${APPLE_SIGNING_IDENTITY}" "${managed_app}"
           codesign --verify --deep --strict "${managed_app}"
+
+          mpv_directory="${final_app}/Contents/Resources/libmpv/darwin-${{ matrix.arch }}"
+          if [[ ! -f "${mpv_directory}/libmpv.2.dylib" ]]; then
+            echo "未找到最终包内的 macOS libmpv：${mpv_directory}" >&2
+            exit 1
+          fi
+          while IFS= read -r -d '' library; do
+            echo "[macos-signing] 签名最终包 libmpv 动态库：${library}"
+            codesign --force --options runtime --timestamp=none \
+              --sign "${APPLE_SIGNING_IDENTITY}" "${library}"
+          done < <(find "${mpv_directory}" -type f -name '*.dylib' -print0)
 
           codesign --force --options runtime --timestamp=none \
             --sign "${APPLE_SIGNING_IDENTITY}" "${final_app}"
