@@ -135,7 +135,8 @@ export async function createRemotePlaybackSession(
     mode,
     fileIndex,
     enhancement,
-    startPositionSeconds
+    startPositionSeconds,
+    "soft"
   );
 }
 
@@ -145,7 +146,8 @@ export async function createRemoteExternalPlaybackSession(
   mode: RemotePlaybackRequestMode,
   fileIndex: number | undefined,
   enhancement: RemotePlaybackEnhancement,
-  startPositionSeconds?: number
+  startPositionSeconds?: number,
+  subtitleId?: string
 ): Promise<RemotePlaybackSession> {
   return createRemoteMediaSession(
     "/api/media/external-sessions",
@@ -153,7 +155,9 @@ export async function createRemoteExternalPlaybackSession(
     mode,
     fileIndex,
     enhancement,
-    startPositionSeconds
+    startPositionSeconds,
+    subtitleId ? "burned" : "off",
+    subtitleId
   );
 }
 
@@ -164,7 +168,9 @@ async function createRemoteMediaSession(
   mode: RemotePlaybackRequestMode,
   fileIndex: number | undefined,
   enhancement: RemotePlaybackEnhancement,
-  startPositionSeconds?: number
+  startPositionSeconds?: number,
+  subtitleMode: "soft" | "burned" | "off" = "soft",
+  subtitleId?: string
 ): Promise<RemotePlaybackSession> {
   const baseUrl = getRemoteBaseUrl();
   const accessToken = window.localStorage.getItem(REMOTE_TOKEN_STORAGE_KEY);
@@ -180,8 +186,10 @@ async function createRemoteMediaSession(
       taskId,
       mode,
       enhancement,
+      subtitleMode,
       ...(fileIndex === undefined ? {} : { fileIndex }),
-      ...(startPositionSeconds === undefined ? {} : { startPositionSeconds })
+      ...(startPositionSeconds === undefined ? {} : { startPositionSeconds }),
+      ...(subtitleId === undefined ? {} : { subtitleId })
     })
   });
   const payload = (await response.json().catch(() => ({}))) as RemotePlaybackSession & { error?: string };

@@ -114,6 +114,17 @@ pub struct RemoteMediaTools {
     pub model_available_vram_bytes: u64,
 }
 
+/// 创建浏览器或外部播放器媒体会话的受控输入。
+pub struct RemoteMediaSessionInput<'a> {
+    pub task_id: &'a str,
+    pub requested_mode: &'a str,
+    pub file_index: Option<i64>,
+    pub enhancement: RemotePlaybackEnhancement,
+    pub start_position_seconds: Option<f64>,
+    pub subtitle_mode: &'a str,
+    pub subtitle_id: Option<&'a str>,
+}
+
 /// 网关可输出的受控媒体文件。
 #[derive(Debug, Clone)]
 pub struct RemoteMediaAsset {
@@ -156,7 +167,21 @@ struct SessionCreateRequest<'a> {
     file_index: Option<i64>,
     enhancement: RemotePlaybackEnhancement,
     start_position_seconds: Option<f64>,
+    subtitle_mode: &'a str,
+    subtitle_id: Option<&'a str>,
     access: SessionAccess,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RequestedSubtitleMode {
+    Soft,
+    Burned,
+    Off,
+}
+
+struct PreparedSubtitle {
+    public: RemotePlaybackSubtitle,
+    output_path: PathBuf,
 }
 
 struct SessionRecord {
@@ -301,6 +326,7 @@ pub struct RemoteMediaSessionService {
     rife_runtime: Mutex<Option<Arc<ModelSidecarRuntime>>>,
     realesrgan_runtime: Mutex<Option<Arc<ModelSidecarRuntime>>>,
     encoder_candidates: Mutex<Option<Vec<(&'static str, &'static str)>>>,
+    subtitle_burn_support: Mutex<Option<Result<(), String>>>,
 }
 
 impl RemoteMediaSessionService {
@@ -318,26 +344,25 @@ impl RemoteMediaSessionService {
             rife_runtime: Mutex::new(None),
             realesrgan_runtime: Mutex::new(None),
             encoder_candidates: Mutex::new(None),
+            subtitle_burn_support: Mutex::new(None),
         }
     }
 
     /// 创建浏览器使用的 Bearer/Cookie 绑定会话。
     pub async fn create_session(
         self: &Arc<Self>,
-        task_id: &str,
         device_id: &str,
-        requested_mode: &str,
-        file_index: Option<i64>,
-        enhancement: RemotePlaybackEnhancement,
-        start_position_seconds: Option<f64>,
+        input: RemoteMediaSessionInput<'_>,
     ) -> Result<RemotePlaybackSession, RemoteMediaError> {
         self.create_session_record(SessionCreateRequest {
-            task_id,
+            task_id: input.task_id,
             device_id,
-            requested_mode,
-            file_index,
-            enhancement,
-            start_position_seconds,
+            requested_mode: input.requested_mode,
+            file_index: input.file_index,
+            enhancement: input.enhancement,
+            start_position_seconds: input.start_position_seconds,
+            subtitle_mode: input.subtitle_mode,
+            subtitle_id: input.subtitle_id,
             access: SessionAccess::Browser,
         })
         .await
@@ -346,20 +371,18 @@ impl RemoteMediaSessionService {
     /// 创建带高熵 URL 票据的外部播放器会话。
     pub async fn create_external_session(
         self: &Arc<Self>,
-        task_id: &str,
         device_id: &str,
-        requested_mode: &str,
-        file_index: Option<i64>,
-        enhancement: RemotePlaybackEnhancement,
-        start_position_seconds: Option<f64>,
+        input: RemoteMediaSessionInput<'_>,
     ) -> Result<RemotePlaybackSession, RemoteMediaError> {
         self.create_session_record(SessionCreateRequest {
-            task_id,
+            task_id: input.task_id,
             device_id,
-            requested_mode,
-            file_index,
-            enhancement,
-            start_position_seconds,
+            requested_mode: input.requested_mode,
+            file_index: input.file_index,
+            enhancement: input.enhancement,
+            start_position_seconds: input.start_position_seconds,
+            subtitle_mode: input.subtitle_mode,
+            subtitle_id: input.subtitle_id,
             access: SessionAccess::External,
         })
         .await
@@ -376,6 +399,8 @@ impl RemoteMediaSessionService {
             file_index,
             enhancement,
             start_position_seconds: requested_start_position_seconds,
+            subtitle_mode,
+            subtitle_id,
             access,
         } = request;
         if !matches!(requested_mode, "direct" | "transcode") {
@@ -393,6 +418,24 @@ impl RemoteMediaSessionService {
             ));
         }
         validate_remote_enhancement(requested_mode, enhancement)?;
+        let subtitle_mode = parse_requested_subtitle_mode(subtitle_mode)?;
+        if subtitle_mode == RequestedSubtitleMode::Burned && requested_mode != "transcode" {
+            return Err(RemoteMediaError::new(
+                400,
+                "MEDIA_SUBTITLE_BURN_REQUIRES_TRANSCODE",
+                "烧录字幕只能在实时转码模式使用",
+            ));
+        }
+        if subtitle_mode == RequestedSubtitleMode::Burned && subtitle_id.is_none() {
+            return Err(RemoteMediaError::new(
+                400,
+                "MEDIA_SUBTITLE_INVALID",
+                "烧录字幕必须指定字幕轨道",
+            ));
+        }
+        if subtitle_mode == RequestedSubtitleMode::Burned {
+            self.ensure_subtitle_burn_supported().await?;
+        }
         self.cleanup_expired().await;
         let task = self
             .repository
@@ -439,14 +482,44 @@ impl RemoteMediaSessionService {
             || format!("/api/media/sessions/{id}"),
             |token| format!("/api/media/external/{token}/sessions/{id}"),
         );
-        let subtitles = self
-            .prepare_subtitles(
+        let prepared_subtitles = if subtitle_mode == RequestedSubtitleMode::Off {
+            Vec::new()
+        } else {
+            self.prepare_subtitles(
                 &media.path,
                 &temporary_directory,
                 &asset_base,
                 stream_start_position_seconds,
             )
-            .await;
+            .await
+        };
+        let burn_subtitle = if subtitle_mode == RequestedSubtitleMode::Burned {
+            match prepared_subtitles
+                .iter()
+                .find(|subtitle| Some(subtitle.public.id.as_str()) == subtitle_id)
+                .map(|subtitle| subtitle.output_path.clone())
+            {
+                Some(output_path) => Some(output_path),
+                None => {
+                    let _ = tokio::fs::remove_dir_all(&temporary_directory).await;
+                    return Err(RemoteMediaError::new(
+                        409,
+                        "MEDIA_SUBTITLE_UNAVAILABLE",
+                        "请求的字幕轨道不可用于烧录",
+                    ));
+                }
+            }
+        } else {
+            None
+        };
+        let subtitles = if subtitle_mode == RequestedSubtitleMode::Soft {
+            prepared_subtitles
+                .into_iter()
+                .map(|subtitle| subtitle.public)
+                .collect()
+        } else {
+            Vec::new()
+        };
         let mut process = None;
         let mut diagnostics = RemotePlaybackDiagnostics {
             playback_path: if mode == "hls" {
@@ -454,7 +527,13 @@ impl RemoteMediaSessionService {
             } else {
                 RemotePlaybackPath::Direct
             },
-            subtitle_mode: Some("soft".to_owned()),
+            subtitle_mode: (subtitle_mode != RequestedSubtitleMode::Off).then(|| {
+                if subtitle_mode == RequestedSubtitleMode::Burned {
+                    "burned".to_owned()
+                } else {
+                    "soft".to_owned()
+                }
+            }),
             enhanced_frame_input: enhancement.video_enhancement != PlayerVideoEnhancement::Off
                 || enhancement.frame_interpolation != PlayerFrameInterpolation::Off,
             video_enhancement: enhancement.video_enhancement,
@@ -468,6 +547,7 @@ impl RemoteMediaSessionService {
                     &temporary_directory,
                     enhancement,
                     stream_start_position_seconds,
+                    burn_subtitle.as_deref(),
                 )
                 .await
                 .inspect_err(|_| {
@@ -985,7 +1065,7 @@ impl RemoteMediaSessionService {
         output_directory: &Path,
         asset_base: &str,
         stream_start_position_seconds: f64,
-    ) -> Vec<RemotePlaybackSubtitle> {
+    ) -> Vec<PreparedSubtitle> {
         let streams = match self.probe_subtitles(source_path).await {
             Ok(streams) => streams,
             Err(error) => {
@@ -1028,13 +1108,16 @@ impl RemoteMediaSessionService {
             if valid {
                 let language = normalize_language(stream.tags.get("language").map(String::as_str));
                 let title = stream.tags.get("title").map(String::as_str);
-                subtitles.push(RemotePlaybackSubtitle {
-                    id: format!("subtitle-{}", stream.index),
-                    label: subtitle_label(title, language.as_deref(), order),
-                    language,
-                    subtitle_type: stream.output_type.to_owned(),
-                    url: format!("{asset_base}/subtitles/{asset_name}"),
-                    default: stream.disposition.default == 1,
+                subtitles.push(PreparedSubtitle {
+                    public: RemotePlaybackSubtitle {
+                        id: format!("subtitle-{}", stream.index),
+                        label: subtitle_label(title, language.as_deref(), order),
+                        language,
+                        subtitle_type: stream.output_type.to_owned(),
+                        url: format!("{asset_base}/subtitles/{asset_name}"),
+                        default: stream.disposition.default == 1,
+                    },
+                    output_path,
                 });
             }
         }
@@ -1077,6 +1160,7 @@ impl RemoteMediaSessionService {
         output_directory: &Path,
         enhancement: RemotePlaybackEnhancement,
         stream_start_position_seconds: f64,
+        burn_subtitle: Option<&Path>,
     ) -> Result<HlsStart, RemoteMediaError> {
         let wants_rife = enhancement.frame_interpolation == PlayerFrameInterpolation::RifeRealtime;
         let wants_realesrgan = enhancement.video_enhancement == PlayerVideoEnhancement::Clear;
@@ -1159,6 +1243,7 @@ impl RemoteMediaSessionService {
                             interpolation_capacity: interpolation_capacity.clone(),
                         },
                         stream_start_position_seconds,
+                        burn_subtitle,
                     )
                     .await
                 {
@@ -1188,6 +1273,7 @@ impl RemoteMediaSessionService {
                         ..enhancement
                     },
                     stream_start_position_seconds,
+                    burn_subtitle,
                 )
                 .await
                 .map(|mut started| {
@@ -1205,6 +1291,7 @@ impl RemoteMediaSessionService {
             output_directory,
             enhancement,
             stream_start_position_seconds,
+            burn_subtitle,
         )
         .await
     }
@@ -1276,12 +1363,41 @@ impl RemoteMediaSessionService {
         candidates
     }
 
+    /// 烧录字幕依赖 FFmpeg `subtitles`/libass 滤镜，缺失时在会话创建前明确拒绝。
+    async fn ensure_subtitle_burn_supported(&self) -> Result<(), RemoteMediaError> {
+        if let Some(result) = self.subtitle_burn_support.lock().await.as_ref() {
+            return result.clone().map_err(|reason| {
+                RemoteMediaError::new(503, "MEDIA_SUBTITLE_BURN_UNAVAILABLE", reason)
+            });
+        }
+        let result = run_command(
+            &self.tools.ffmpeg_path,
+            &["-hide_banner", "-filters"],
+            None,
+            ENCODER_PROBE_TIMEOUT,
+        )
+        .await
+        .and_then(|output| {
+            if ffmpeg_filter_available(&output.stdout, "subtitles")
+                || ffmpeg_filter_available(&output.stderr, "subtitles")
+            {
+                Ok(())
+            } else {
+                Err("当前 FFmpeg 未启用 libass subtitles 滤镜，无法烧录字幕".to_owned())
+            }
+        });
+        *self.subtitle_burn_support.lock().await = Some(result.clone());
+        result
+            .map_err(|reason| RemoteMediaError::new(503, "MEDIA_SUBTITLE_BURN_UNAVAILABLE", reason))
+    }
+
     async fn start_hls_ffmpeg(
         &self,
         source_path: &Path,
         output_directory: &Path,
         enhancement: RemotePlaybackEnhancement,
         stream_start_position_seconds: f64,
+        burn_subtitle: Option<&Path>,
     ) -> Result<HlsStart, RemoteMediaError> {
         let playlist = output_directory.join("index.m3u8");
         let segments = output_directory.join("segment-%06d.ts");
@@ -1301,7 +1417,7 @@ impl RemoteMediaSessionService {
                     .arg(source_path)
                     .args(["-map", "0:v:0", "-map", "0:a:0?", "-c:v"])
                     .args(encoder_video_args(codec))
-                    .args(remote_video_filter_args(profile.enhancement))
+                    .args(remote_video_filter_args(profile.enhancement, burn_subtitle))
                     .args([
                         "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "160k", "-ac", "2",
                     ])
@@ -1389,6 +1505,7 @@ impl RemoteMediaSessionService {
         output_directory: &Path,
         config: ModelHlsConfig,
         stream_start_position_seconds: f64,
+        burn_subtitle: Option<&Path>,
     ) -> Result<HlsStart, RemoteMediaError> {
         let ModelHlsConfig {
             enhancement,
@@ -1449,6 +1566,7 @@ impl RemoteMediaSessionService {
                     &dimensions,
                     encoder_codec,
                     encoder_name,
+                    burn_subtitle,
                 )
                 .await
             {
@@ -1485,6 +1603,7 @@ impl RemoteMediaSessionService {
         dimensions: &str,
         encoder_codec: &str,
         encoder_name: &'static str,
+        burn_subtitle: Option<&Path>,
     ) -> Result<HlsStart, RemoteMediaError> {
         let mut decoder = hidden_command(&self.tools.ffmpeg_path);
         decoder.args(["-nostdin", "-hide_banner", "-loglevel", "error"]);
@@ -1548,14 +1667,17 @@ impl RemoteMediaSessionService {
             .arg(source_path)
             .args(["-map", "0:v:0", "-map", "1:a:0?", "-c:v"])
             .args(encoder_video_args(encoder_codec))
-            .args(remote_video_filter_args(RemotePlaybackEnhancement {
-                video_enhancement: if model_enhancement_active {
-                    PlayerVideoEnhancement::Off
-                } else {
-                    enhancement.video_enhancement
+            .args(remote_video_filter_args(
+                RemotePlaybackEnhancement {
+                    video_enhancement: if model_enhancement_active {
+                        PlayerVideoEnhancement::Off
+                    } else {
+                        enhancement.video_enhancement
+                    },
+                    frame_interpolation: PlayerFrameInterpolation::Off,
                 },
-                frame_interpolation: PlayerFrameInterpolation::Off,
-            }))
+                burn_subtitle,
+            ))
             .args([
                 "-pix_fmt",
                 "yuv420p",
@@ -2319,27 +2441,64 @@ fn validate_remote_enhancement(
     Ok(())
 }
 
-fn remote_video_filter_args(enhancement: RemotePlaybackEnhancement) -> Vec<String> {
-    let mut filters = Vec::new();
+fn parse_requested_subtitle_mode(value: &str) -> Result<RequestedSubtitleMode, RemoteMediaError> {
+    match value {
+        "soft" => Ok(RequestedSubtitleMode::Soft),
+        "burned" => Ok(RequestedSubtitleMode::Burned),
+        "off" => Ok(RequestedSubtitleMode::Off),
+        _ => Err(RemoteMediaError::new(
+            400,
+            "MEDIA_SUBTITLE_MODE_INVALID",
+            "字幕输出模式无效",
+        )),
+    }
+}
+
+fn remote_video_filter_args(
+    enhancement: RemotePlaybackEnhancement,
+    burn_subtitle: Option<&Path>,
+) -> Vec<String> {
+    let mut filters = Vec::<String>::new();
     match enhancement.video_enhancement {
         PlayerVideoEnhancement::Off => {}
         PlayerVideoEnhancement::Balanced => {
-            filters.push("hqdn3d=1.2:1.2:4:4");
-            filters.push("unsharp=5:5:0.45:5:5:0");
+            filters.push("hqdn3d=1.2:1.2:4:4".to_owned());
+            filters.push("unsharp=5:5:0.45:5:5:0".to_owned());
         }
         PlayerVideoEnhancement::Clear => {
-            filters.push("hqdn3d=0.8:0.8:3:3");
-            filters.push("unsharp=7:7:0.75:5:5:0");
+            filters.push("hqdn3d=0.8:0.8:3:3".to_owned());
+            filters.push("unsharp=7:7:0.75:5:5:0".to_owned());
         }
     }
     if enhancement.frame_interpolation == PlayerFrameInterpolation::MotionCompensated {
-        filters.push("minterpolate=fps=60:mi_mode=mci:mc_mode=aobmc:me_mode=bidir:vsbmc=1");
+        filters
+            .push("minterpolate=fps=60:mi_mode=mci:mc_mode=aobmc:me_mode=bidir:vsbmc=1".to_owned());
+    }
+    if let Some(path) = burn_subtitle {
+        filters.push(format!(
+            "subtitles=filename='{}'",
+            escape_ffmpeg_filter_path(path)
+        ));
     }
     if filters.is_empty() {
         Vec::new()
     } else {
         vec!["-vf".to_owned(), filters.join(",")]
     }
+}
+
+/// 转义 libavfilter 的字幕路径；字幕文件位于受控会话目录，不拼接任意滤镜表达式。
+fn escape_ffmpeg_filter_path(path: &Path) -> String {
+    let normalized = path.to_string_lossy().replace('\\', "/");
+    normalized
+        .chars()
+        .fold(String::new(), |mut output, character| {
+            if matches!(character, ':' | '\'' | ',' | '[' | ']' | ';') {
+                output.push('\\');
+            }
+            output.push(character);
+            output
+        })
 }
 
 /// 为高成本运动补偿追加无插帧重试，保证远程播放优先可用。
@@ -2569,9 +2728,10 @@ fn model_encoder_attempt_failure_message(encoder: &str, reason: &str) -> String 
 #[cfg(test)]
 mod encoder_tests {
     use super::{
-        encoder_failure_message, encoder_is_degraded, encoder_video_args, hls_enhancement_profiles,
-        model_encoder_attempt_failure_message, remote_video_filter_args,
-        validate_remote_enhancement, ENCODER_CANDIDATES, MODEL_PIPELINE_SAFETY_MARGIN_MS,
+        encoder_failure_message, encoder_is_degraded, encoder_video_args, ffmpeg_filter_available,
+        hls_enhancement_profiles, model_encoder_attempt_failure_message,
+        parse_requested_subtitle_mode, remote_video_filter_args, validate_remote_enhancement,
+        RequestedSubtitleMode, ENCODER_CANDIDATES, MODEL_PIPELINE_SAFETY_MARGIN_MS,
         MODEL_PIPELINE_UTILIZATION_LIMIT, REMOTE_OUTPUT_FRAME_RATE_CAP, RIFE_HARD_MAX_MULTIPLIER,
     };
     use ani_contracts::{
@@ -2676,13 +2836,59 @@ mod encoder_tests {
 
     #[test]
     fn builds_actual_remote_enhancement_filter_chain() {
-        let args = remote_video_filter_args(RemotePlaybackEnhancement {
-            video_enhancement: PlayerVideoEnhancement::Clear,
-            frame_interpolation: PlayerFrameInterpolation::MotionCompensated,
-        });
+        let args = remote_video_filter_args(
+            RemotePlaybackEnhancement {
+                video_enhancement: PlayerVideoEnhancement::Clear,
+                frame_interpolation: PlayerFrameInterpolation::MotionCompensated,
+            },
+            None,
+        );
         assert_eq!(args[0], "-vf");
         assert!(args[1].contains("unsharp=7:7"));
         assert!(args[1].contains("minterpolate=fps=60"));
+    }
+
+    #[test]
+    fn appends_burned_subtitles_after_the_enhancement_filters() {
+        let args = remote_video_filter_args(
+            RemotePlaybackEnhancement {
+                video_enhancement: PlayerVideoEnhancement::Clear,
+                ..Default::default()
+            },
+            Some(std::path::Path::new("C:\\media\\subtitle:01[main].ass")),
+        );
+        assert_eq!(args[0], "-vf");
+        let filters = &args[1];
+        assert!(filters.find("unsharp=7:7").unwrap() < filters.find("subtitles=").unwrap());
+        assert!(filters.contains("subtitles=filename='C\\:/media/subtitle\\:01\\[main\\].ass'"));
+    }
+
+    #[test]
+    fn validates_subtitle_output_modes() {
+        assert_eq!(
+            parse_requested_subtitle_mode("soft").unwrap(),
+            RequestedSubtitleMode::Soft
+        );
+        assert_eq!(
+            parse_requested_subtitle_mode("burned").unwrap(),
+            RequestedSubtitleMode::Burned
+        );
+        assert_eq!(
+            parse_requested_subtitle_mode("off").unwrap(),
+            RequestedSubtitleMode::Off
+        );
+        assert!(parse_requested_subtitle_mode("client-defined").is_err());
+    }
+
+    #[test]
+    fn detects_only_the_exact_ffmpeg_subtitle_filter() {
+        let filters = b" ... null V->V Pass source\n .. subtitles V->V Render text\n";
+        assert!(ffmpeg_filter_available(filters, "subtitles"));
+        assert!(!ffmpeg_filter_available(filters, "subtitle"));
+        assert!(!ffmpeg_filter_available(
+            b" ... null V->V subtitles in help text",
+            "subtitles"
+        ));
     }
 
     #[test]
@@ -2871,6 +3077,13 @@ async fn run_command(
         Ok(Err(error)) => Err(error.to_string()),
         Err(_) => Err("执行超时".to_owned()),
     }
+}
+
+/// 仅接受 FFmpeg `-filters` 表格中精确登记的滤镜名，避免从说明文本误判能力。
+fn ffmpeg_filter_available(output: &[u8], expected_filter: &str) -> bool {
+    String::from_utf8_lossy(output)
+        .lines()
+        .any(|line| line.split_whitespace().nth(1) == Some(expected_filter))
 }
 
 fn hidden_command(path: &Path) -> Command {

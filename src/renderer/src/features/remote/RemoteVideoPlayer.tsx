@@ -62,6 +62,7 @@ import {
 } from "./external-player-launch";
 import type { PlaybackSessionClient } from "./playback-session-client";
 import { startPlaybackSessionRefresh } from "@shared/playback-session-refresh";
+import { planExternalPlayback } from "@shared/external-playback-plan";
 import {
   playlistItemLabel,
   resolveAdjacentPlaylistItem,
@@ -830,25 +831,35 @@ export function RemoteVideoPlayer({
     setExternalPlayerOpening(true);
     const toastId = toast.loading(`正在准备 ${externalPlayer.label} 播放地址`);
     let externalSession: RemotePlaybackSession | undefined;
+    const externalPlan = planExternalPlayback(
+      requestedMode,
+      sessionEnhancement,
+      selectedSubtitleId
+    );
     try {
       externalSession = await createRemoteExternalPlaybackSession(
         activeItem.task.id,
-        requestedMode,
+        externalPlan.mode,
         activeItem.fileIndex,
-        sessionEnhancement,
-        currentTimeSeconds
+        externalPlan.enhancement,
+        currentTimeSeconds,
+        externalPlan.subtitleId
       );
       const mediaUrl = new URL(externalSession.streamUrl, window.location.origin).toString();
       window.location.assign(buildExternalPlayerProtocolUrl(externalPlayer.kind, mediaUrl));
       toast.info(`已请求打开 ${externalPlayer.label}`, {
         id: toastId,
-        description: "若播放器未启动，请确认已安装并允许浏览器打开外部应用。"
+        description: externalPlan.subtitleMode === "burned"
+          ? "当前字幕将在画质增强后合成到视频流。"
+          : "若播放器未启动，请确认已安装并允许浏览器打开外部应用。"
       });
       console.info("[remote] 已下发本地播放器拉流请求", {
         player: externalPlayer.kind,
         taskId: activeItem.task.id,
         fileIndex: activeItem.fileIndex,
-        mode: requestedMode
+        mode: externalPlan.mode,
+        subtitleMode: externalPlan.subtitleMode,
+        subtitleId: externalPlan.subtitleId
       });
     } catch (caught) {
       if (externalSession) void closeRemotePlaybackSession(externalSession.id);

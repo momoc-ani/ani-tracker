@@ -28,7 +28,9 @@ use tokio_util::io::ReaderStream;
 
 use crate::auth::{RemoteDeviceAuth, RemoteDeviceAuthError};
 use crate::image_cache::{ImageCache, ImageCacheError};
-use crate::media::{RemoteMediaAsset, RemoteMediaError, RemoteMediaSessionService};
+use crate::media::{
+    RemoteMediaAsset, RemoteMediaError, RemoteMediaSessionInput, RemoteMediaSessionService,
+};
 use crate::network::{
     is_trusted_host, is_trusted_origin, list_private_ipv4_addresses, TrustedOrigin,
 };
@@ -538,28 +540,19 @@ async fn handle_request(
         )
         .await?;
         let body: MediaSessionBody = parse_body(request).await?;
+        let input = RemoteMediaSessionInput {
+            task_id: &body.task_id,
+            requested_mode: &body.mode,
+            file_index: body.file_index,
+            enhancement: body.enhancement,
+            start_position_seconds: body.start_position_seconds,
+            subtitle_mode: &body.subtitle_mode,
+            subtitle_id: body.subtitle_id.as_deref(),
+        };
         let session = if path.ends_with("external-sessions") {
-            core.media
-                .create_external_session(
-                    &body.task_id,
-                    &device.id,
-                    &body.mode,
-                    body.file_index,
-                    body.enhancement,
-                    body.start_position_seconds,
-                )
-                .await
+            core.media.create_external_session(&device.id, input).await
         } else {
-            core.media
-                .create_session(
-                    &body.task_id,
-                    &device.id,
-                    &body.mode,
-                    body.file_index,
-                    body.enhancement,
-                    body.start_position_seconds,
-                )
-                .await
+            core.media.create_session(&device.id, input).await
         }
         .map_err(GatewayHttpError::from_media)?;
         let mut response = json_response(StatusCode::OK, serde_json::to_value(session)?);
@@ -1119,6 +1112,14 @@ struct MediaSessionBody {
     enhancement: RemotePlaybackEnhancement,
     #[serde(default)]
     start_position_seconds: Option<f64>,
+    #[serde(default = "default_subtitle_mode")]
+    subtitle_mode: String,
+    #[serde(default)]
+    subtitle_id: Option<String>,
+}
+
+fn default_subtitle_mode() -> String {
+    "soft".to_owned()
 }
 
 struct BrowserMediaRoute {
