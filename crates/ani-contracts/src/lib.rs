@@ -854,8 +854,25 @@ pub struct RemotePlaybackSubtitle {
     pub default: bool,
 }
 
+/// 远程 AI 插帧在当前源帧率、模型性能、显存和输出上限下的容量结果。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteInterpolationCapacity {
+    pub source_frame_rate: f64,
+    pub target_frame_rate: f64,
+    pub selected_multiplier: u8,
+    pub max_feasible_multiplier: u8,
+    pub output_frame_rate_cap: f64,
+    pub interval_budget_ms: f64,
+    pub estimated_interval_cost_ms: f64,
+    pub interpolation_p95_ms: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enhancement_p95_ms: Option<f64>,
+    pub latency_sample_count: u64,
+}
+
 /// 远程增强输出的实际编码诊断，不代表请求一定使用了硬件编码。
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RemotePlaybackDiagnostics {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -872,6 +889,8 @@ pub struct RemotePlaybackDiagnostics {
     pub video_enhancement: PlayerVideoEnhancement,
     #[serde(default)]
     pub frame_interpolation: PlayerFrameInterpolation,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interpolation_capacity: Option<RemoteInterpolationCapacity>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub degradation_reason: Option<String>,
 }

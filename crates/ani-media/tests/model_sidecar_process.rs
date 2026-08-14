@@ -23,6 +23,8 @@ async fn launches_validated_sidecar_and_processes_continuous_rgb_frames() {
     assert_eq!(diagnostics.gpu_device, "fixture-vulkan-device");
     assert_eq!(diagnostics.processed_frames, 1);
     assert_eq!(diagnostics.dropped_frames, 0);
+    assert_eq!(diagnostics.frame_time_sample_count, 2);
+    assert!(diagnostics.p95_frame_time_ms.is_some_and(f64::is_finite));
     runtime.shutdown().await;
 }
 

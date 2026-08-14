@@ -693,6 +693,20 @@ export interface RemotePlaybackSubtitle {
   default: boolean;
 }
 
+/** 基于当前源帧率、模型 P95、显存和输出上限得到的 AI 插帧计划。 */
+export interface RemoteInterpolationCapacity {
+  sourceFrameRate: number;
+  targetFrameRate: number;
+  selectedMultiplier: number;
+  maxFeasibleMultiplier: number;
+  outputFrameRateCap: number;
+  intervalBudgetMs: number;
+  estimatedIntervalCostMs: number;
+  interpolationP95Ms: number;
+  enhancementP95Ms?: number;
+  latencySampleCount: number;
+}
+
 /** 远程转码实际采用的编码器和字幕传递方式。 */
 export interface RemotePlaybackDiagnostics {
   encoder?: string;
@@ -702,6 +716,7 @@ export interface RemotePlaybackDiagnostics {
   modelBackend?: string;
   videoEnhancement: import("./player-contract").PlayerVideoEnhancement;
   frameInterpolation: import("./player-contract").PlayerFrameInterpolation;
+  interpolationCapacity?: RemoteInterpolationCapacity;
   degradationReason?: string;
 }
 

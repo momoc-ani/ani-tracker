@@ -659,6 +659,12 @@ export function RemoteVideoPlayer({
     sessionDiagnostics?.degradationReason ? "增强已降级" : undefined,
     sessionDiagnostics && sessionDiagnostics.videoEnhancement !== "off" ? "画质增强" : undefined,
     sessionDiagnostics?.frameInterpolation === "motion-compensated" ? "60 FPS 运动补偿" : undefined,
+    sessionDiagnostics?.interpolationCapacity
+      ? sessionDiagnostics.frameInterpolation === "rife-realtime"
+        && sessionDiagnostics.interpolationCapacity.selectedMultiplier > 1
+        ? `AI ${Math.round(sessionDiagnostics.interpolationCapacity.targetFrameRate)} FPS (${sessionDiagnostics.interpolationCapacity.selectedMultiplier}x)`
+        : "AI 插帧上限 1x"
+      : undefined,
     session ? `${session.subtitles.length} 条字幕` : undefined,
     activeItem?.task.resolution?.toUpperCase()
   ].filter((value): value is string => Boolean(value));

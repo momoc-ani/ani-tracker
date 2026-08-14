@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -20,6 +21,7 @@ const PROTOCOL_VERSION: u16 = 1;
 const HEADER_BYTES: usize = 48;
 const MAX_CONTROL_PAYLOAD_BYTES: usize = 64 * 1024;
 const DEFAULT_MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
+const FRAME_TIME_SAMPLE_CAPACITY: usize = 120;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -97,6 +99,8 @@ pub struct ModelSidecarDiagnostics {
     pub gpu_device: String,
     pub warmup_frame_time_ms: f64,
     pub last_frame_time_ms: Option<f64>,
+    pub p95_frame_time_ms: Option<f64>,
+    pub frame_time_sample_count: u64,
     pub processed_frames: u64,
     pub dropped_frames: u64,
     pub degradation_reason: Option<String>,
@@ -113,6 +117,7 @@ pub struct ModelSidecarRuntime {
     request_sequence: AtomicU64,
     ready: AtomicBool,
     diagnostics: Mutex<ModelSidecarDiagnostics>,
+    frame_time_samples_ms: Mutex<VecDeque<f64>>,
 }
 
 struct SidecarConnection {
@@ -290,15 +295,38 @@ impl ModelSidecarRuntime {
                 gpu_device: handshake.gpu_device,
                 warmup_frame_time_ms,
                 last_frame_time_ms: None,
+                p95_frame_time_ms: Some(warmup_frame_time_ms),
+                frame_time_sample_count: 1,
                 processed_frames: 0,
                 dropped_frames: 0,
                 degradation_reason: None,
             }),
+            frame_time_samples_ms: Mutex::new(VecDeque::from([warmup_frame_time_ms])),
         })
     }
 
     pub async fn diagnostics(&self) -> ModelSidecarDiagnostics {
         self.diagnostics.lock().await.clone()
+    }
+
+    async fn record_frame_time(&self, frame_time_ms: f64) {
+        let mut samples = self.frame_time_samples_ms.lock().await;
+        if samples.len() == FRAME_TIME_SAMPLE_CAPACITY {
+            let _ = samples.pop_front();
+        }
+        samples.push_back(frame_time_ms);
+        let mut sorted = samples.iter().copied().collect::<Vec<_>>();
+        sorted.sort_by(f64::total_cmp);
+        let p95_index = ((sorted.len() * 95).div_ceil(100)).saturating_sub(1);
+        let p95_frame_time_ms = sorted.get(p95_index).copied();
+        let frame_time_sample_count = samples.len() as u64;
+        drop(samples);
+
+        let mut diagnostics = self.diagnostics.lock().await;
+        diagnostics.last_frame_time_ms = Some(frame_time_ms);
+        diagnostics.p95_frame_time_ms = p95_frame_time_ms;
+        diagnostics.frame_time_sample_count = frame_time_sample_count;
+        diagnostics.processed_frames = diagnostics.processed_frames.saturating_add(1);
     }
 
     pub async fn shutdown(&self) {
@@ -372,9 +400,7 @@ impl ModelSidecarRuntime {
             return self.degrade(error).await;
         }
         let frame_time_ms = started.elapsed().as_secs_f64() * 1_000.0;
-        let mut diagnostics = self.diagnostics.lock().await;
-        diagnostics.last_frame_time_ms = Some(frame_time_ms);
-        diagnostics.processed_frames = diagnostics.processed_frames.saturating_add(1);
+        self.record_frame_time(frame_time_ms).await;
         Ok(RawVideoFrame {
             width: response.width,
             height: response.height,
@@ -422,9 +448,7 @@ impl ModelSidecarRuntime {
             return self.degrade(error).await;
         }
         let frame_time_ms = started.elapsed().as_secs_f64() * 1_000.0;
-        let mut diagnostics = self.diagnostics.lock().await;
-        diagnostics.last_frame_time_ms = Some(frame_time_ms);
-        diagnostics.processed_frames = diagnostics.processed_frames.saturating_add(1);
+        self.record_frame_time(frame_time_ms).await;
         Ok(RawVideoFrame {
             width: response.width,
             height: response.height,

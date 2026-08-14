@@ -31,6 +31,113 @@ pub struct EnhancementBudget {
     pub required_vram_bytes: u64,
 }
 
+/// 基于整条源帧间隔计算插帧倍率，避免只按 GPU 品牌或单次模型耗时猜测能力。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct InterpolationCapacityInput {
+    pub source_frame_rate: f64,
+    pub output_frame_rate_cap: f64,
+    pub interpolation_p95_ms: f64,
+    pub enhancement_p95_ms: f64,
+    pub decode_p95_ms: f64,
+    pub encode_p95_ms: f64,
+    pub safety_margin_ms: f64,
+    pub utilization_limit: f64,
+    pub available_vram_bytes: u64,
+    pub required_vram_bytes: u64,
+    pub hard_max_multiplier: u8,
+}
+
+/// 当前硬件和处理链允许的插帧计划；倍率 1 表示保持源帧率。
+#[derive(Debug, Clone, PartialEq)]
+pub struct InterpolationPlan {
+    pub source_frame_rate: f64,
+    pub target_frame_rate: f64,
+    pub selected_multiplier: u8,
+    pub max_feasible_multiplier: u8,
+    pub interval_budget_ms: f64,
+    pub estimated_interval_cost_ms: f64,
+    pub rejection_reason: Option<String>,
+}
+
+/// 计算整数插帧倍率上限。每个源帧间隔需要生成 `倍率 - 1` 帧，并处理全部输出帧。
+pub fn plan_interpolation(input: InterpolationCapacityInput) -> InterpolationPlan {
+    let source_interval_ms = 1_000.0 / input.source_frame_rate;
+    let interval_budget_ms = source_interval_ms * input.utilization_limit;
+    let base_cost_ms = input.decode_p95_ms + input.encode_p95_ms + input.safety_margin_ms;
+    let valid = input.source_frame_rate.is_finite()
+        && input.source_frame_rate > 0.0
+        && input.output_frame_rate_cap.is_finite()
+        && input.output_frame_rate_cap > 0.0
+        && input.interpolation_p95_ms.is_finite()
+        && input.interpolation_p95_ms > 0.0
+        && input.enhancement_p95_ms.is_finite()
+        && input.enhancement_p95_ms >= 0.0
+        && input.decode_p95_ms.is_finite()
+        && input.decode_p95_ms >= 0.0
+        && input.encode_p95_ms.is_finite()
+        && input.encode_p95_ms >= 0.0
+        && input.safety_margin_ms.is_finite()
+        && input.safety_margin_ms >= 0.0
+        && input.utilization_limit.is_finite()
+        && input.utilization_limit > 0.0
+        && input.utilization_limit <= 1.0
+        && input.hard_max_multiplier >= 2;
+    if !valid {
+        return InterpolationPlan {
+            source_frame_rate: input.source_frame_rate,
+            target_frame_rate: input.source_frame_rate,
+            selected_multiplier: 1,
+            max_feasible_multiplier: 1,
+            interval_budget_ms,
+            estimated_interval_cost_ms: f64::NAN,
+            rejection_reason: Some("插帧性能遥测无效，已保持源帧率".to_owned()),
+        };
+    }
+
+    let cost_for = |multiplier: u8| {
+        input.interpolation_p95_ms * f64::from(multiplier.saturating_sub(1))
+            + input.enhancement_p95_ms * f64::from(multiplier)
+            + base_cost_ms
+    };
+    let output_limited_multiplier =
+        (input.output_frame_rate_cap / input.source_frame_rate).floor() as u8;
+    let candidate_max = input
+        .hard_max_multiplier
+        .min(output_limited_multiplier.max(1));
+    let mut max_feasible_multiplier = 1;
+    if input.required_vram_bytes <= input.available_vram_bytes {
+        for multiplier in 2..=candidate_max {
+            if cost_for(multiplier) <= interval_budget_ms {
+                max_feasible_multiplier = multiplier;
+            } else {
+                break;
+            }
+        }
+    }
+    let estimated_interval_cost_ms = cost_for(max_feasible_multiplier.max(2));
+    let rejection_reason = if max_feasible_multiplier >= 2 {
+        None
+    } else if input.required_vram_bytes > input.available_vram_bytes {
+        Some("插帧模型超出当前显存预算，已保持源帧率".to_owned())
+    } else if output_limited_multiplier < 2 {
+        Some("源帧率已达到输出帧率上限，已跳过 AI 插帧".to_owned())
+    } else {
+        Some(format!(
+            "插帧链路 P95 预计 {:.2}ms，超过每个源帧间隔 {:.2}ms 的安全预算",
+            estimated_interval_cost_ms, interval_budget_ms
+        ))
+    };
+    InterpolationPlan {
+        source_frame_rate: input.source_frame_rate,
+        target_frame_rate: input.source_frame_rate * f64::from(max_feasible_multiplier),
+        selected_multiplier: max_feasible_multiplier,
+        max_feasible_multiplier,
+        interval_budget_ms,
+        estimated_interval_cost_ms,
+        rejection_reason,
+    }
+}
+
 /// 模型权重的受控清单；播放器只接受摘要、尺寸和资源预算均有效的模型。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EnhancementModelManifest {
@@ -712,6 +819,92 @@ mod tests {
             scheduler.decide(EnhancementStage::ModelSuperResolution),
             EnhancementDecision::Shader
         );
+    }
+
+    fn interpolation_input(source_frame_rate: f64) -> InterpolationCapacityInput {
+        InterpolationCapacityInput {
+            source_frame_rate,
+            output_frame_rate_cap: 60.0,
+            interpolation_p95_ms: 20.0,
+            enhancement_p95_ms: 0.0,
+            decode_p95_ms: 0.0,
+            encode_p95_ms: 0.0,
+            safety_margin_ms: 5.0,
+            utilization_limit: 0.8,
+            available_vram_bytes: 4_000,
+            required_vram_bytes: 2_000,
+            hard_max_multiplier: 2,
+        }
+    }
+
+    #[test]
+    fn plans_ai_interpolation_from_source_interval_output_cap_and_cost() {
+        for (source_frame_rate, target_frame_rate) in [(24.0, 48.0), (25.0, 50.0)] {
+            let plan = plan_interpolation(interpolation_input(source_frame_rate));
+            assert_eq!(plan.selected_multiplier, 2);
+            assert_eq!(plan.target_frame_rate, target_frame_rate);
+            assert!(plan.rejection_reason.is_none());
+        }
+
+        let over_budget = plan_interpolation(InterpolationCapacityInput {
+            interpolation_p95_ms: 25.0,
+            ..interpolation_input(30.0)
+        });
+        assert_eq!(over_budget.selected_multiplier, 1);
+        assert!(over_budget
+            .rejection_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("P95")));
+
+        let output_limited = plan_interpolation(interpolation_input(60.0));
+        assert_eq!(output_limited.selected_multiplier, 1);
+        assert!(output_limited
+            .rejection_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("输出帧率上限")));
+    }
+
+    #[test]
+    fn interpolation_capacity_accounts_for_combined_models_vram_and_invalid_telemetry() {
+        let combined = plan_interpolation(InterpolationCapacityInput {
+            enhancement_p95_ms: 10.0,
+            ..interpolation_input(24.0)
+        });
+        assert_eq!(combined.selected_multiplier, 1);
+
+        let insufficient_vram = plan_interpolation(InterpolationCapacityInput {
+            available_vram_bytes: 1_999,
+            ..interpolation_input(24.0)
+        });
+        assert_eq!(insufficient_vram.selected_multiplier, 1);
+        assert!(insufficient_vram
+            .rejection_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("显存")));
+
+        let invalid = plan_interpolation(InterpolationCapacityInput {
+            interpolation_p95_ms: f64::NAN,
+            ..interpolation_input(24.0)
+        });
+        assert_eq!(invalid.selected_multiplier, 1);
+        assert!(invalid
+            .rejection_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("遥测无效")));
+    }
+
+    #[test]
+    fn interpolation_calculator_supports_future_protocol_multipliers() {
+        let plan = plan_interpolation(InterpolationCapacityInput {
+            output_frame_rate_cap: 120.0,
+            interpolation_p95_ms: 10.0,
+            safety_margin_ms: 0.0,
+            utilization_limit: 1.0,
+            hard_max_multiplier: 4,
+            ..interpolation_input(24.0)
+        });
+        assert_eq!(plan.max_feasible_multiplier, 4);
+        assert_eq!(plan.target_frame_rate, 96.0);
     }
 
     #[test]

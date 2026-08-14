@@ -5,12 +5,16 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use ani_contracts::{
-    PlayerFrameInterpolation, PlayerVideoEnhancement, RemotePlaybackDiagnostics,
-    RemotePlaybackEnhancement, RemotePlaybackSession, RemotePlaybackSubtitle,
+    PlayerFrameInterpolation, PlayerVideoEnhancement, RemoteInterpolationCapacity,
+    RemotePlaybackDiagnostics, RemotePlaybackEnhancement, RemotePlaybackSession,
+    RemotePlaybackSubtitle,
 };
 use ani_domain::{AppSettings, DownloadTask, MediaFile, PlaybackCheckpoint};
 use ani_media::model_sidecar::{ModelSidecarConfig, ModelSidecarRuntime};
-use ani_media::player::{EnhancementBudget, FrameInterpolator, ModelEnhancer, RawVideoFrame};
+use ani_media::player::{
+    plan_interpolation, FrameInterpolator, InterpolationCapacityInput, InterpolationPlan,
+    ModelEnhancer, RawVideoFrame,
+};
 use async_trait::async_trait;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
@@ -30,6 +34,10 @@ const SESSION_TTL: Duration = Duration::from_secs(30 * 60);
 const TRANSCODER_START_TIMEOUT: Duration = Duration::from_secs(20);
 const MAX_SESSIONS: usize = 2;
 const RIFE_FRAME_QUEUE_CAPACITY: usize = 2;
+const RIFE_HARD_MAX_MULTIPLIER: u8 = 2;
+const REMOTE_OUTPUT_FRAME_RATE_CAP: f64 = 60.0;
+const MODEL_PIPELINE_UTILIZATION_LIMIT: f64 = 0.8;
+const MODEL_PIPELINE_SAFETY_MARGIN_MS: f64 = 5.0;
 const ENCODER_CANDIDATES: &[(&str, &str)] = &[
     ("h264_nvenc", "nvenc"),
     ("h264_amf", "amf"),
@@ -167,6 +175,7 @@ struct HlsStart {
     encoder_degraded: bool,
     actual_video_enhancement: PlayerVideoEnhancement,
     actual_interpolation: PlayerFrameInterpolation,
+    interpolation_capacity: Option<RemoteInterpolationCapacity>,
     model_backend: Option<String>,
     degradation_reason: Option<String>,
 }
@@ -174,6 +183,7 @@ struct HlsStart {
 struct ModelPipelineState {
     actual_video_enhancement: PlayerVideoEnhancement,
     actual_interpolation: PlayerFrameInterpolation,
+    interpolation_capacity: Option<RemoteInterpolationCapacity>,
     rife_model_backend: Option<String>,
     realesrgan_model_backend: Option<String>,
     degradation_reasons: Vec<String>,
@@ -349,6 +359,7 @@ impl RemoteMediaSessionService {
             diagnostics.encoder_degraded = started.encoder_degraded;
             diagnostics.video_enhancement = started.actual_video_enhancement;
             diagnostics.frame_interpolation = started.actual_interpolation;
+            diagnostics.interpolation_capacity = started.interpolation_capacity;
             diagnostics.model_backend = started.model_backend;
             diagnostics.enhanced_frame_input = diagnostics.video_enhancement
                 != PlayerVideoEnhancement::Off
@@ -437,6 +448,7 @@ impl RemoteMediaSessionService {
             let state = state.lock().await;
             public.diagnostics.video_enhancement = state.actual_video_enhancement;
             public.diagnostics.frame_interpolation = state.actual_interpolation;
+            public.diagnostics.interpolation_capacity = state.interpolation_capacity.clone();
             public.diagnostics.model_backend = state.model_backend();
             public.diagnostics.enhanced_frame_input = state.actual_video_enhancement
                 != PlayerVideoEnhancement::Off
@@ -927,15 +939,35 @@ impl RemoteMediaSessionService {
             } else {
                 None
             };
-            if let (Some(rife_runtime), Some(realesrgan_runtime)) = (&rife, &realesrgan) {
-                if !model_pair_fits(
-                    FrameInterpolator::budget(rife_runtime.as_ref()),
-                    ModelEnhancer::budget(realesrgan_runtime.as_ref()),
-                    self.tools.model_available_vram_bytes,
-                ) {
-                    degradation_reasons
-                        .push("模型组合超出帧时间或显存预算，已优先关闭 RIFE 插帧".to_owned());
-                    rife = None;
+            let mut video_probe = None;
+            let mut interpolation_capacity = None;
+            if let Some(rife_runtime) = rife.as_ref() {
+                match self.probe_video(source_path).await {
+                    Ok(video) => {
+                        let (plan, capacity) = model_interpolation_plan(
+                            video.frame_rate,
+                            rife_runtime,
+                            realesrgan.as_ref(),
+                            self.tools.model_available_vram_bytes,
+                        )
+                        .await;
+                        video_probe = Some(video);
+                        interpolation_capacity = Some(capacity);
+                        if plan.selected_multiplier < RIFE_HARD_MAX_MULTIPLIER {
+                            let reason = plan.rejection_reason.unwrap_or_else(|| {
+                                "当前处理链无法满足 2x AI 插帧预算，已保持源帧率".to_owned()
+                            });
+                            log::warn!("RIFE 容量门禁关闭模型插帧 reason={reason}");
+                            degradation_reasons.push(reason);
+                            rife = None;
+                        }
+                    }
+                    Err(reason) => {
+                        let reason = format!("无法探测源帧率，已关闭 RIFE 插帧：{reason}");
+                        log::warn!("{reason}");
+                        degradation_reasons.push(reason);
+                        rife = None;
+                    }
                 }
             }
             if rife.is_some() || realesrgan.is_some() {
@@ -943,16 +975,20 @@ impl RemoteMediaSessionService {
                     .start_model_hls(
                         source_path,
                         output_directory,
-                        RemotePlaybackEnhancement {
-                            video_enhancement: enhancement.video_enhancement,
-                            frame_interpolation: if rife.is_some() {
-                                PlayerFrameInterpolation::RifeRealtime
-                            } else {
-                                PlayerFrameInterpolation::Off
+                        ModelHlsConfig {
+                            enhancement: RemotePlaybackEnhancement {
+                                video_enhancement: enhancement.video_enhancement,
+                                frame_interpolation: if rife.is_some() {
+                                    PlayerFrameInterpolation::RifeRealtime
+                                } else {
+                                    PlayerFrameInterpolation::Off
+                                },
                             },
+                            rife,
+                            realesrgan,
+                            video_probe,
+                            interpolation_capacity: interpolation_capacity.clone(),
                         },
-                        rife,
-                        realesrgan,
                     )
                     .await
                 {
@@ -984,6 +1020,7 @@ impl RemoteMediaSessionService {
                 )
                 .await
                 .map(|mut started| {
+                    started.interpolation_capacity = interpolation_capacity;
                     started.degradation_reason = join_degradation_reasons(
                         started.degradation_reason.take(),
                         degradation_reasons,
@@ -1098,6 +1135,7 @@ impl RemoteMediaSessionService {
                         encoder_degraded: index > 0,
                         actual_video_enhancement: enhancement.video_enhancement,
                         actual_interpolation: enhancement.frame_interpolation,
+                        interpolation_capacity: None,
                         model_backend: None,
                         degradation_reason: None,
                     });
@@ -1125,14 +1163,22 @@ impl RemoteMediaSessionService {
         &self,
         source_path: &Path,
         output_directory: &Path,
-        enhancement: RemotePlaybackEnhancement,
-        rife: Option<Arc<ModelSidecarRuntime>>,
-        realesrgan: Option<Arc<ModelSidecarRuntime>>,
+        config: ModelHlsConfig,
     ) -> Result<HlsStart, RemoteMediaError> {
-        let video = self
-            .probe_video(source_path)
-            .await
-            .map_err(|error| RemoteMediaError::new(503, "MODEL_VIDEO_PROBE_FAILED", error))?;
+        let ModelHlsConfig {
+            enhancement,
+            rife,
+            realesrgan,
+            video_probe,
+            interpolation_capacity,
+        } = config;
+        let video = match video_probe {
+            Some(video) => video,
+            None => self
+                .probe_video(source_path)
+                .await
+                .map_err(|error| RemoteMediaError::new(503, "MODEL_VIDEO_PROBE_FAILED", error))?,
+        };
         let playlist = output_directory.join("index.m3u8");
         let segments = output_directory.join("segment-%06d.ts");
         let output_fps = if rife.is_some() {
@@ -1240,6 +1286,7 @@ impl RemoteMediaSessionService {
         let pipeline_state = Arc::new(Mutex::new(ModelPipelineState {
             actual_video_enhancement: enhancement.video_enhancement,
             actual_interpolation: enhancement.frame_interpolation,
+            interpolation_capacity: interpolation_capacity.clone(),
             rife_model_backend: rife
                 .as_ref()
                 .map(|runtime| FrameInterpolator::backend_id(runtime.as_ref()).to_owned()),
@@ -1259,6 +1306,7 @@ impl RemoteMediaSessionService {
                 width: video.width,
                 height: video.height,
                 frame_rate: video.frame_rate,
+                available_vram_bytes: self.tools.model_available_vram_bytes,
             },
         ));
         let started = tokio::time::Instant::now();
@@ -1275,6 +1323,7 @@ impl RemoteMediaSessionService {
                     encoder_degraded: true,
                     actual_video_enhancement: enhancement.video_enhancement,
                     actual_interpolation: enhancement.frame_interpolation,
+                    interpolation_capacity,
                     model_backend,
                     degradation_reason: None,
                 });
@@ -1347,10 +1396,19 @@ impl RemoteMediaSessionService {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
 struct VideoProbe {
     width: u32,
     height: u32,
     frame_rate: f64,
+}
+
+struct ModelHlsConfig {
+    enhancement: RemotePlaybackEnhancement,
+    rife: Option<Arc<ModelSidecarRuntime>>,
+    realesrgan: Option<Arc<ModelSidecarRuntime>>,
+    video_probe: Option<VideoProbe>,
+    interpolation_capacity: Option<RemoteInterpolationCapacity>,
 }
 
 struct ModelPipelineConfig {
@@ -1360,6 +1418,7 @@ struct ModelPipelineConfig {
     width: u32,
     height: u32,
     frame_rate: f64,
+    available_vram_bytes: u64,
 }
 
 #[derive(Default, Deserialize)]
@@ -1404,6 +1463,7 @@ async fn run_model_pipeline(
         width,
         height,
         frame_rate,
+        available_vram_bytes,
     } = config;
     // 即使 RIFE 运行中降级，编码器仍保持已启动的双倍帧率，后续帧必须重复补齐时间轴。
     let maintain_doubled_cadence = rife.is_some();
@@ -1461,23 +1521,52 @@ async fn run_model_pipeline(
             .await
             .map_err(|error| format!("写入模型管线原始帧失败：{error}"))?;
         if maintain_doubled_cadence {
-            let middle = if let Some(runtime) = rife.as_ref() {
+            if rife.is_some()
+                && !refresh_interpolation_capacity(
+                    frame_rate,
+                    rife.as_ref(),
+                    realesrgan.as_ref(),
+                    available_vram_bytes,
+                    &pipeline_state,
+                )
+                .await
+            {
+                rife = None;
+            }
+            let middle = if let Some(runtime) = rife.clone() {
                 match runtime.interpolate(previous.clone(), next.clone()).await {
-                    Ok(middle) => Some(
-                        apply_model_enhancement(
+                    Ok(middle) => {
+                        let middle = apply_model_enhancement(
                             &mut realesrgan,
                             middle,
                             fallback_scale,
                             &pipeline_state,
                         )
-                        .await,
-                    ),
+                        .await;
+                        if !refresh_interpolation_capacity(
+                            frame_rate,
+                            rife.as_ref(),
+                            realesrgan.as_ref(),
+                            available_vram_bytes,
+                            &pipeline_state,
+                        )
+                        .await
+                        {
+                            rife = None;
+                        }
+                        Some(middle)
+                    }
                     Err(reason) => {
                         log::warn!("RIFE 运行中降级，继续双倍帧率原始时间轴 reason={reason}");
                         rife = None;
                         let mut state = pipeline_state.lock().await;
                         state.actual_interpolation = PlayerFrameInterpolation::Off;
                         state.rife_model_backend = None;
+                        if let Some(capacity) = state.interpolation_capacity.as_mut() {
+                            capacity.target_frame_rate = capacity.source_frame_rate;
+                            capacity.selected_multiplier = 1;
+                            capacity.max_feasible_multiplier = 1;
+                        }
                         state.degradation_reasons.push(reason);
                         None
                     }
@@ -1603,22 +1692,94 @@ fn upscale_rgb24_nearest(
     })
 }
 
-fn model_pair_fits(
-    rife: EnhancementBudget,
-    realesrgan: EnhancementBudget,
+async fn model_interpolation_plan(
+    source_frame_rate: f64,
+    rife: &Arc<ModelSidecarRuntime>,
+    realesrgan: Option<&Arc<ModelSidecarRuntime>>,
     available_vram_bytes: u64,
+) -> (InterpolationPlan, RemoteInterpolationCapacity) {
+    let rife_budget = FrameInterpolator::budget(rife.as_ref());
+    let rife_diagnostics = rife.diagnostics().await;
+    let interpolation_p95_ms = rife_diagnostics
+        .p95_frame_time_ms
+        .unwrap_or(rife_diagnostics.warmup_frame_time_ms)
+        .max(rife_budget.estimated_frame_time_ms);
+    let (enhancement_p95_ms, enhancement_sample_count, required_vram_bytes) =
+        if let Some(realesrgan) = realesrgan {
+            let budget = ModelEnhancer::budget(realesrgan.as_ref());
+            let diagnostics = realesrgan.diagnostics().await;
+            (
+                diagnostics
+                    .p95_frame_time_ms
+                    .unwrap_or(diagnostics.warmup_frame_time_ms)
+                    .max(budget.estimated_frame_time_ms),
+                Some(diagnostics.frame_time_sample_count),
+                rife_budget
+                    .required_vram_bytes
+                    .saturating_add(budget.required_vram_bytes),
+            )
+        } else {
+            (0.0, None, rife_budget.required_vram_bytes)
+        };
+    let plan = plan_interpolation(InterpolationCapacityInput {
+        source_frame_rate,
+        output_frame_rate_cap: REMOTE_OUTPUT_FRAME_RATE_CAP,
+        interpolation_p95_ms,
+        enhancement_p95_ms,
+        decode_p95_ms: 0.0,
+        encode_p95_ms: 0.0,
+        safety_margin_ms: MODEL_PIPELINE_SAFETY_MARGIN_MS,
+        utilization_limit: MODEL_PIPELINE_UTILIZATION_LIMIT,
+        available_vram_bytes,
+        required_vram_bytes,
+        hard_max_multiplier: RIFE_HARD_MAX_MULTIPLIER,
+    });
+    let latency_sample_count = enhancement_sample_count
+        .map_or(rife_diagnostics.frame_time_sample_count, |count| {
+            count.min(rife_diagnostics.frame_time_sample_count)
+        });
+    let capacity = RemoteInterpolationCapacity {
+        source_frame_rate: plan.source_frame_rate,
+        target_frame_rate: plan.target_frame_rate,
+        selected_multiplier: plan.selected_multiplier,
+        max_feasible_multiplier: plan.max_feasible_multiplier,
+        output_frame_rate_cap: REMOTE_OUTPUT_FRAME_RATE_CAP,
+        interval_budget_ms: plan.interval_budget_ms,
+        estimated_interval_cost_ms: plan.estimated_interval_cost_ms,
+        interpolation_p95_ms,
+        enhancement_p95_ms: realesrgan.map(|_| enhancement_p95_ms),
+        latency_sample_count,
+    };
+    (plan, capacity)
+}
+
+async fn refresh_interpolation_capacity(
+    source_frame_rate: f64,
+    rife: Option<&Arc<ModelSidecarRuntime>>,
+    realesrgan: Option<&Arc<ModelSidecarRuntime>>,
+    available_vram_bytes: u64,
+    pipeline_state: &Arc<Mutex<ModelPipelineState>>,
 ) -> bool {
-    let required_vram_bytes = rife
-        .required_vram_bytes
-        .saturating_add(realesrgan.required_vram_bytes);
-    // 每个 RIFE 区间会增强原帧与中间帧，超分预算需要按两次推理计算。
-    let estimated_frame_time_ms =
-        rife.estimated_frame_time_ms + realesrgan.estimated_frame_time_ms * 2.0;
-    required_vram_bytes <= available_vram_bytes
-        && estimated_frame_time_ms
-            <= rife
-                .target_frame_time_ms
-                .min(realesrgan.target_frame_time_ms)
+    let Some(rife) = rife else {
+        return false;
+    };
+    let (plan, capacity) =
+        model_interpolation_plan(source_frame_rate, rife, realesrgan, available_vram_bytes).await;
+    let mut state = pipeline_state.lock().await;
+    state.interpolation_capacity = Some(capacity);
+    if plan.selected_multiplier >= RIFE_HARD_MAX_MULTIPLIER {
+        return true;
+    }
+    let reason = plan
+        .rejection_reason
+        .unwrap_or_else(|| "RIFE 运行时 P95 超出插帧预算，已保持源帧率".to_owned());
+    log::warn!("RIFE 运行时容量降级 reason={reason}");
+    state.actual_interpolation = PlayerFrameInterpolation::Off;
+    state.rife_model_backend = None;
+    if !state.degradation_reasons.contains(&reason) {
+        state.degradation_reasons.push(reason);
+    }
+    false
 }
 
 fn join_degradation_reasons(current: Option<String>, additional: Vec<String>) -> Option<String> {
@@ -1700,12 +1861,13 @@ fn encoder_video_args(codec: &str) -> &'static [&'static str] {
 mod encoder_tests {
     use super::{
         encoder_video_args, remote_video_filter_args, validate_remote_enhancement,
-        ENCODER_CANDIDATES,
+        ENCODER_CANDIDATES, MODEL_PIPELINE_SAFETY_MARGIN_MS, MODEL_PIPELINE_UTILIZATION_LIMIT,
+        REMOTE_OUTPUT_FRAME_RATE_CAP, RIFE_HARD_MAX_MULTIPLIER,
     };
     use ani_contracts::{
         PlayerFrameInterpolation, PlayerVideoEnhancement, RemotePlaybackEnhancement,
     };
-    use ani_media::player::{EnhancementBudget, RawVideoFrame};
+    use ani_media::player::{plan_interpolation, InterpolationCapacityInput, RawVideoFrame};
 
     #[test]
     fn selects_vendor_specific_video_options() {
@@ -1777,29 +1939,37 @@ mod encoder_tests {
     }
 
     #[test]
-    fn model_pair_requires_combined_frame_and_vram_budget() {
-        let rife = EnhancementBudget {
-            target_frame_time_ms: 33.0,
-            estimated_frame_time_ms: 16.0,
+    fn remote_rife_policy_caps_ai_at_two_and_accounts_for_combined_cost() {
+        let base = InterpolationCapacityInput {
+            source_frame_rate: 24.0,
+            output_frame_rate_cap: REMOTE_OUTPUT_FRAME_RATE_CAP,
+            interpolation_p95_ms: 20.0,
+            enhancement_p95_ms: 0.0,
+            decode_p95_ms: 0.0,
+            encode_p95_ms: 0.0,
+            safety_margin_ms: MODEL_PIPELINE_SAFETY_MARGIN_MS,
+            utilization_limit: MODEL_PIPELINE_UTILIZATION_LIMIT,
             available_vram_bytes: 4_000,
             required_vram_bytes: 2_000,
+            hard_max_multiplier: RIFE_HARD_MAX_MULTIPLIER,
         };
-        let realesrgan = EnhancementBudget {
-            target_frame_time_ms: 33.0,
-            estimated_frame_time_ms: 8.5,
-            available_vram_bytes: 4_000,
-            required_vram_bytes: 1_000,
-        };
-        assert!(super::model_pair_fits(rife, realesrgan, 4_000));
-        assert!(!super::model_pair_fits(rife, realesrgan, 2_999));
-        assert!(!super::model_pair_fits(
-            EnhancementBudget {
-                estimated_frame_time_ms: 17.1,
-                ..rife
-            },
-            realesrgan,
-            4_000
-        ));
+        assert_eq!(plan_interpolation(base).selected_multiplier, 2);
+        assert_eq!(
+            plan_interpolation(InterpolationCapacityInput {
+                enhancement_p95_ms: 10.0,
+                ..base
+            })
+            .selected_multiplier,
+            1
+        );
+        assert_eq!(
+            plan_interpolation(InterpolationCapacityInput {
+                available_vram_bytes: 1_999,
+                ..base
+            })
+            .selected_multiplier,
+            1
+        );
     }
 
     #[test]
