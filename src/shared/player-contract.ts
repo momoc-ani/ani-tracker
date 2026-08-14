@@ -120,6 +120,8 @@ export interface PlayerCapabilities {
   supportsDirectPlayback: boolean;
   supportsTranscodingFallback: boolean;
   supportsHdr: boolean;
+  /** WebCodecs/WebGPU 直传增强；未完成能力探测时必须保持 false 或缺省。 */
+  supportsDirectEnhancement?: boolean;
   unavailableReason?: string;
 }
 
@@ -270,6 +272,7 @@ export function createUnavailablePlayerCapabilities(
     supportsDirectPlayback: false,
     supportsTranscodingFallback: false,
     supportsHdr: false,
+    supportsDirectEnhancement: false,
     unavailableReason
   };
 }

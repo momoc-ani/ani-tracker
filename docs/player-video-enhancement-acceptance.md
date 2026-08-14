@@ -98,6 +98,7 @@ Real-ESRGAN 模型归档固定为 `v0.2.5.0/realesrgan-ncnn-vulkan-20220424-wind
 
 ## 6. WebCodecs/WebGPU 直传增强验收
 
+- F5-A 能力探测已实现并有共享单元测试，但它只记录 WebCodecs/WebGPU/codec 结果；在解复用、shader 和音视频时钟完成前，`supportsDirectEnhancement` 必须保持 `false`。
 - 能力探测必须同时确认 `VideoDecoder`、目标 codec 的 `isConfigSupported`、WebGPU adapter/device、WGSL shader 摘要和音视频时钟；任一项失败都不能展示“直传增强已启用”。
 - 直传增强必须从原文件的 HTTP Range 读取并在终端解码，不得启动服务端 FFmpeg/模型转码进程；网络面板和服务端会话诊断必须能区分 `direct` 与 `direct-enhanced`。
 - 首批只验收已选定 demuxer 支持的 MP4/WebM 组合；H.265、MKV、HDR 和浏览器不支持的 codec 必须明确回退原始直传或 HLS，不能输出黑帧或假增强状态。

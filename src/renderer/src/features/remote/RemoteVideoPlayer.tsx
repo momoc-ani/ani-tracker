@@ -45,6 +45,7 @@ import type {
 import { resolvePlayerShortcut } from "@shared/player-shortcuts";
 import { readStoredSubtitleScale, storeSubtitleScale } from "@/features/player/subtitle-scale";
 import { ArtPlayerAdapter } from "./art-player-adapter";
+import { probeDirectEnhancementCapabilities } from "./direct-enhancement-capabilities";
 import {
   buildExternalPlayerProtocolUrl,
   detectExternalPlayer
@@ -130,6 +131,18 @@ export function RemoteVideoPlayer({
   const [panelOpen, setPanelOpen] = useState(false);
   const [externalPlayerOpening, setExternalPlayerOpening] = useState(false);
   const [playerSnapshot, setPlayerSnapshot] = useState<PlayerSnapshot>();
+
+  useEffect(() => {
+    let active = true;
+    void probeDirectEnhancementCapabilities().then((capabilities) => {
+      if (!active) return;
+      console.info("[remote] F5 直传终端增强能力探测完成", capabilities);
+    });
+    return () => {
+      active = false;
+    };
+  }, []);
+
   const externalPlayer = useMemo(
     () => allowExternalPlayback
       ? detectExternalPlayer(navigator.userAgent, navigator.platform)

@@ -35,7 +35,9 @@ const ART_PLAYER_CAPABILITIES: PlayerCapabilities = {
   supportsPlaylistNavigation: false,
   supportsDirectPlayback: true,
   supportsTranscodingFallback: true,
-  supportsHdr: false
+  supportsHdr: false,
+  // F5-A 只完成探测；WebCodecs 解复用和 WebGPU shader 接入前不开放直传增强。
+  supportsDirectEnhancement: false
 };
 
 // 远程点播列表在转码完成前属于 EVENT 流，必须把同步点固定在列表起点，避免追赶快速增长的直播边缘。
