@@ -36,7 +36,7 @@ const ART_PLAYER_CAPABILITIES: PlayerCapabilities = {
   supportsDirectPlayback: true,
   supportsTranscodingFallback: true,
   supportsHdr: false,
-  // F5-A 只完成探测；WebCodecs 解复用和 WebGPU shader 接入前不开放直传增强。
+  // F5-D 已接入可见画布；30 分钟真机矩阵和独立音视频时钟完成前仍不开放能力契约。
   supportsDirectEnhancement: false
 };
 
@@ -78,6 +78,11 @@ export class ArtPlayerAdapter implements UnifiedPlayerAdapter {
   /** 返回当前完整状态，调用方无需读取 ArtPlayer 实例。 */
   getSnapshot(): PlayerSnapshot {
     return this.snapshot;
+  }
+
+  /** 仅供直传增强控制器读取 ArtPlayer 管理的媒体时钟与音频主轨。 */
+  getMediaElement(): HTMLVideoElement | undefined {
+    return this.player?.template.$video;
   }
 
   /** 判断绝对媒体时间是否位于当前浏览器可跳转范围。 */

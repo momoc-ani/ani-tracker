@@ -30,7 +30,7 @@ export function storeRemotePlaybackMode(mode: RemotePlaybackRequestMode): void {
   }
 }
 
-/** 读取远程转码增强偏好，并丢弃旧版本或伪造客户端写入的模式。 */
+/** 读取远程增强偏好，并丢弃旧版本或伪造客户端写入的模式。 */
 export function readRemotePlaybackEnhancement(): RemotePlaybackEnhancement {
   try {
     const value = JSON.parse(window.localStorage.getItem(REMOTE_PLAYBACK_ENHANCEMENT_KEY) ?? "null") as Partial<RemotePlaybackEnhancement> | null;
@@ -48,7 +48,7 @@ export function readRemotePlaybackEnhancement(): RemotePlaybackEnhancement {
   }
 }
 
-/** 保存只会交给实时转码链的画质增强与运动补偿偏好。 */
+/** 保存画质增强与运动补偿偏好；具体执行链由当前播放模式决定。 */
 export function storeRemotePlaybackEnhancement(enhancement: RemotePlaybackEnhancement): void {
   try {
     window.localStorage.setItem(REMOTE_PLAYBACK_ENHANCEMENT_KEY, JSON.stringify(enhancement));

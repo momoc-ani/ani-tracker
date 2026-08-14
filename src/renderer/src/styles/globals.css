@@ -294,6 +294,20 @@ html.desktop-vlc-host-root #root {
   object-fit: contain;
 }
 
+.direct-enhancement-canvas {
+  object-fit: contain;
+  pointer-events: none;
+}
+
+[data-direct-enhancement-active="true"] [data-artplayer-surface],
+[data-direct-enhancement-active="true"] [data-artplayer-surface] .art-video-player {
+  background: transparent;
+}
+
+[data-direct-enhancement-active="true"] [data-artplayer-surface] .art-video {
+  visibility: hidden;
+}
+
 [data-artplayer-surface] .art-bottom,
 [data-artplayer-surface] .art-mask,
 [data-artplayer-surface] .art-state,

@@ -14,7 +14,7 @@ import {
 } from "@shared/direct-enhancement-media";
 import { createDirectEnhancementWebGpuRenderer } from "./direct-enhancement-webgpu";
 
-const MAX_CACHE_BYTES = 32 * 1024 * 1024;
+export const DIRECT_ENHANCEMENT_CACHE_BYTES = 32 * 1024 * 1024;
 const MAX_RANGE_BYTES = 64 * 1024 * 1024;
 const MAX_RANGE_REQUESTS = 24;
 const PROBE_TIMEOUT_MS = 8_000;
@@ -32,11 +32,22 @@ interface BrowserDecoderGlobals {
   AudioDecoder?: BrowserDecoderConstructor<AudioDecoderConfig>;
 }
 
-interface RangeTelemetry {
+export interface DirectEnhancementRangeTelemetry {
   requestCount: number;
   rangeRequestCount: number;
   receivedRangeBytes: number;
   contentRanges: string[];
+}
+
+export interface DirectEnhancementMediaInputOptions {
+  fetchFn?: typeof fetch;
+  maximumRangeRequests?: number;
+  maximumReceivedBytes?: number;
+}
+
+export interface DirectEnhancementMediaInputHandle {
+  input: Input<UrlSource>;
+  telemetry: DirectEnhancementRangeTelemetry;
 }
 
 export interface DirectEnhancementDemuxDiagnostics extends DirectEnhancementMediaSupport {
@@ -68,24 +79,10 @@ export async function probeDirectEnhancementMediaSource(
   streamUrl: string,
   options: DirectEnhancementDemuxProbeOptions = {}
 ): Promise<DirectEnhancementDemuxDiagnostics> {
-  const telemetry: RangeTelemetry = {
-    requestCount: 0,
-    rangeRequestCount: 0,
-    receivedRangeBytes: 0,
-    contentRanges: []
-  };
-  const fetchFn = createBoundedRangeFetch(options.fetchFn ?? fetch, telemetry);
-  const input = new Input({
-    source: new UrlSource(streamUrl, {
-      fetchFn,
-      maxCacheSize: MAX_CACHE_BYTES,
-      parallelism: 2,
-      requestInit: {
-        cache: "no-store",
-        credentials: "same-origin"
-      }
-    }),
-    formats: [MP4, WEBM]
+  const { input, telemetry } = createDirectEnhancementMediaInput(streamUrl, {
+    fetchFn: options.fetchFn,
+    maximumRangeRequests: MAX_RANGE_REQUESTS,
+    maximumReceivedBytes: MAX_RANGE_BYTES
   });
   const abort = (): void => input.dispose();
   options.signal?.addEventListener("abort", abort, { once: true });
@@ -114,11 +111,44 @@ export async function probeDirectEnhancementMediaSource(
   }
 }
 
+/** 创建共享的严格 Range 媒体输入；探测和连续播放分别提供自己的预算。 */
+export function createDirectEnhancementMediaInput(
+  streamUrl: string,
+  options: DirectEnhancementMediaInputOptions = {}
+): DirectEnhancementMediaInputHandle {
+  const telemetry: DirectEnhancementRangeTelemetry = {
+    requestCount: 0,
+    rangeRequestCount: 0,
+    receivedRangeBytes: 0,
+    contentRanges: []
+  };
+  const fetchFn = createDirectEnhancementRangeFetch(
+    options.fetchFn ?? fetch,
+    telemetry,
+    options
+  );
+  return {
+    input: new Input({
+      source: new UrlSource(streamUrl, {
+        fetchFn,
+        maxCacheSize: DIRECT_ENHANCEMENT_CACHE_BYTES,
+        parallelism: 2,
+        requestInit: {
+          cache: "no-store",
+          credentials: "same-origin"
+        }
+      }),
+      formats: [MP4, WEBM]
+    }),
+    telemetry
+  };
+}
+
 async function probeInput(
   input: Input<UrlSource>,
   startPositionSeconds: number,
   globals: BrowserDecoderGlobals,
-  telemetry: RangeTelemetry,
+  telemetry: DirectEnhancementRangeTelemetry,
   renderCanvas?: HTMLCanvasElement | OffscreenCanvas
 ): Promise<DirectEnhancementDemuxDiagnostics> {
   const format = await input.getFormat();
@@ -236,7 +266,11 @@ async function decoderSupports<Config>(
   }
 }
 
-function createBoundedRangeFetch(baseFetch: typeof fetch, telemetry: RangeTelemetry): typeof fetch {
+function createDirectEnhancementRangeFetch(
+  baseFetch: typeof fetch,
+  telemetry: DirectEnhancementRangeTelemetry,
+  limits: DirectEnhancementMediaInputOptions
+): typeof fetch {
   return async (input, init) => {
     telemetry.requestCount += 1;
     const requestHeaders = new Headers(input instanceof Request ? input.headers : undefined);
@@ -244,8 +278,11 @@ function createBoundedRangeFetch(baseFetch: typeof fetch, telemetry: RangeTeleme
     const range = requestHeaders.get("range");
     if (range) {
       telemetry.rangeRequestCount += 1;
-      if (telemetry.rangeRequestCount > MAX_RANGE_REQUESTS) {
-        throw new Error(`F5-B Range 请求超过 ${MAX_RANGE_REQUESTS} 次上限`);
+      if (
+        limits.maximumRangeRequests !== undefined
+        && telemetry.rangeRequestCount > limits.maximumRangeRequests
+      ) {
+        throw new Error(`F5-B Range 请求超过 ${limits.maximumRangeRequests} 次上限`);
       }
     }
 
@@ -262,11 +299,15 @@ function createBoundedRangeFetch(baseFetch: typeof fetch, telemetry: RangeTeleme
       throw new Error("F5-B Range 响应缺少 Content-Range");
     }
     telemetry.contentRanges.push(contentRange);
-    return monitorResponseBody(response, telemetry);
+    return monitorResponseBody(response, telemetry, limits.maximumReceivedBytes);
   };
 }
 
-function monitorResponseBody(response: Response, telemetry: RangeTelemetry): Response {
+function monitorResponseBody(
+  response: Response,
+  telemetry: DirectEnhancementRangeTelemetry,
+  maximumReceivedBytes?: number
+): Response {
   if (!response.body) return response;
   const reader = response.body.getReader();
   const body = new ReadableStream<Uint8Array>({
@@ -277,9 +318,9 @@ function monitorResponseBody(response: Response, telemetry: RangeTelemetry): Res
         return;
       }
       telemetry.receivedRangeBytes += result.value.byteLength;
-      if (telemetry.receivedRangeBytes > MAX_RANGE_BYTES) {
+      if (maximumReceivedBytes !== undefined && telemetry.receivedRangeBytes > maximumReceivedBytes) {
         await reader.cancel();
-        controller.error(new Error(`F5-B Range 实际读取超过 ${MAX_RANGE_BYTES} 字节上限`));
+        controller.error(new Error(`F5-B Range 实际读取超过 ${maximumReceivedBytes} 字节上限`));
         return;
       }
       controller.enqueue(result.value);
@@ -302,7 +343,7 @@ function monitorResponseBody(response: Response, telemetry: RangeTelemetry): Res
 
 function unsupportedDiagnostics(
   reason: string,
-  telemetry: RangeTelemetry
+  telemetry: DirectEnhancementRangeTelemetry
 ): DirectEnhancementDemuxDiagnostics {
   return {
     supported: false,
@@ -313,7 +354,7 @@ function unsupportedDiagnostics(
   };
 }
 
-function telemetryResult(telemetry: RangeTelemetry): Pick<
+function telemetryResult(telemetry: DirectEnhancementRangeTelemetry): Pick<
   DirectEnhancementDemuxDiagnostics,
   "requestCount" | "rangeRequestCount" | "receivedRangeBytes" | "contentRanges"
 > {

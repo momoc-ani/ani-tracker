@@ -1,6 +1,7 @@
 import { strict as assert } from "node:assert";
 import { test } from "node:test";
 import {
+  DirectEnhancementFrameQueue,
   DirectEnhancementMediaClock,
   evaluateDirectEnhancementMediaCandidate,
   normalizeDirectEnhancementVideoCodec
@@ -11,6 +12,36 @@ test("F5-B 识别 MP4/WebM 首批 codec string", () => {
   assert.equal(normalizeDirectEnhancementVideoCodec("vp09.00.10.08"), "vp9");
   assert.equal(normalizeDirectEnhancementVideoCodec("av01.0.08M.08"), "av1");
   assert.equal(normalizeDirectEnhancementVideoCodec("hvc1.2.4.L153"), undefined);
+});
+
+test("F5-D 帧队列按媒体时间选择最新帧并返回应丢弃帧", () => {
+  const queue = new DirectEnhancementFrameQueue<{ id: string; timestampSeconds: number }>(4);
+  queue.push({ id: "late", timestampSeconds: 1.08 });
+  queue.push({ id: "first", timestampSeconds: 1 });
+  queue.push({ id: "current", timestampSeconds: 1.02 });
+
+  assert.deepEqual(queue.take(1), {
+    frame: { id: "current", timestampSeconds: 1.02 },
+    discarded: [{ id: "first", timestampSeconds: 1 }]
+  });
+  assert.deepEqual(queue.take(1.06), {
+    frame: { id: "late", timestampSeconds: 1.08 },
+    discarded: []
+  });
+});
+
+test("F5-D 帧队列溢出时优先丢弃最旧帧", () => {
+  const queue = new DirectEnhancementFrameQueue<{ id: number; timestampSeconds: number }>(2);
+  queue.push({ id: 1, timestampSeconds: 1 });
+  queue.push({ id: 2, timestampSeconds: 2 });
+  assert.deepEqual(queue.push({ id: 3, timestampSeconds: 3 }), [
+    { id: 1, timestampSeconds: 1 }
+  ]);
+  assert.equal(queue.size, 2);
+  assert.deepEqual(queue.clear(), [
+    { id: 2, timestampSeconds: 2 },
+    { id: 3, timestampSeconds: 3 }
+  ]);
 });
 
 test("F5-B 拒绝 MKV、H.265 和 WebM/H.264", () => {

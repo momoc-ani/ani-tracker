@@ -54,7 +54,7 @@ fn fragment(input: VertexOutput) -> @location(0) vec4<f32> {
 const DIRECT_ENHANCEMENT_WGSL_SHA256 = "2d01d34bcf4bd5958b0e25d4146b451ff7546ed3dc0f0899fa1bed8d7a48a957";
 
 export interface DirectEnhancementWebGpuRenderer {
-  render(frame: VideoFrame): void;
+  render(frame: VideoFrame, strength?: number): void;
   dispose(): void;
 }
 
@@ -107,13 +107,13 @@ export async function createDirectEnhancementWebGpuRenderer(
   const layout = pipeline.getBindGroupLayout(0);
 
   return {
-    render(frame) {
+    render(frame, strength = 0.35) {
       const width = Math.max(1, frame.displayWidth || frame.codedWidth);
       const height = Math.max(1, frame.displayHeight || frame.codedHeight);
       device.queue.writeBuffer(params, 0, new Float32Array([
         1 / width,
         1 / height,
-        0.35,
+        Math.min(0.75, Math.max(0, strength)),
         0
       ]));
       const externalTexture = device.importExternalTexture({ source: frame });

@@ -1,6 +1,6 @@
 # PC 内置播放器与画质增强执行计划
 
-> 当前实现边界（2026-08-14）：桌面 Windows/Linux/macOS 已统一使用 libmpv，接入 gpu-next/Render API、平台硬解路径、Anime4K Shader、字幕后合成、掉帧自动降级和双窗口同步；PC 播放路径不再保留 libVLC。远程 HLS 已按 NVENC/AMF/QSV/libx264 探测普通转码编码器；模型链已接入 RIFE 插帧和 Real-ESRGAN 2x 动画超分，采用 `FFmpeg RGB24 解码 -> 可选 RIFE -> 可选 Real-ESRGAN -> FFmpeg 编码`，并通过受认证会话诊断报告实际模型与降级原因。RIFE 已增加按源帧率、模型滚动 P95、显存、60 FPS 输出上限、80% 利用率和 5 ms 链路余量计算的容量门禁，当前协议因 timestep 固定为 `0.5` 而硬限制为 2x；运行时超预算会关闭模型并维持既定时间轴。macOS Intel + AMD RX 6750 XT + MoltenVK 已完成真实 sidecar 握手：Real-ESRGAN 最新 warmup `24.46 ms`；RIFE 最新 warmup `25.99 ms`。这些低分辨率 warmup 只可作为启动样本，真实分辨率滚动 P95 和完整播放矩阵未通过前不能标记为实时插帧验收通过。F5-A 已探测视频/音频 WebCodecs、WebGPU、codec 与内置 WGSL 摘要；F5-B 已加入受控 MP4/WebM Range demux 诊断、实际解码配置检查、关键帧和首个音频样本定位、独立绝对媒体时钟；F5-C 已加入外部 VideoFrame 的 WebGPU shader 工厂，并在受控条件下执行 1x1 OffscreenCanvas 首帧 smoke test，但仍不接管播放器。本地 libmpv 模型链、HDR 原生输出、跨 GPU 真机证据、音频样本调度和远端直传 shader 控制层仍未完成。
+> 当前实现边界（2026-08-14）：桌面 Windows/Linux/macOS 已统一使用 libmpv，接入 gpu-next/Render API、平台硬解路径、Anime4K Shader、字幕后合成、掉帧自动降级和双窗口同步；PC 播放路径不再保留 libVLC。远程 HLS 已按 NVENC/AMF/QSV/libx264 探测普通转码编码器；模型链已接入 RIFE 插帧和 Real-ESRGAN 2x 动画超分，采用 `FFmpeg RGB24 解码 -> 可选 RIFE -> 可选 Real-ESRGAN -> FFmpeg 编码`，并通过受认证会话诊断报告实际模型与降级原因。RIFE 已增加按源帧率、模型滚动 P95、显存、60 FPS 输出上限、80% 利用率和 5 ms 链路余量计算的容量门禁，当前协议因 timestep 固定为 `0.5` 而硬限制为 2x；运行时超预算会关闭模型并维持既定时间轴。macOS Intel + AMD RX 6750 XT + MoltenVK 已完成真实 sidecar 握手：Real-ESRGAN 最新 warmup `24.46 ms`；RIFE 最新 warmup `25.99 ms`。这些低分辨率 warmup 只可作为启动样本，真实分辨率滚动 P95 和完整播放矩阵未通过前不能标记为实时插帧验收通过。F5-A/F5-B/F5-C 已完成能力、受控 MP4/WebM Range demux、实际解码配置、关键帧/首个音频样本、内置 WGSL、1x1 首帧 smoke test；F5-D 已接入有界 VideoFrame 队列、连续 WebCodecs 解码、可见 WebGPU 画布、预设切换、关键帧拖动和原画回退。当前由 ArtPlayer `<video>` 继续承担音频、播放控制和主时钟，字幕 DOM 位于 shader 画布之后；这会产生额外 Range 请求和一次重复视频解码。本地 libmpv 模型链、HDR 原生输出、跨 GPU 真机证据、独立音频样本调度、漂移/帧预算门禁和远端直传增强浏览器矩阵仍未完成，`supportsDirectEnhancement` 继续保持 `false`。
 
 正式模型包、HDR、远程输出和真实 GPU 的逐项执行与证据要求见 [播放器终版发布验收清单](./player-video-enhancement-acceptance.md)。
 
@@ -30,7 +30,7 @@ PC 播放路径只运行 libmpv：Windows 使用原生 HWND `wid`、D3D11 和 D3
 
 - `direct` 只传输原文件，远端服务不解码视频像素，因此不能执行 Anime4K、FFmpeg 画质滤镜、Real-ESRGAN 或 RIFE；增强字段必须保持关闭。
 - `transcode` 在主机侧解码并重新编码为 HLS，才可以执行 FFmpeg 滤镜或模型帧管线。后端会再次校验模式，伪造直传增强请求会被拒绝。
-- F5 将新增浏览器端“直传 + 终端增强”路径：WebCodecs 负责视频解码，WebGPU/WGSL 负责 Anime4K 类 shader，字幕在增强后的画布上叠加；能力不满足时回退原始直传或实时转码。
+- F5 已加入浏览器端“直传 + 终端增强”源码路径：WebCodecs 负责额外的视频解码，WebGPU/WGSL 负责 Anime4K 类 shader，现有 `<video>` 保留音频和主时钟，字幕在增强后的画布上叠加；初始化或运行失败时先恢复原始直传，原视频本身失败时再沿用实时转码回退。
 - F5 首批不在浏览器端运行 RIFE/Real-ESRGAN；浏览器模型推理需在 F5 的音视频时钟、显存预算和 30 分钟稳定性通过后另立模型阶段。
 
 目标远程链路：
@@ -166,7 +166,7 @@ cost(m) = (m - 1) * rife_p95_ms
 - 解码、模型 rawvideo 编码的独立 P95，显示刷新率/终端 FPS 上限探测，以及按分辨率和 GPU 缓存的容量基线；当前远程门禁使用 80% 利用率和 5 ms 固定余量保守覆盖未拆分成本。
 - RIFE 任意 timestep 协议、场景切换检测和 3x 质量矩阵；完成前实时 AI 硬上限保持 2x，4x 及以上只评估离线转码。
 - 模型 rawvideo 链的跨厂商真机证据、逐候选编码器重试、终端字幕能力探测、自适应码率和断线恢复。
-- WebGPU/WebCodecs 直传增强：F5-A 能力探测已完成；F5-B 已完成 MP4/WebM demux 选型、受控 Range 元数据/关键帧/首个音频样本探测和绝对时钟语义；F5-C 已完成内置 WGSL 摘要校验、外部 VideoFrame shader 工厂、资源释放接口和 1x1 首帧 smoke test。音频样本调度、时钟接管、连续拖动/断线恢复、shader 画布接管、浏览器能力矩阵和 GPU 真机证据仍待实现。
+- WebGPU/WebCodecs 直传增强：F5-A 至 F5-C 已完成能力、受控 MP4/WebM Range/关键帧/音频样本探测、绝对时钟、内置 WGSL 和 1x1 首帧 smoke test；F5-D 已接入连续 VideoDecoder、有界帧队列、可见 WebGPU 画布、预设切换、拖动重启、DOM 字幕后合成和失败恢复原画。当前仍复用 ArtPlayer `<video>` 的音频与媒体时钟，因而存在重复网络/视频解码；独立音频样本调度、漂移/帧预算自动降级、断线恢复、浏览器能力矩阵和 GPU 真机证据仍待实现。
 - 浏览器端 RIFE/Real-ESRGAN 模型推理和端侧显存/帧预算调度。
 - HDR 源元数据、渲染器、显示器能力探测和原生输出。
 - Windows NVIDIA/AMD/Intel、macOS、Linux 真机矩阵与两个正式版本稳定期。
@@ -181,7 +181,7 @@ cost(m) = (m - 1) * rife_p95_ms
 | 终版 F2 | 已完成 RIFE 与 Real-ESRGAN 端口、长驻 sidecar、内存帧协议、2x 固定尺寸回退、双倍帧率时间轴保护和运行时 P95 降级；固定提交和子模块校验已接入 | macOS 两个模型的低分辨率 warmup 已通过；真实分辨率完整链路尚未达到发布验收，本地播放器模型链、HDR 原生输出待完成 |
 | 终版 F3 | 已完成普通 HLS 编码器回退、远程 RIFE + Real-ESRGAN rawvideo 管线、独立音轨/软字幕和受认证诊断刷新 | 模型链硬件编码、终端字幕探测、断线恢复和跨厂商证据待完成 |
 | 终版 F4 | PC libVLC 已从播放器、安装包和工作流移除 | 仍需两个正式版本完成跨平台真机矩阵，确认 libmpv 发布稳定性 |
-| 终版 F5 | F5-A 已完成；F5-B 已加入 `mediabunny` MP4/WebM Range demux 诊断、源 codec/AudioDecoder/VideoDecoder 校验、关键帧/首个音频样本定位和绝对时钟基础；F5-C 已加入应用内置 WGSL 摘要校验、外部 VideoFrame WebGPU 工厂和受控 1x1 首帧 smoke test；不修改原文件且不接管播放器 | F5-B 音频样本调度与时钟接管、F5-C 可见画布接管与真机 shader 证据未完成；F5-D/F5-E 控制层、降级和浏览器矩阵待完成 |
+| 终版 F5 | F5-A 至 F5-C 已完成；F5-D 已加入连续 WebCodecs 视频解码、有界帧队列、首帧门禁、可见 WebGPU 画布、预设热切换、关键帧拖动、DOM 字幕后合成、资源释放和原画回退；不修改原文件或启动服务端转码 | F5-D 仅达到源码与静态门禁状态；独立音频解码/时钟、帧预算与漂移门禁、断线恢复、客户端到服务端诊断契约及 30 分钟浏览器/GPU 真机矩阵仍待完成，`supportsDirectEnhancement` 保持 `false` |
 
 ### F1：能力调度层
 
@@ -217,9 +217,9 @@ PC libVLC 已不再属于播放器、安装包或桌面工作流。剩余发布�
 ### F5：WebCodecs/WebGPU 直传终端增强
 
 1. **F5-A 能力与安全边界**：探测 `VideoDecoder`、`VideoFrame`、`AudioDecoder`、`AudioData`、`GPUAdapter`、`MediaCapabilities` 和 `OffscreenCanvas`；shader 使用应用内置且带摘要的 WGSL，禁止远端下发任意代码。能力不足时保持原始 `<video>` 直传，不自动伪装成增强。
-2. **F5-B 容器与媒体时钟**：已选用 `mediabunny 1.53.1` 作为纯 TypeScript、动态加载的受控 demuxer，首批只接受 MP4/WebM + H.264/VP9/AV1，并限制为 32 MiB 缓存、2 个并发、24 次 Range、64 MiB 累计响应和 8 秒探测窗口。当前已通过 HTTP Range 验证源 codec、实际 Audio/Video decoder config、媒体时长和目标位置之前的关键帧，建立可测试的绝对时间轴；音频样本队列、AudioContext 主时钟、连续拖动和断线恢复仍待接入。MKV、H.265 及浏览器不支持的组合继续使用现有直传或 HLS。
-3. **F5-C WebGPU shader 链**：已加入应用内置、SHA-256 校验的 Anime4K 类 WGSL 锐化 shader，以及 `VideoFrame -> texture_external -> Canvas` 工厂；待接入 `EncodedVideoChunk -> VideoDecoder` 帧循环和字幕/OSD 独立图层，避免把字幕写入 shader 输入。
-4. **F5-D 控制层接入**：扩展现有 `UnifiedPlayerAdapter`，保留播放/暂停、音量、倍速、拖动、全屏、进度上报和默认字幕；字幕在增强画布之后通过 DOM/独立字幕层合成。
-5. **F5-E 降级与验收**：WebGPU 初始化失败、解码器不支持、帧预算超限、音画漂移或 GPU 资源回收失败时，按“终端原画直传 -> 服务端 HLS 转码”顺序降级，并在快照中报告实际路径和原因。
+2. **F5-B 容器与媒体时钟**：已选用 `mediabunny 1.53.1` 作为纯 TypeScript、动态加载的受控 demuxer，首批只接受 MP4/WebM + H.264/VP9/AV1，并限制为 32 MiB 缓存、2 个并发、24 次 Range、64 MiB 累计响应和 8 秒探测窗口。当前已通过 HTTP Range 验证源 codec、实际 Audio/Video decoder config、媒体时长和目标位置之前的关键帧，建立可测试的绝对时间轴；F5-D 暂时使用现有 `<video>` 的 `currentTime` 作为主时钟。独立音频样本队列、AudioContext 主时钟和断线恢复仍待接入。MKV、H.265 及浏览器不支持的组合继续使用现有直传或 HLS。
+3. **F5-C WebGPU shader 链**：已加入应用内置、SHA-256 校验的 Anime4K 类 WGSL 锐化 shader、`VideoFrame -> texture_external -> Canvas` 工厂和可调预设强度；F5-D 已将其接入连续 VideoDecoder 帧循环。字幕/OSD 保持独立 DOM 图层，不进入 shader 输入。
+4. **F5-D 控制层接入**：已实现最多 8 帧的媒体时间队列、2 秒解码前探、8 秒增强首帧门禁、暂停/恢复、倍速主时钟、关键帧拖动重启、可见画布接管和 `balanced`/`clear` 热切换。现有 ArtPlayer 继续负责音量、播放控制、全屏、进度、默认字幕和字幕缩放；只有增强首帧成功后才隐藏原视频，初始化或运行失败立即恢复原画。当前完成状态为 `implemented`，尚无 30 分钟真机证据。
+5. **F5-E 降级与验收**：已实现 WebGPU 初始化、解码器、Range 上限、首帧和运行错误回退原画，并通过页面诊断属性记录状态、出帧数和原因；原视频本身失败时继续沿用 HLS 自动转码。帧耗时/P95、音画漂移、GPU 内存、断线恢复、服务端 `direct-enhanced` 诊断和浏览器/GPU 真机矩阵仍待完成。
 
 F5 完成后再评估浏览器端 RIFE/Real-ESRGAN。模型端侧推理不能复用远程 HLS 的 rawvideo 管道，必须另行验证模型包、WebGPU compute、显存上限、断帧策略和浏览器兼容性。
