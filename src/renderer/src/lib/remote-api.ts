@@ -199,6 +199,7 @@ export async function closeRemotePlaybackSession(sessionId: string): Promise<voi
   if (!accessToken) return;
   const response = await fetch(`${baseUrl}/api/media/sessions/${encodeURIComponent(sessionId)}`, {
     method: "DELETE",
+    keepalive: true,
     credentials: "same-origin",
     headers: { Authorization: `Bearer ${accessToken}` }
   });

@@ -360,6 +360,15 @@ export function RemoteVideoPlayer({
     });
   }, [environment, session?.id, sessionClient]);
 
+  useEffect(() => {
+    if (environment !== "remote" || !session) return;
+    const closeSessionOnPageHide = (): void => {
+      void sessionClient.close(session.id);
+    };
+    window.addEventListener("pagehide", closeSessionOnPageHide);
+    return () => window.removeEventListener("pagehide", closeSessionOnPageHide);
+  }, [environment, session?.id, sessionClient]);
+
   /** 原文件发生媒体错误时仅自动升级一次实时转码。 */
   const startAutomaticTranscode = useCallback((): void => {
     if (!activeItem || requestedMode !== "direct" || automaticFallbackStartedRef.current) return;
