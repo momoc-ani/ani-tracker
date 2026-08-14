@@ -21,7 +21,7 @@ import {
 const DECODE_AHEAD_SECONDS = 2;
 const FIRST_FRAME_TIMEOUT_MS = 8_000;
 const GPU_QUEUE_SAMPLE_INTERVAL_FRAMES = 30;
-const MAX_BUFFERED_VIDEO_FRAMES = 8;
+const MAX_BUFFERED_VIDEO_FRAMES = 48;
 const MAX_PLAYBACK_RANGE_REQUESTS = 4_096;
 
 interface QueuedVideoFrame {
@@ -199,7 +199,9 @@ class DirectEnhancementPlayback implements DirectEnhancementPlaybackController {
     this.throwIfStopped();
     this.options.canvas.width = Math.max(1, Math.round(width));
     this.options.canvas.height = Math.max(1, Math.round(height));
-    const renderer = await createDirectEnhancementWebGpuRenderer(this.options.canvas);
+    const renderer = await createDirectEnhancementWebGpuRenderer(this.options.canvas, {
+      maximumBufferedVideoFrames: MAX_BUFFERED_VIDEO_FRAMES
+    });
     if (this.disposed) {
       renderer.dispose();
       this.throwIfStopped();
@@ -626,7 +628,13 @@ class DirectEnhancementPlayback implements DirectEnhancementPlaybackController {
       && positionSeconds - this.lastPresentedMediaTimeSeconds > 0.5
       && now - this.lastPresentedAtMs > 2_000
     ) {
-      this.fail(new Error("媒体时钟持续前进但增强画面超过 2 秒没有更新"));
+      this.fail(new Error(
+        "媒体时钟持续前进但增强画面超过 2 秒没有更新"
+        + `：decoded=${this.frameQueue.size}`
+        + ` pending=${this.pendingVideoFrames}`
+        + ` decoder=${this.decoder?.decodeQueueSize ?? 0}`
+        + ` next=${this.nextPacket?.timestamp ?? "none"}`
+      ));
     }
   }
 

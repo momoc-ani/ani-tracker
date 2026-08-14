@@ -67,6 +67,10 @@ export interface DirectEnhancementWebGpuRenderer {
   dispose(): void;
 }
 
+export interface DirectEnhancementWebGpuRendererOptions {
+  maximumBufferedVideoFrames?: number;
+}
+
 /** 校验应用内置 shader，避免远端内容变成可执行 GPU 代码。 */
 export async function verifyDirectEnhancementShader(): Promise<boolean> {
   const subtle = globalThis.crypto?.subtle;
@@ -81,7 +85,8 @@ export async function verifyDirectEnhancementShader(): Promise<boolean> {
 
 /** 创建 F5-C 的外部 VideoFrame shader 表面；调用方负责管理 frame 生命周期。 */
 export async function createDirectEnhancementWebGpuRenderer(
-  canvas: HTMLCanvasElement | OffscreenCanvas
+  canvas: HTMLCanvasElement | OffscreenCanvas,
+  options: DirectEnhancementWebGpuRendererOptions = {}
 ): Promise<DirectEnhancementWebGpuRenderer> {
   if (!await verifyDirectEnhancementShader()) {
     throw new Error("F5-C 内置 WGSL shader 摘要校验失败");
@@ -91,13 +96,18 @@ export async function createDirectEnhancementWebGpuRenderer(
   const adapter = await gpu.requestAdapter();
   if (!adapter) throw new Error("WebGPU adapter 不可用");
   const device = await adapter.requestDevice();
+  const maximumBufferedVideoFrames = Number.isSafeInteger(options.maximumBufferedVideoFrames)
+    && Number(options.maximumBufferedVideoFrames) > 0
+    ? Math.min(240, Math.max(2, Number(options.maximumBufferedVideoFrames)))
+    : 16;
+  const decodedFrameBudget = Math.ceil(maximumBufferedVideoFrames / 2);
   const resourceBudget = evaluateDirectEnhancementGpuResources({
     width: canvas.width,
     height: canvas.height,
     maxTextureDimension2D: device.limits.maxTextureDimension2D,
     deviceMemoryGiB: (navigator as Navigator & { deviceMemory?: number }).deviceMemory,
-    queuedVideoFrames: 8,
-    decoderQueueSize: 8
+    queuedVideoFrames: decodedFrameBudget,
+    decoderQueueSize: maximumBufferedVideoFrames - decodedFrameBudget
   });
   if (!resourceBudget.supported) {
     device.destroy();

@@ -151,6 +151,29 @@ test("F5-G GPU 资源门禁接受 4 GiB 设备的 4K 有界队列", () => {
   assert.ok(budget.estimatedWorkingSetBytes < budget.resourceBudgetBytes);
 });
 
+test("F5-G 长时播放缓冲按真实总帧数计入资源预算", () => {
+  const fullHd = evaluateDirectEnhancementGpuResources({
+    width: 1_920,
+    height: 1_080,
+    maxTextureDimension2D: 8_192,
+    deviceMemoryGiB: 4,
+    queuedVideoFrames: 24,
+    decoderQueueSize: 24
+  });
+  const ultraHd = evaluateDirectEnhancementGpuResources({
+    width: 3_840,
+    height: 2_160,
+    maxTextureDimension2D: 8_192,
+    deviceMemoryGiB: 4,
+    queuedVideoFrames: 24,
+    decoderQueueSize: 24
+  });
+
+  assert.equal(fullHd.supported, true);
+  assert.equal(ultraHd.supported, false);
+  assert.match(ultraHd.reason ?? "", /工作集/);
+});
+
 test("F5-G GPU 资源门禁拒绝纹理上限和估算工作集超限", () => {
   const textureLimit = evaluateDirectEnhancementGpuResources({
     width: 8_192,
