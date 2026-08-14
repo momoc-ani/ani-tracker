@@ -1,7 +1,6 @@
 import type { DesktopPlayerWindowInput } from "./contracts";
 
 export const DESKTOP_PLAYER_VIEW = "desktop-player";
-export const DESKTOP_VLC_HOST_VIEW = "desktop-vlc-host";
 
 /** 校验并规范化桌面播放器窗口参数。 */
 export function normalizeDesktopPlayerWindowInput(input: DesktopPlayerWindowInput): DesktopPlayerWindowInput {
@@ -30,16 +29,6 @@ export function createDesktopPlayerSearchParams(input: DesktopPlayerWindowInput)
     params.set("fileIndex", String(normalized.fileIndex));
   }
   return params;
-}
-
-/** 构建不携带业务数据的 libVLC 视频宿主页参数。 */
-export function createDesktopVlcHostSearchParams(): URLSearchParams {
-  return new URLSearchParams({ aniView: DESKTOP_VLC_HOST_VIEW });
-}
-
-/** 判断当前 renderer 是否只承载 libVLC 原生视频表面。 */
-export function isDesktopVlcHostView(search: string): boolean {
-  return new URLSearchParams(search).get("aniView") === DESKTOP_VLC_HOST_VIEW;
 }
 
 /** 从当前地址解析独立播放器目标，无效地址不进入播放器页面。 */

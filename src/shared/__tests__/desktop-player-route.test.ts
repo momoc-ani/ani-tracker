@@ -2,8 +2,6 @@ import { strict as assert } from "node:assert";
 import { test } from "node:test";
 import {
   createDesktopPlayerSearchParams,
-  createDesktopVlcHostSearchParams,
-  isDesktopVlcHostView,
   resolveDesktopPlayerWindowInput
 } from "../desktop-player-route";
 
@@ -14,13 +12,6 @@ test("桌面播放器路由参数可往返解析", () => {
     taskId: "task:episode-02",
     fileIndex: 3
   });
-});
-
-test("libVLC 宿主页路由不携带媒体业务参数", () => {
-  const params = createDesktopVlcHostSearchParams();
-  assert.equal(params.toString(), "aniView=desktop-vlc-host");
-  assert.equal(isDesktopVlcHostView(`?${params.toString()}`), true);
-  assert.equal(isDesktopVlcHostView("?aniView=desktop-player"), false);
 });
 
 test("桌面播放器路由拒绝错误视图和异常文件索引", () => {

@@ -122,11 +122,11 @@ export function DesktopPlayerPage({ taskId, initialFileIndex, onClose }: Desktop
     return () => { active = false; };
   }, [initialFileIndex, taskId]);
 
-  /** 切集时保留当前独立窗口，仅由新会话触发 libVLC 换源。 */
+  /** 切集时保留当前独立窗口，仅由新会话触发 libmpv 换源。 */
   const selectItem = useCallback((item: RemotePlaylistItem): void => {
     setActiveItemId(item.id);
     document.title = `${item.displayTitle} - Ani Tracker`;
-    console.info("[player] 桌面 libVLC 切换文件", {
+    console.info("[player] 桌面 libmpv 切换文件", {
       taskId: item.task.id,
       fileIndex: item.fileIndex
     });
@@ -526,7 +526,7 @@ function DesktopMpvControls({
     else setRetryNonce((value) => value + 1);
   };
   const statusBadges = [
-    snapshot?.backend === "mpv" ? "libmpv" : "libVLC",
+    snapshot?.backend === "mpv" ? "libmpv" : snapshot?.backend,
     snapshot?.enhancementDiagnostics.pipeline !== "none"
       ? snapshot?.enhancementDiagnostics.pipeline
       : undefined,

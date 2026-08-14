@@ -15,6 +15,7 @@ test("播放器实机矩阵覆盖桌面架构和 GPU 厂商", () => {
   assert.deepEqual(matrix.find((entry) => entry.platform === "windows").gpuVendors, ["nvidia", "amd", "intel"]);
   assert.deepEqual(matrix.find((entry) => entry.platform === "linux").gpuVendors, ["amd", "intel", "nvidia"]);
   assert.equal(matrix.find((entry) => entry.platform === "macos" && entry.arch === "arm64").renderer, "opengl-cgl");
+  assert.equal(matrix.filter((entry) => entry.platform === "macos").every((entry) => entry.localShader === "implemented"), true);
   assert.equal(matrix.find((entry) => entry.platform === "windows").localModel, "pending");
   assert.equal(matrix.every((entry) => entry.remoteModel === "implemented"), true);
 });

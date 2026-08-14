@@ -12,14 +12,13 @@ export const PLAYER_ENHANCEMENT_MATRIX = [
     localModel: "pending",
     remoteModel: "implemented"
   },
-  // macOS currently remains on libVLC; the final native libmpv render path targets Metal.
   {
     platform: "macos",
     arch: "arm64",
     gpuVendors: ["apple"],
     renderer: "opengl-cgl",
     decoder: "videotoolbox",
-    localShader: "pending",
+    localShader: "implemented",
     localModel: "pending",
     remoteModel: "implemented"
   },
@@ -29,7 +28,7 @@ export const PLAYER_ENHANCEMENT_MATRIX = [
     gpuVendors: ["intel", "amd"],
     renderer: "opengl-cgl",
     decoder: "videotoolbox",
-    localShader: "pending",
+    localShader: "implemented",
     localModel: "pending",
     remoteModel: "implemented"
   },
@@ -114,7 +113,7 @@ function validateRemoteEncoders() {
 
 function validateReleaseGates() {
   if (FINAL_RELEASE_GATES.requiredStableVersions < 2) {
-    throw new Error("桌面 libVLC 移除至少需要两个稳定版本");
+    throw new Error("桌面 libmpv 至少需要两个稳定版本完成真机验收");
   }
   if (!FINAL_RELEASE_GATES.evidenceStates.includes("device-passed")
     || FINAL_RELEASE_GATES.requiredEvidenceFields.length < 10) {

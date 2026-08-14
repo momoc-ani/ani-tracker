@@ -184,20 +184,6 @@ html.desktop-player-overlay-root #root {
   background: transparent;
 }
 
-html.desktop-vlc-host-root,
-html.desktop-vlc-host-root body,
-html.desktop-vlc-host-root #root {
-  overflow: hidden;
-  background: #000;
-}
-
-.desktop-vlc-host-page {
-  width: 100vw;
-  height: 100vh;
-  overflow: hidden;
-  background: #000;
-}
-
 ::selection {
   background: hsl(var(--primary) / 0.24);
 }

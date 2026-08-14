@@ -794,14 +794,14 @@ class TauriClientCore implements AppClient {
     });
   }
 
-  /** 打开 Tauri 桌面 libVLC 双窗口。 */
+  /** 打开 Tauri 桌面 libmpv 视频窗口与透明控制层。 */
   async openDesktopPlayerWindow(input: DesktopPlayerWindowInput): Promise<void> {
     return invoke<void>("open_desktop_player_window", { input }).catch((error) => {
       throw normalizeTauriError("open_desktop_player_window", error);
     });
   }
 
-  /** 关闭 Tauri 桌面 libVLC 双窗口。 */
+  /** 关闭 Tauri 桌面 libmpv 视频窗口与透明控制层。 */
   closeDesktopPlayerWindow(): void {
     void invoke<void>("close_desktop_player_window").catch((error) => {
       console.error("[tauri-client] 关闭播放器窗口失败", normalizeTauriError("close_desktop_player_window", error));
