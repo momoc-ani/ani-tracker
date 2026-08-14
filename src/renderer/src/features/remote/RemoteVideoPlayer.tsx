@@ -157,12 +157,16 @@ export function RemoteVideoPlayer({
       return;
     }
     const controller = new AbortController();
+    const renderCanvas = typeof OffscreenCanvas === "undefined"
+      ? undefined
+      : new OffscreenCanvas(1, 1);
     void import("./direct-enhancement-demuxer")
       .then(({ probeDirectEnhancementMediaSource }) => probeDirectEnhancementMediaSource(
         new URL(session.streamUrl, window.location.href).toString(),
         {
           signal: controller.signal,
-          startPositionSeconds: session.startPositionSeconds
+          startPositionSeconds: session.startPositionSeconds,
+          renderCanvas
         }
       ))
       .then((diagnostics) => {

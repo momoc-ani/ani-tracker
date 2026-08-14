@@ -12,6 +12,7 @@ import {
   type DirectEnhancementContainer,
   type DirectEnhancementMediaSupport
 } from "@shared/direct-enhancement-media";
+import { createDirectEnhancementWebGpuRenderer } from "./direct-enhancement-webgpu";
 
 const MAX_CACHE_BYTES = 32 * 1024 * 1024;
 const MAX_RANGE_BYTES = 64 * 1024 * 1024;
@@ -44,6 +45,7 @@ export interface DirectEnhancementDemuxDiagnostics extends DirectEnhancementMedi
   keyFrameTimestampSeconds?: number;
   keyFrameDurationSeconds?: number;
   audioSampleTimestampSeconds?: number;
+  firstFrameRendered?: boolean;
   requestCount: number;
   rangeRequestCount: number;
   receivedRangeBytes: number;
@@ -55,6 +57,7 @@ export interface DirectEnhancementDemuxProbeOptions {
   startPositionSeconds?: number;
   fetchFn?: typeof fetch;
   globals?: BrowserDecoderGlobals;
+  renderCanvas?: HTMLCanvasElement | OffscreenCanvas;
 }
 
 /**
@@ -94,7 +97,8 @@ export async function probeDirectEnhancementMediaSource(
       input,
       Math.max(0, options.startPositionSeconds ?? 0),
       options.globals ?? globalThis as unknown as BrowserDecoderGlobals,
-      telemetry
+      telemetry,
+      options.renderCanvas
     );
     throwIfAborted(options.signal);
     return result;
@@ -114,7 +118,8 @@ async function probeInput(
   input: Input<UrlSource>,
   startPositionSeconds: number,
   globals: BrowserDecoderGlobals,
-  telemetry: RangeTelemetry
+  telemetry: RangeTelemetry,
+  renderCanvas?: HTMLCanvasElement | OffscreenCanvas
 ): Promise<DirectEnhancementDemuxDiagnostics> {
   const format = await input.getFormat();
   const container: DirectEnhancementContainer = format === MP4 ? "mp4" : "webm";
@@ -164,7 +169,9 @@ async function probeInput(
   }
 
   const [keyFrame, audioSample] = await Promise.all([
-    new EncodedPacketSink(videoTrack).getKeyPacket(startPositionSeconds, { metadataOnly: true }),
+    new EncodedPacketSink(videoTrack).getKeyPacket(startPositionSeconds, {
+      metadataOnly: !renderCanvas
+    }),
     audioTrack
       ? new EncodedPacketSink(audioTrack).getFirstPacket({ metadataOnly: true })
       : Promise.resolve(null)
@@ -178,8 +185,43 @@ async function probeInput(
       keyFrameDurationSeconds: keyFrame.duration
     } : {}),
     ...(audioSample ? { audioSampleTimestampSeconds: audioSample.timestamp } : {}),
+    ...(renderCanvas && keyFrame ? {
+      firstFrameRendered: await decodeAndRenderFirstFrame(keyFrame, videoConfig, renderCanvas)
+    } : {}),
     ...telemetryResult(telemetry)
   };
+}
+
+async function decodeAndRenderFirstFrame(
+  packet: import("mediabunny").EncodedPacket,
+  config: VideoDecoderConfig,
+  canvas: HTMLCanvasElement | OffscreenCanvas
+): Promise<boolean> {
+  if (packet.isMetadataOnly) return false;
+  const renderer = await createDirectEnhancementWebGpuRenderer(canvas);
+  let rendered = false;
+  const decoder = new VideoDecoder({
+    output(frame) {
+      try {
+        renderer.render(frame);
+        rendered = true;
+      } finally {
+        frame.close();
+      }
+    },
+    error(error) {
+      console.info("[remote] F5-C 首帧 WebCodecs 解码失败", { error });
+    }
+  });
+  try {
+    decoder.configure(config);
+    decoder.decode(packet.toEncodedVideoChunk());
+    await decoder.flush();
+    return rendered;
+  } finally {
+    decoder.close();
+    renderer.dispose();
+  }
 }
 
 async function decoderSupports<Config>(
