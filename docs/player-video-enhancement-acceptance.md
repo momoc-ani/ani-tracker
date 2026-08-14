@@ -119,6 +119,16 @@ Real-ESRGAN 模型归档固定为 `v0.2.5.0/realesrgan-ncnn-vulkan-20220424-wind
 - MKV 按 F5 首批容器边界返回 `Input has an unsupported or unrecognizable format.`，页面保持 `data-remote-playback-path="direct"` 并显示“浏览器增强不可用，已使用原画”；原画播放推进到 `01:42`，暂停控制有效，默认中文 ASS 轨道保持选中且字幕实际显示，字幕缩放保持 `150%`。
 - 本记录只证明浏览器原生 fetch 修复和不支持容器的安全回退，不标记为 `device-passed`。仍需 MP4/WebM 正向样本验证 `direct-enhanced`、WebGPU 指标、30 分钟音画同步、拖动、Range 断流恢复和资源释放；完成前 `supportsDirectEnhancement` 继续保持 `false`。
 
+### 2026-08-14 Intel Mac Chrome MP4 正向验收
+
+- 代码：`a93fbcb`（48 帧有界预解码窗口）与 `9937d60`（页面退出会话回收）。主机为 macOS `26.4.1 (25E253)`、Intel `x86_64`、AMD Radeon RX 6750 XT 12 GB（Metal 3），浏览器为 Google Chrome `151.0.7922.138`。
+- 样本为 `acceptance-direct-enhancement-long-hq.mp4`：35:00、1920x1080 H.264、约 7.5 Mbps、AAC、两条字幕轨、约 2.00 GiB。样本由本地媒体以 `-c copy` 生成，不重新编码。
+- 正式连续播放通过 `30:40`：`playbackPath=direct-enhanced`、实际档位 `clear`、1920x1080 canvas、`AudioContext` 主时钟、渲染帧 `43620`、滚动丢帧率约 `2.44%`、GPU 队列 P95 约 `1.3 ms`、音画漂移约 `12.1 ms`、Range 重试/恢复/网络失败均为 `0`。丢帧率是最近窗口指标，不得写成累计值；`207548416` bytes 是 WebGPU 工作集估算，资源预算为 1 GiB，不是 VRAM 遥测。
+- 高码率样本约 7 分钟处曾因旧的 8 帧缓冲无法覆盖 Range 读取抖动而触发无增强帧回退；48 帧上限对应约 2 秒预解码窗口，1080p/4 GiB 门禁通过，4K/4 GiB 被工作集门禁拒绝。修复后跨越原失败点并完成 30 分钟持续播放。
+- 应用级全屏进入、退出均通过，截图中的画布保持 1920x1080，控件和字幕层可用。该模式是播放器的网页全屏布局；浏览器 `document.fullscreenElement` 仍为 `null`，不能把它记为浏览器原生全屏证明。
+- 关闭验收页后重新进入同一任务，首帧再次为 `direct-enhanced / clear`，AudioContext 与双字幕轨仍存在；手动开始后 3 秒内渲染 60 帧。页面退出回收已验证：网关日志记录 `DELETE /api/media/sessions/<id> -> 204`，对应 `remote-media/session-<id>` 目录立即消失。
+- 此项是指定 macOS Intel x64 + RX 6750 XT + Chrome 的 `device-passed`，不代表 Windows、Safari、Firefox、Apple Silicon、Intel/NVIDIA Windows GPU、H.265、MKV、HDR、模型侧车或远端 HLS 已通过。此前页面重载不是会话 TTL；会话 TTL 为 30 分钟，播放期间每 2 秒刷新，原问题是 8 帧缓冲覆盖不了高码率 Range 抖动。
+
 ## 7. 证据状态规则
 
 - `implemented`：源码、单元/集成测试和静态门禁已通过，不代表真实硬件通过。
