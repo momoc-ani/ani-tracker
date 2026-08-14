@@ -83,7 +83,7 @@ Real-ESRGAN 模型归档固定为 `v0.2.5.0/realesrgan-ncnn-vulkan-20220424-wind
 - `direct` 模式只发送原文件，不经过 FFmpeg 编码；服务端不改变视频码流，画质上限等于原文件和终端解码能力。
 - `transcode` 模式必须重新编码为 HLS，当前普通和模型管线使用 H.264 视频候选、`yuv420p` 像素格式和 AAC 160 kbps 音频，因此属于有损输出，可能降低码率、色深和 HDR 元数据保留能力。模型超分只增加处理后的像素，不会恢复原始编码中已丢失的细节。
 - 原始下载文件始终保持不变；压缩只发生在远端会话的输出流。需要无损保真时选择直传，接受转码损失后再启用远端画质增强或插帧。
-- 若未来增加 WebGPU/WebCodecs 或 wasm shader，才可另行实现“直传 + 终端本地增强”；当前远端浏览器没有这条路径。
+- WebGPU/WebCodecs 直传增强按本清单第 6 节单独验收；在该阶段完成前，远端浏览器不宣称支持终端本地增强。
 - 分别在 NVIDIA、AMD、Intel 环境确认 NVENC、AMF、QSV 的实际编码器诊断。
 - 禁用全部硬件编码器后确认回退 `libx264`，且界面显示编码降级。
 - RIFE 或 Real-ESRGAN 只有在摘要、预算、真实 Vulkan 握手和 warmup 通过后才能出现在 `modelBackend`；运行中失败后 2 秒内通过受认证会话状态读取更新 `degradationReason`、实际增强和插帧状态。
@@ -96,7 +96,19 @@ Real-ESRGAN 模型归档固定为 `v0.2.5.0/realesrgan-ncnn-vulkan-20220424-wind
 
 结果记录：输入管线、实际编码器、是否软件回退、字幕模式、输出分辨率/帧率/码率、首段耗时、重连耗时和失败原因。
 
-## 6. 证据状态规则
+## 6. WebCodecs/WebGPU 直传增强验收
+
+- 能力探测必须同时确认 `VideoDecoder`、目标 codec 的 `isConfigSupported`、WebGPU adapter/device、WGSL shader 摘要和音视频时钟；任一项失败都不能展示“直传增强已启用”。
+- 直传增强必须从原文件的 HTTP Range 读取并在终端解码，不得启动服务端 FFmpeg/模型转码进程；网络面板和服务端会话诊断必须能区分 `direct` 与 `direct-enhanced`。
+- 首批只验收已选定 demuxer 支持的 MP4/WebM 组合；H.265、MKV、HDR 和浏览器不支持的 codec 必须明确回退原始直传或 HLS，不能输出黑帧或假增强状态。
+- WebGPU shader 只处理视频帧，字幕和 OSD 在 shader 输出后叠加；切换字幕、字幕缩放和 ASS/VTT 不得导致文字被锐化或重复绘制。
+- 连续播放 30 分钟，确认首帧、暂停/恢复、关键帧拖动、全屏、音画同步、GPU 资源释放和页面重新进入；帧预算超限时必须在 2 秒内回退原画直传。
+- Chrome/Edge、Safari macOS、Firefox（若能力未开放）分别记录 `device-passed` 或结构化回退原因；不能以桌面浏览器支持代替移动浏览器证据。
+- WGSL 必须来自应用内置资源并校验摘要，不能从远端 URL 加载可执行 shader 或模型代码。
+
+结果记录：浏览器版本、GPU/驱动、WebGPU adapter、codec、容器、Range 请求、实际渲染路径、首帧、P95 帧耗时、音画漂移、GPU 内存峰值、回退次数和字幕截图。
+
+## 7. 证据状态规则
 
 - `implemented`：源码、单元/集成测试和静态门禁已通过，不代表真实硬件通过。
 - `release-runner`：同一候选 SHA 的正式 Release Runner 已完成构建、打包、真实 sidecar 握手和 warmup。
@@ -105,7 +117,7 @@ Real-ESRGAN 模型归档固定为 `v0.2.5.0/realesrgan-ncnn-vulkan-20220424-wind
 
 `scripts/player-enhancement-matrix.mjs` 只校验必须登记的目标和证据字段，不把任何目标自动标记为通过。
 
-## 7. PC libmpv 稳定发布门槛
+## 8. PC libmpv 稳定发布门槛
 
 PC 播放器、安装包和桌面工作流已经移除 libVLC。连续两个正式版本仍需满足：
 
