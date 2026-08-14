@@ -93,7 +93,11 @@ export async function probeDirectEnhancementCapabilities(
     }
   }
 
-  input.shaderAvailable = await verifyDirectEnhancementShader();
+  try {
+    input.shaderAvailable = await verifyDirectEnhancementShader();
+  } catch (error) {
+    console.info("[remote] 内置 WebGPU shader 摘要探测失败", { error });
+  }
 
   if (videoDecoder?.isConfigSupported) {
     for (const candidate of DIRECT_ENHANCEMENT_CODEC_CANDIDATES) {

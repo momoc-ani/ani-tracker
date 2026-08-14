@@ -43,6 +43,7 @@ export interface DirectEnhancementDemuxDiagnostics extends DirectEnhancementMedi
   audioDecoderSupported: boolean;
   keyFrameTimestampSeconds?: number;
   keyFrameDurationSeconds?: number;
+  audioSampleTimestampSeconds?: number;
   requestCount: number;
   rangeRequestCount: number;
   receivedRangeBytes: number;
@@ -162,9 +163,12 @@ async function probeInput(
     };
   }
 
-  const keyFrame = await new EncodedPacketSink(videoTrack).getKeyPacket(startPositionSeconds, {
-    metadataOnly: true
-  });
+  const [keyFrame, audioSample] = await Promise.all([
+    new EncodedPacketSink(videoTrack).getKeyPacket(startPositionSeconds, { metadataOnly: true }),
+    audioTrack
+      ? new EncodedPacketSink(audioTrack).getFirstPacket({ metadataOnly: true })
+      : Promise.resolve(null)
+  ]);
   return {
     ...support,
     videoDecoderSupported,
@@ -173,6 +177,7 @@ async function probeInput(
       keyFrameTimestampSeconds: keyFrame.timestamp,
       keyFrameDurationSeconds: keyFrame.duration
     } : {}),
+    ...(audioSample ? { audioSampleTimestampSeconds: audioSample.timestamp } : {}),
     ...telemetryResult(telemetry)
   };
 }
