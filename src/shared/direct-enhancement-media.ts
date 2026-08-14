@@ -38,6 +38,22 @@ export interface DirectEnhancementSubtitleCue {
   text: string;
 }
 
+export interface DirectEnhancementGpuResourceInput {
+  width: number;
+  height: number;
+  maxTextureDimension2D: number;
+  deviceMemoryGiB?: number;
+  queuedVideoFrames?: number;
+  decoderQueueSize?: number;
+}
+
+export interface DirectEnhancementGpuResourceBudget {
+  supported: boolean;
+  estimatedWorkingSetBytes: number;
+  resourceBudgetBytes: number;
+  reason?: string;
+}
+
 export type DirectEnhancementPerformanceAction = "keep" | "degrade" | "fallback";
 
 export interface DirectEnhancementPerformanceSnapshot {
@@ -63,6 +79,69 @@ const DIRECT_ENHANCEMENT_FRAME_INTERVAL_LIMIT = 60;
 const DIRECT_ENHANCEMENT_OUTCOME_LIMIT = 120;
 const DIRECT_ENHANCEMENT_DEFAULT_FRAME_BUDGET_MS = 32;
 const DIRECT_ENHANCEMENT_MAX_FRAME_BUDGET_MS = 1000 / 30;
+const DIRECT_ENHANCEMENT_DEFAULT_DEVICE_MEMORY_GIB = 4;
+const DIRECT_ENHANCEMENT_GPU_BUDGET_FRACTION = 0.125;
+const DIRECT_ENHANCEMENT_MIN_GPU_BUDGET_BYTES = 256 * 1024 * 1024;
+const DIRECT_ENHANCEMENT_MAX_GPU_BUDGET_BYTES = 1024 * 1024 * 1024;
+const DIRECT_ENHANCEMENT_FIXED_WORKING_SET_BYTES = 16 * 1024 * 1024;
+
+/**
+ * WebGPU 不暴露实际显存，本门禁按设备纹理上限和有界帧队列估算最坏工作集。
+ * 估算覆盖 YUV 解码/展示帧、三缓冲画布及两份 RGBA 中间资源。
+ */
+export function evaluateDirectEnhancementGpuResources(
+  input: DirectEnhancementGpuResourceInput
+): DirectEnhancementGpuResourceBudget {
+  const validDimensions = [input.width, input.height, input.maxTextureDimension2D]
+    .every((value) => Number.isSafeInteger(value) && value > 0);
+  if (!validDimensions) {
+    return {
+      supported: false,
+      estimatedWorkingSetBytes: 0,
+      resourceBudgetBytes: 0,
+      reason: "直传增强 GPU 资源尺寸无效"
+    };
+  }
+
+  const deviceMemoryGiB = Number.isFinite(input.deviceMemoryGiB) && Number(input.deviceMemoryGiB) > 0
+    ? Math.min(16, Math.max(1, Number(input.deviceMemoryGiB)))
+    : DIRECT_ENHANCEMENT_DEFAULT_DEVICE_MEMORY_GIB;
+  const resourceBudgetBytes = Math.round(Math.min(
+    DIRECT_ENHANCEMENT_MAX_GPU_BUDGET_BYTES,
+    Math.max(
+      DIRECT_ENHANCEMENT_MIN_GPU_BUDGET_BYTES,
+      deviceMemoryGiB * 1024 * 1024 * 1024 * DIRECT_ENHANCEMENT_GPU_BUDGET_FRACTION
+    )
+  ));
+  const queuedVideoFrames = normalizeResourceCount(input.queuedVideoFrames, 8);
+  const decoderQueueSize = normalizeResourceCount(input.decoderQueueSize, 8);
+  const pixels = input.width * input.height;
+  const yuvFrameBytes = pixels * 1.5;
+  const canvasAndIntermediateBytes = pixels * 4 * 5;
+  const estimatedWorkingSetBytes = Math.ceil(
+    yuvFrameBytes * (queuedVideoFrames + decoderQueueSize)
+    + canvasAndIntermediateBytes
+    + DIRECT_ENHANCEMENT_FIXED_WORKING_SET_BYTES
+  );
+
+  if (input.width > input.maxTextureDimension2D || input.height > input.maxTextureDimension2D) {
+    return {
+      supported: false,
+      estimatedWorkingSetBytes,
+      resourceBudgetBytes,
+      reason: `视频尺寸 ${input.width}x${input.height} 超过 WebGPU 纹理上限 ${input.maxTextureDimension2D}`
+    };
+  }
+  if (estimatedWorkingSetBytes > resourceBudgetBytes) {
+    return {
+      supported: false,
+      estimatedWorkingSetBytes,
+      resourceBudgetBytes,
+      reason: `估算 GPU 工作集 ${formatMebibytes(estimatedWorkingSetBytes)} MiB 超过资源预算 ${formatMebibytes(resourceBudgetBytes)} MiB`
+    };
+  }
+  return { supported: true, estimatedWorkingSetBytes, resourceBudgetBytes };
+}
 
 /** 汇总短窗口性能样本，并给出清晰档降级或增强链退出建议。 */
 export class DirectEnhancementPerformanceMonitor {
@@ -268,6 +347,14 @@ export function parseDirectEnhancementSubtitleCues(
 function trimOldest<T>(values: T[], maximumLength: number): void {
   const overflow = values.length - maximumLength;
   if (overflow > 0) values.splice(0, overflow);
+}
+
+function normalizeResourceCount(value: number | undefined, fallback: number): number {
+  return Number.isSafeInteger(value) && Number(value) > 0 ? Number(value) : fallback;
+}
+
+function formatMebibytes(bytes: number): string {
+  return (bytes / (1024 * 1024)).toFixed(0);
 }
 
 function percentile(values: number[], fraction: number): number | undefined {

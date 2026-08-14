@@ -996,6 +996,8 @@ export function RemoteVideoPlayer({
         data-direct-enhancement-effective-preset={directEnhancementDiagnostics?.effectivePreset}
         data-direct-enhancement-frame-budget-ms={directEnhancementDiagnostics?.frameBudgetMs}
         data-direct-enhancement-gpu-p95-ms={directEnhancementDiagnostics?.gpuQueueP95Ms}
+        data-direct-enhancement-gpu-estimated-bytes={directEnhancementDiagnostics?.gpuEstimatedWorkingSetBytes}
+        data-direct-enhancement-gpu-budget-bytes={directEnhancementDiagnostics?.gpuResourceBudgetBytes}
         data-direct-enhancement-rendered-frames={directEnhancementDiagnostics?.renderedFrames}
         data-direct-enhancement-status={directEnhancementStatus}
         data-remote-fullscreen={environment === "remote" ? remoteFullscreenMode ?? undefined : undefined}

@@ -1,6 +1,6 @@
 # PC 内置播放器与画质增强执行计划
 
-> 当前实现边界（2026-08-14）：桌面 Windows/Linux/macOS 已统一使用 libmpv，接入 gpu-next/Render API、平台硬解路径、Anime4K Shader、字幕后合成、掉帧自动降级和双窗口同步；PC 播放路径不再保留 libVLC。远程 HLS 已按 NVENC/AMF/QSV/libx264 探测普通转码编码器；模型链已接入 RIFE 插帧和 Real-ESRGAN 2x 动画超分，采用 `FFmpeg RGB24 解码 -> 可选 RIFE -> 可选 Real-ESRGAN -> FFmpeg 编码`，并通过受认证会话诊断报告实际模型与降级原因。RIFE 已增加按源帧率、模型滚动 P95、显存、60 FPS 输出上限、80% 利用率和 5 ms 链路余量计算的容量门禁，当前协议因 timestep 固定为 `0.5` 而硬限制为 2x；运行时超预算会关闭模型并维持既定时间轴。macOS Intel + AMD RX 6750 XT + MoltenVK 已完成真实 sidecar 握手：Real-ESRGAN 最新 warmup `24.46 ms`；RIFE 最新 warmup `25.99 ms`。这些低分辨率 warmup 只可作为启动样本，真实分辨率滚动 P95 和完整播放矩阵未通过前不能标记为实时插帧验收通过。F5-A/F5-B/F5-C 已完成能力、受控 MP4/WebM Range demux、实际解码配置、关键帧/首个音频样本、内置 WGSL、1x1 首帧 smoke test；F5-D 已接入有界 VideoFrame 队列、连续 WebCodecs 解码、可见 WebGPU 画布、预设切换、关键帧拖动和原画回退；F5-E 已接入 WebGPU device-lost、按源帧率计算的 80% 帧预算、GPU 队列 P95、丢帧率、连续音画漂移和无帧超时门禁，清晰档超限先自动降到均衡；F5-F 已接入 AudioBufferSink 内部 AudioDecoder、AudioContext 主时钟、1.5 秒/96 buffer 有界预调度，以及暂停、拖动、倍速、音量、静音和结束态。增强激活后卸载 ArtPlayer 原媒体源，ASS/VTT 由独立 cue 时钟直接渲染到 ArtPlayer DOM，连续重复 Range/视频解码已从增强路径移除。GPU 内存门禁、断线恢复、客户端到服务端诊断和远端直传增强浏览器矩阵仍未完成，`supportsDirectEnhancement` 继续保持 `false`。
+> 当前实现边界（2026-08-14）：桌面 Windows/Linux/macOS 已统一使用 libmpv，接入 gpu-next/Render API、平台硬解路径、Anime4K Shader、字幕后合成、掉帧自动降级和双窗口同步；PC 播放路径不再保留 libVLC。远程 HLS 已按 NVENC/AMF/QSV/libx264 探测普通转码编码器；模型链已接入 RIFE 插帧和 Real-ESRGAN 2x 动画超分，采用 `FFmpeg RGB24 解码 -> 可选 RIFE -> 可选 Real-ESRGAN -> FFmpeg 编码`，并通过受认证会话诊断报告实际模型与降级原因。RIFE 已增加按源帧率、模型滚动 P95、显存、60 FPS 输出上限、80% 利用率和 5 ms 链路余量计算的容量门禁，当前协议因 timestep 固定为 `0.5` 而硬限制为 2x；运行时超预算会关闭模型并维持既定时间轴。macOS Intel + AMD RX 6750 XT + MoltenVK 已完成真实 sidecar 握手：Real-ESRGAN 最新 warmup `24.46 ms`；RIFE 最新 warmup `25.99 ms`。这些低分辨率 warmup 只可作为启动样本，真实分辨率滚动 P95 和完整播放矩阵未通过前不能标记为实时插帧验收通过。F5-A/F5-B/F5-C 已完成能力、受控 MP4/WebM Range demux、实际解码配置、关键帧/首个音频样本、内置 WGSL、1x1 首帧 smoke test；F5-D 已接入有界 VideoFrame 队列、连续 WebCodecs 解码、可见 WebGPU 画布、预设切换、关键帧拖动和原画回退；F5-E 已接入 WebGPU device-lost、按源帧率计算的 80% 帧预算、GPU 队列 P95、丢帧率、连续音画漂移和无帧超时门禁，清晰档超限先自动降到均衡；F5-F 已接入 AudioBufferSink 内部 AudioDecoder、AudioContext 主时钟、1.5 秒/96 buffer 有界预调度，以及暂停、拖动、倍速、音量、静音和结束态；F5-G 已接入 GPU 纹理上限、有界队列工作集估算和 WebGPU `out-of-memory` 运行门禁。增强激活后卸载 ArtPlayer 原媒体源，ASS/VTT 由独立 cue 时钟直接渲染到 ArtPlayer DOM，连续重复 Range/视频解码已从增强路径移除。WebGPU 不提供真实显存遥测，因此 F5-G 只报告估算预算，不伪报 VRAM；断线恢复、客户端到服务端诊断和远端直传增强浏览器矩阵仍未完成，`supportsDirectEnhancement` 继续保持 `false`。
 
 正式模型包、HDR、远程输出和真实 GPU 的逐项执行与证据要求见 [播放器终版发布验收清单](./player-video-enhancement-acceptance.md)。
 
@@ -166,7 +166,7 @@ cost(m) = (m - 1) * rife_p95_ms
 - 解码、模型 rawvideo 编码的独立 P95，显示刷新率/终端 FPS 上限探测，以及按分辨率和 GPU 缓存的容量基线；当前远程门禁使用 80% 利用率和 5 ms 固定余量保守覆盖未拆分成本。
 - RIFE 任意 timestep 协议、场景切换检测和 3x 质量矩阵；完成前实时 AI 硬上限保持 2x，4x 及以上只评估离线转码。
 - 模型 rawvideo 链的跨厂商真机证据、逐候选编码器重试、终端字幕能力探测、自适应码率和断线恢复。
-- WebGPU/WebCodecs 直传增强：F5-A 至 F5-C 已完成能力、受控 MP4/WebM Range/关键帧/音频样本探测、绝对时钟、内置 WGSL 和 1x1 首帧 smoke test；F5-D 已接入连续 VideoDecoder、有界帧队列、可见 WebGPU 画布、预设切换、拖动重启、DOM 字幕后合成和失败恢复原画；F5-E 已接入 device-lost、按源帧率自适应的帧预算、GPU 队列 P95、丢帧、漂移和无帧门禁；F5-F 已接入 AudioDecoder/AudioContext 音轨调度、完整控制命令和独立 ASS/VTT cue 时钟，增强激活后卸载原 `<video>` 媒体源。GPU 内存门禁、断线恢复、客户端到服务端诊断、浏览器能力矩阵和 GPU 真机证据仍待实现。
+- WebGPU/WebCodecs 直传增强：F5-A 至 F5-C 已完成能力、受控 MP4/WebM Range/关键帧/音频样本探测、绝对时钟、内置 WGSL 和 1x1 首帧 smoke test；F5-D 已接入连续 VideoDecoder、有界帧队列、可见 WebGPU 画布、预设切换、拖动重启、DOM 字幕后合成和失败恢复原画；F5-E 已接入 device-lost、按源帧率自适应的帧预算、GPU 队列 P95、丢帧、漂移和无帧门禁；F5-F 已接入 AudioDecoder/AudioContext 音轨调度、完整控制命令和独立 ASS/VTT cue 时钟，增强激活后卸载原 `<video>` 媒体源；F5-G 已接入纹理上限、估算工作集和 WebGPU OOM 门禁。断线恢复、客户端到服务端诊断、浏览器能力矩阵和 GPU 真机证据仍待实现。
 - 浏览器端 RIFE/Real-ESRGAN 模型推理和端侧显存/帧预算调度。
 - HDR 源元数据、渲染器、显示器能力探测和原生输出。
 - Windows NVIDIA/AMD/Intel、macOS、Linux 真机矩阵与两个正式版本稳定期。
@@ -181,7 +181,7 @@ cost(m) = (m - 1) * rife_p95_ms
 | 终版 F2 | 已完成 RIFE 与 Real-ESRGAN 端口、长驻 sidecar、内存帧协议、2x 固定尺寸回退、双倍帧率时间轴保护和运行时 P95 降级；固定提交和子模块校验已接入 | macOS 两个模型的低分辨率 warmup 已通过；真实分辨率完整链路尚未达到发布验收，本地播放器模型链、HDR 原生输出待完成 |
 | 终版 F3 | 已完成普通 HLS 编码器回退、远程 RIFE + Real-ESRGAN rawvideo 管线、独立音轨/软字幕和受认证诊断刷新 | 模型链硬件编码、终端字幕探测、断线恢复和跨厂商证据待完成 |
 | 终版 F4 | PC libVLC 已从播放器、安装包和工作流移除 | 仍需两个正式版本完成跨平台真机矩阵，确认 libmpv 发布稳定性 |
-| 终版 F5 | F5-A 至 F5-D 已完成源码接入；F5-E 已加入 device-lost、源帧率 80% 帧预算、GPU 队列 P95、丢帧率、连续 250 ms 漂移、2 秒无帧和拖动后 8 秒恢复门禁；F5-F 已加入独立 AudioDecoder/AudioContext 时钟、播放控制和 DOM 字幕 cue 时钟，不修改原文件或启动服务端转码 | 当前仅达到源码与静态门禁状态；GPU 内存、断线恢复、客户端到服务端诊断契约及 30 分钟浏览器/GPU 真机矩阵仍待完成，`supportsDirectEnhancement` 保持 `false` |
+| 终版 F5 | F5-A 至 F5-D 已完成源码接入；F5-E 已加入 device-lost、源帧率 80% 帧预算、GPU 队列 P95、丢帧率、连续 250 ms 漂移、2 秒无帧和拖动后 8 秒恢复门禁；F5-F 已加入独立 AudioDecoder/AudioContext 时钟、播放控制和 DOM 字幕 cue 时钟；F5-G 已加入纹理维度、估算工作集和运行时 OOM 门禁，不修改原文件或启动服务端转码 | 当前仅达到源码与静态门禁状态；断线恢复、客户端到服务端诊断契约及 30 分钟浏览器/GPU 真机矩阵仍待完成，`supportsDirectEnhancement` 保持 `false` |
 
 ### F1：能力调度层
 
@@ -220,7 +220,8 @@ PC libVLC 已不再属于播放器、安装包或桌面工作流。剩余发布�
 2. **F5-B/F5-F 容器与媒体时钟**：已选用 `mediabunny 1.53.1` 作为纯 TypeScript、动态加载的受控 demuxer，首批只接受 MP4/WebM + H.264/VP9/AV1，并限制为 32 MiB 缓存、2 个并发、24 次 Range、64 MiB 累计响应和 8 秒探测窗口。当前已通过 HTTP Range 验证源 codec、实际 Audio/Video decoder config、媒体时长和目标位置之前的关键帧；F5-F 使用 AudioBufferSink 的 AudioDecoder 路径输出到 AudioContext，并以可测试绝对时钟驱动视频展示。音频预调度上限为 1.5 秒和 96 个 AudioBufferSourceNode；断线恢复仍待接入。MKV、H.265 及浏览器不支持的组合继续使用现有直传或 HLS。
 3. **F5-C WebGPU shader 链**：已加入应用内置、SHA-256 校验的 Anime4K 类 WGSL 锐化 shader、`VideoFrame -> texture_external -> Canvas` 工厂和可调预设强度；F5-D 已将其接入连续 VideoDecoder 帧循环。字幕/OSD 保持独立 DOM 图层，不进入 shader 输入。
 4. **F5-D 控制层接入**：已实现最多 8 帧的媒体时间队列、2 秒解码前探、8 秒增强首帧门禁、关键帧拖动重启、可见画布接管和 `balanced`/`clear` 热切换。ArtPlayer 继续承载控制 UI、全屏、进度和 DOM 字幕；增强激活后播放、暂停、拖动、倍速、音量和静音由 F5-F 独立控制器执行。只有增强首帧成功后才隐藏原视频，初始化或运行失败立即恢复原画。当前完成状态为 `implemented`，尚无 30 分钟真机证据。
-5. **F5-E 降级与验收**：已实现 WebGPU 初始化/device-lost、解码器、Range 上限、首帧、拖动恢复和运行错误回退原画；最近 60 个 GPU 队列样本计算 P95，最近 120 次展示统计丢帧，帧预算按源帧间隔的 80% 计算并最多取 30 FPS 的 `33.3 ms` 安全窗口。清晰档超过 75% 预算或 20% 丢帧时先降均衡；均衡超过完整预算、35% 丢帧、连续 12 帧漂移超过 `250 ms`、播放时钟前进但 2 秒无新帧时退出增强。页面诊断属性记录实际档位、预算、P95、漂移、丢帧、出帧数和原因；原视频本身失败时继续沿用 HLS 自动转码。GPU 内存、断线恢复、服务端 `direct-enhanced` 诊断和浏览器/GPU 真机矩阵仍待完成。
+5. **F5-E 降级与验收**：已实现 WebGPU 初始化/device-lost、解码器、Range 上限、首帧、拖动恢复和运行错误回退原画；最近 60 个 GPU 队列样本计算 P95，最近 120 次展示统计丢帧，帧预算按源帧间隔的 80% 计算并最多取 30 FPS 的 `33.3 ms` 安全窗口。清晰档超过 75% 预算或 20% 丢帧时先降均衡；均衡超过完整预算、35% 丢帧、连续 12 帧漂移超过 `250 ms`、播放时钟前进但 2 秒无新帧时退出增强。页面诊断属性记录实际档位、预算、P95、漂移、丢帧、出帧数和原因；原视频本身失败时继续沿用 HLS 自动转码。断线恢复、服务端 `direct-enhanced` 诊断和浏览器/GPU 真机矩阵仍待完成。
 6. **F5-F 独立音频与字幕时钟**：已实现 AudioDecoder 配置复核、AudioContext 输出、1.5 秒/96 buffer 有界预调度、暂停/恢复、倍速、拖动、音量、静音和结束态，并将画面选择和漂移门禁切换到 AudioContext 绝对时钟。增强启动后卸载 ArtPlayer 原媒体源，控制命令优先进入独立控制器；ASS 先转换为 VTT，ASS/VTT cue 都由相同音频时钟直接渲染到 ArtPlayer 字幕 DOM。运行失败时按当前绝对位置重载原文件并恢复原播放器。
+7. **F5-G GPU 资源压力门禁**：已按 `GPUDevice.limits.maxTextureDimension2D`、画面像素、有界 VideoFrame/decoder 队列、画布三缓冲和中间资源估算工作集，并以可用的 `navigator.deviceMemory` 生成有上下限的保守预算；超过纹理或工作集预算时不进入增强。初始化和每帧提交使用 WebGPU `out-of-memory` error scope，运行时资源失败立即回退原画。页面诊断记录估算工作集与预算字节数；浏览器没有真实 VRAM API，因此不得把该值展示为显卡显存占用。
 
 F5 完成后再评估浏览器端 RIFE/Real-ESRGAN。模型端侧推理不能复用远程 HLS 的 rawvideo 管道，必须另行验证模型包、WebGPU compute、显存上限、断帧策略和浏览器兼容性。

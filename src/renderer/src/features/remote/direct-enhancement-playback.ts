@@ -44,6 +44,8 @@ export interface DirectEnhancementPlaybackDiagnostics {
   rangeRequestCount: number;
   receivedRangeBytes: number;
   gpuQueueP95Ms?: number;
+  gpuEstimatedWorkingSetBytes?: number;
+  gpuResourceBudgetBytes?: number;
   degradationReason?: string;
 }
 
@@ -206,6 +208,9 @@ class DirectEnhancementPlayback implements DirectEnhancementPlaybackController {
           : `WebGPU 设备已丢失：${info.reason}`
       ));
     });
+    void renderer.resourcePressure.then((error) => {
+      if (!this.disposed) this.fail(error);
+    });
     this.packetSink = new EncodedPacketSink(videoTrack);
     this.decoderConfig = config;
     this.audioPlayback = await createDirectEnhancementAudioPlayback(audioTrack, {
@@ -336,6 +341,10 @@ class DirectEnhancementPlayback implements DirectEnhancementPlaybackController {
       ...(performanceSnapshot.gpuQueueP95Ms === undefined
         ? {}
         : { gpuQueueP95Ms: performanceSnapshot.gpuQueueP95Ms }),
+      ...(this.renderer ? {
+        gpuEstimatedWorkingSetBytes: this.renderer.resourceBudget.estimatedWorkingSetBytes,
+        gpuResourceBudgetBytes: this.renderer.resourceBudget.resourceBudgetBytes
+      } : {}),
       ...(this.failureError || this.automaticDegradationReason ? {
         degradationReason: this.failureError?.message ?? this.automaticDegradationReason
       } : {})

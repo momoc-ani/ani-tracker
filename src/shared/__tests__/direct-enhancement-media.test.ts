@@ -4,6 +4,7 @@ import {
   DirectEnhancementFrameQueue,
   DirectEnhancementMediaClock,
   DirectEnhancementPerformanceMonitor,
+  evaluateDirectEnhancementGpuResources,
   evaluateDirectEnhancementMediaCandidate,
   normalizeDirectEnhancementVideoCodec,
   parseDirectEnhancementSubtitleCues
@@ -115,6 +116,38 @@ intro
     { startSeconds: 1.25, endSeconds: 3.5, text: "第一行\n第二行" },
     { startSeconds: 4, endSeconds: 5.25, text: "下一句" }
   ]);
+});
+
+test("F5-G GPU 资源门禁接受 4 GiB 设备的 4K 有界队列", () => {
+  const budget = evaluateDirectEnhancementGpuResources({
+    width: 3_840,
+    height: 2_160,
+    maxTextureDimension2D: 8_192,
+    deviceMemoryGiB: 4
+  });
+
+  assert.equal(budget.supported, true);
+  assert.ok(budget.estimatedWorkingSetBytes < budget.resourceBudgetBytes);
+});
+
+test("F5-G GPU 资源门禁拒绝纹理上限和估算工作集超限", () => {
+  const textureLimit = evaluateDirectEnhancementGpuResources({
+    width: 8_192,
+    height: 4_320,
+    maxTextureDimension2D: 4_096,
+    deviceMemoryGiB: 8
+  });
+  const memoryLimit = evaluateDirectEnhancementGpuResources({
+    width: 7_680,
+    height: 4_320,
+    maxTextureDimension2D: 8_192,
+    deviceMemoryGiB: 4
+  });
+
+  assert.equal(textureLimit.supported, false);
+  assert.match(textureLimit.reason ?? "", /纹理上限/);
+  assert.equal(memoryLimit.supported, false);
+  assert.match(memoryLimit.reason ?? "", /工作集/);
 });
 
 test("F5-B 拒绝 MKV、H.265 和 WebM/H.264", () => {

@@ -1,5 +1,10 @@
 /// <reference types="@webgpu/types" />
 
+import {
+  evaluateDirectEnhancementGpuResources,
+  type DirectEnhancementGpuResourceBudget
+} from "@shared/direct-enhancement-media";
+
 export const DIRECT_ENHANCEMENT_WGSL = `
 struct VertexOutput {
   @builtin(position) position: vec4<f32>,
@@ -55,6 +60,8 @@ const DIRECT_ENHANCEMENT_WGSL_SHA256 = "2d01d34bcf4bd5958b0e25d4146b451ff7546ed3
 
 export interface DirectEnhancementWebGpuRenderer {
   readonly deviceLost: Promise<GPUDeviceLostInfo>;
+  readonly resourceBudget: DirectEnhancementGpuResourceBudget;
+  readonly resourcePressure: Promise<Error>;
   render(frame: VideoFrame, strength?: number): void;
   waitForSubmittedWork(): Promise<void>;
   dispose(): void;
@@ -84,64 +91,125 @@ export async function createDirectEnhancementWebGpuRenderer(
   const adapter = await gpu.requestAdapter();
   if (!adapter) throw new Error("WebGPU adapter 不可用");
   const device = await adapter.requestDevice();
+  const resourceBudget = evaluateDirectEnhancementGpuResources({
+    width: canvas.width,
+    height: canvas.height,
+    maxTextureDimension2D: device.limits.maxTextureDimension2D,
+    deviceMemoryGiB: (navigator as Navigator & { deviceMemory?: number }).deviceMemory,
+    queuedVideoFrames: 8,
+    decoderQueueSize: 8
+  });
+  if (!resourceBudget.supported) {
+    device.destroy();
+    throw new Error(resourceBudget.reason ?? "F5-G WebGPU 资源预算不足");
+  }
   const context = canvas.getContext("webgpu") as GPUCanvasContext | null;
   if (!context) {
     device.destroy();
     throw new Error("WebGPU canvas context 不可用");
   }
   const format = gpu.getPreferredCanvasFormat();
-  context.configure({ device, format, alphaMode: "opaque" });
-  const pipeline = device.createRenderPipeline({
-    layout: "auto",
-    vertex: { module: device.createShaderModule({ code: DIRECT_ENHANCEMENT_WGSL }), entryPoint: "vertex" },
-    fragment: {
-      module: device.createShaderModule({ code: DIRECT_ENHANCEMENT_WGSL }),
-      entryPoint: "fragment",
-      targets: [{ format }]
-    },
-    primitive: { topology: "triangle-list" }
-  });
-  const sampler = device.createSampler({ magFilter: "linear", minFilter: "linear" });
-  const params = device.createBuffer({
-    size: 16,
-    usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
-  });
+  device.pushErrorScope("out-of-memory");
+  let allocationScopeOpen = true;
+  let pipeline!: GPURenderPipeline;
+  let sampler!: GPUSampler;
+  let params!: GPUBuffer;
+  try {
+    context.configure({ device, format, alphaMode: "opaque" });
+    pipeline = device.createRenderPipeline({
+      layout: "auto",
+      vertex: { module: device.createShaderModule({ code: DIRECT_ENHANCEMENT_WGSL }), entryPoint: "vertex" },
+      fragment: {
+        module: device.createShaderModule({ code: DIRECT_ENHANCEMENT_WGSL }),
+        entryPoint: "fragment",
+        targets: [{ format }]
+      },
+      primitive: { topology: "triangle-list" }
+    });
+    sampler = device.createSampler({ magFilter: "linear", minFilter: "linear" });
+    params = device.createBuffer({
+      size: 16,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
+    });
+    const allocationError = await device.popErrorScope();
+    allocationScopeOpen = false;
+    if (allocationError) {
+      throw new Error(`F5-G WebGPU 初始化资源不足：${allocationError.message}`);
+    }
+  } catch (error) {
+    if (allocationScopeOpen) {
+      try {
+        await device.popErrorScope();
+      } catch {
+        // Device loss may already have cleared the pending error scope.
+      }
+    }
+    context.unconfigure?.();
+    params?.destroy();
+    device.destroy();
+    throw error;
+  }
   const layout = pipeline.getBindGroupLayout(0);
+  let resourceFailure: Error | undefined;
+  let resolveResourcePressure!: (error: Error) => void;
+  const resourcePressure = new Promise<Error>((resolve) => {
+    resolveResourcePressure = resolve;
+  });
+
+  const recordResourcePressure = (error: GPUError): void => {
+    if (resourceFailure) return;
+    resourceFailure = new Error(`F5-G WebGPU 运行时资源不足：${error.message}`);
+    resolveResourcePressure(resourceFailure);
+  };
 
   return {
     deviceLost: device.lost,
+    resourceBudget,
+    resourcePressure,
     render(frame, strength = 0.35) {
+      if (resourceFailure) throw resourceFailure;
       const width = Math.max(1, frame.displayWidth || frame.codedWidth);
       const height = Math.max(1, frame.displayHeight || frame.codedHeight);
-      device.queue.writeBuffer(params, 0, new Float32Array([
-        1 / width,
-        1 / height,
-        Math.min(0.75, Math.max(0, strength)),
-        0
-      ]));
-      const externalTexture = device.importExternalTexture({ source: frame });
-      const bindGroup = device.createBindGroup({
-        layout,
-        entries: [
-          { binding: 0, resource: externalTexture },
-          { binding: 1, resource: sampler },
-          { binding: 2, resource: { buffer: params } }
-        ]
-      });
-      const encoder = device.createCommandEncoder();
-      const pass = encoder.beginRenderPass({
-        colorAttachments: [{
-          view: context.getCurrentTexture().createView(),
-          clearValue: { r: 0, g: 0, b: 0, a: 1 },
-          loadOp: "clear",
-          storeOp: "store"
-        }]
-      });
-      pass.setPipeline(pipeline);
-      pass.setBindGroup(0, bindGroup);
-      pass.draw(6);
-      pass.end();
-      device.queue.submit([encoder.finish()]);
+      device.pushErrorScope("out-of-memory");
+      try {
+        device.queue.writeBuffer(params, 0, new Float32Array([
+          1 / width,
+          1 / height,
+          Math.min(0.75, Math.max(0, strength)),
+          0
+        ]));
+        const externalTexture = device.importExternalTexture({ source: frame });
+        const bindGroup = device.createBindGroup({
+          layout,
+          entries: [
+            { binding: 0, resource: externalTexture },
+            { binding: 1, resource: sampler },
+            { binding: 2, resource: { buffer: params } }
+          ]
+        });
+        const encoder = device.createCommandEncoder();
+        const pass = encoder.beginRenderPass({
+          colorAttachments: [{
+            view: context.getCurrentTexture().createView(),
+            clearValue: { r: 0, g: 0, b: 0, a: 1 },
+            loadOp: "clear",
+            storeOp: "store"
+          }]
+        });
+        pass.setPipeline(pipeline);
+        pass.setBindGroup(0, bindGroup);
+        pass.draw(6);
+        pass.end();
+        device.queue.submit([encoder.finish()]);
+      } catch (error) {
+        void device.popErrorScope();
+        throw error;
+      }
+      void device.popErrorScope()
+        .then((error) => {
+          if (error) recordResourcePressure(error);
+        })
+        .catch(() => undefined);
     },
     waitForSubmittedWork() {
       return device.queue.onSubmittedWorkDone();
