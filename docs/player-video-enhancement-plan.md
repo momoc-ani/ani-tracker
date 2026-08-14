@@ -1,6 +1,6 @@
 # PC 内置播放器与画质增强执行计划
 
-> 当前实现边界（2026-08-14）：桌面 Windows/Linux 已接入 libmpv、gpu-next、硬解路径、Anime4K Shader、字幕后合成、掉帧自动降级和 libVLC 回退。远程 HLS 已按 NVENC/AMF/QSV/libx264 探测普通转码编码器；模型链已接入 RIFE 插帧和 Real-ESRGAN 2x 动画超分，采用 `FFmpeg RGB24 解码 -> 可选 RIFE -> 可选 Real-ESRGAN -> FFmpeg 编码`，并通过受认证会话诊断报告实际模型与降级原因。macOS Intel + AMD RX 6750 XT + MoltenVK 已完成真实 sidecar 握手：Real-ESRGAN 最新 warmup `24.46 ms` 达到 `33 ms` 预算；RIFE 使用固定 NCNN/libwebp/glslang 提交重建后最新 warmup `25.99 ms`，仍未达到 `16 ms` 预算。模型能力只有在资源摘要、显存/帧预算、真实 Vulkan 握手和 warmup 全部通过后才启用；本地 libmpv 模型链、HDR 原生输出和跨 GPU 真机证据仍未完成。
+> 当前实现边界（2026-08-14）：桌面 Windows/Linux 已接入 libmpv、gpu-next、硬解路径、Anime4K Shader、字幕后合成、掉帧自动降级和 libVLC 回退。远程 HLS 已按 NVENC/AMF/QSV/libx264 探测普通转码编码器；模型链已接入 RIFE 插帧和 Real-ESRGAN 2x 动画超分，采用 `FFmpeg RGB24 解码 -> 可选 RIFE -> 可选 Real-ESRGAN -> FFmpeg 编码`，并通过受认证会话诊断报告实际模型与降级原因。RIFE 已增加按源帧率、模型滚动 P95、显存、60 FPS 输出上限、80% 利用率和 5 ms 链路余量计算的容量门禁，当前协议因 timestep 固定为 `0.5` 而硬限制为 2x；运行时超预算会关闭模型并维持既定时间轴。macOS Intel + AMD RX 6750 XT + MoltenVK 已完成真实 sidecar 握手：Real-ESRGAN 最新 warmup `24.46 ms`；RIFE 最新 warmup `25.99 ms`。这些低分辨率 warmup 只可作为启动样本，真实分辨率滚动 P95 和完整播放矩阵未通过前不能标记为实时插帧验收通过。本地 libmpv 模型链、HDR 原生输出和跨 GPU 真机证据仍未完成。
 
 正式模型包、HDR、远程输出和真实 GPU 的逐项执行与证据要求见 [播放器终版发布验收清单](./player-video-enhancement-acceptance.md)。
 
@@ -31,6 +31,34 @@
 ```text
 输入 -> 本地硬件解码 -> 增强/插帧/HDR -> 厂商硬件编码 -> HLS/SRT/WebRTC -> 远程播放器
 ```
+
+## 插帧倍率与硬件容量策略
+
+当前 RIFE sidecar 调用固定 `rife.process(previous, next, 0.5)`，每对源帧只能生成一个正中间帧，因此实时 AI 插帧硬上限为 2x。3x 需要协议支持 `1/3`、`2/3` timestep；4x 需要递归三次推理。当前不使用递归 4x，原因是成本至少约为 2x 的三倍，连续递归还会放大遮挡、场景切换和线条抖动伪影。
+
+容量不按 AMD、NVIDIA、Intel 型号表硬编码，而按当前设备实测的滚动 P95 计算：
+
+```text
+source_interval_ms = 1000 / source_fps
+safe_budget_ms = source_interval_ms * 0.8
+cost(m) = (m - 1) * rife_p95_ms
+        + m * enhancer_p95_ms
+        + decode_p95_ms + encode_p95_ms
+        + safety_margin_ms
+```
+
+只有 `cost(m) <= safe_budget_ms`、模型总显存不超过可用预算、`source_fps * m <= output_fps_cap` 且协议支持该倍率时才可选择 `m`。当前远程实现固定 `output_fps_cap=60`、`safety_margin_ms=5`、`hard_max_multiplier=2`；解码和编码独立 P95 尚未接入前由利用率与固定余量保守覆盖。sidecar 保留最近 120 个样本并持续重算 P95，真实分辨率或并发负载使预算超限时优先关闭 RIFE。
+
+首版目标档位：
+
+| 源帧率 | AI 目标 | 策略 |
+| --- | --- | --- |
+| 23.976/24 | 47.952/48 | P95、显存和输出门禁通过时使用 RIFE 2x |
+| 25 | 50 | P95、显存和输出门禁通过时使用 RIFE 2x |
+| 29.97/30 | 59.94/60 | P95、显存和输出门禁通过时使用 RIFE 2x |
+| 大于 30 | 保持源帧率 | 60 FPS 输出上限下不启用 AI 插帧 |
+
+更高刷新率显示器不直接提高 AI 倍率。首选输出 48/50/60 FPS 后由显示链做轻量帧呈现；本地 libmpv 可用 `display-resample` 作为低成本兜底，远程可选择 FFmpeg `minterpolate` 的 60 FPS 运动补偿。未来只有在任意 timestep 协议、场景切换检测、真实 P95 和质量矩阵全部完成后，才开放 3x；4x 及以上优先作为离线转码档位，不作为实时默认。
 
 普通 HLS 已按 NVIDIA NVENC、AMD AMF、Intel QSV 选择，全部不可用时回退 libx264。模型 rawvideo 链当前使用 libx264，接入跨厂商硬件编码和对应真机证据仍属于后续发布门禁。
 
@@ -118,6 +146,8 @@
 
 - 本地 libmpv 的模型超分/插帧渲染链；当前模型仅用于远程 HLS。
 - Windows/Linux Release Runner 的真实 RIFE、Real-ESRGAN Vulkan 构建、握手、warmup 和帧耗时证据；macOS 已完成 sidecar 级别验证，但尚未完成 30 分钟播放矩阵。
+- 解码、模型 rawvideo 编码的独立 P95，显示刷新率/终端 FPS 上限探测，以及按分辨率和 GPU 缓存的容量基线；当前远程门禁使用 80% 利用率和 5 ms 固定余量保守覆盖未拆分成本。
+- RIFE 任意 timestep 协议、场景切换检测和 3x 质量矩阵；完成前实时 AI 硬上限保持 2x，4x 及以上只评估离线转码。
 - 模型 rawvideo 链的 NVENC/AMF/QSV 编码、终端字幕能力探测、自适应码率和断线恢复。
 - libmpv render API + Metal 的 macOS 原生输出。
 - HDR 源元数据、渲染器、显示器能力探测和原生输出。
@@ -129,8 +159,8 @@
 | --- | --- | --- |
 | 首版 P0-P3 | 已完成：libmpv/libVLC 单内核切换、跨厂商硬解配置、Anime4K、字幕后合成和掉帧降级 | macOS 仍使用 libVLC；各平台真机需持续回归 |
 | 首版 P4 | 已完成发布资源门禁和实机矩阵声明 | Windows/AMD/NVIDIA/Intel、macOS、Linux 实机结果待采集 |
-| 终版 F1 | 已完成能力、诊断、组合预算、权重/可执行文件摘要校验和安全降级契约 | 真实 GPU 显存值仍使用配置预算；真机数据待采集 |
-| 终版 F2 | 已完成 RIFE 与 Real-ESRGAN 端口、长驻 sidecar、内存帧协议、2x 固定尺寸回退和双倍帧率时间轴保护；固定提交和子模块校验已接入 | macOS Real-ESRGAN Vulkan warmup 已通过；RIFE 固定依赖重建和握手已通过但未达实时预算；本地播放器模型链、HDR 原生输出待完成 |
+| 终版 F1 | 已完成能力、诊断、按源帧率/滚动 P95/显存/输出上限计算的 2x 容量门禁、权重/可执行文件摘要校验和安全降级契约 | 真实 GPU 显存值仍使用配置预算；解码/编码 P95 和真机数据待采集 |
+| 终版 F2 | 已完成 RIFE 与 Real-ESRGAN 端口、长驻 sidecar、内存帧协议、2x 固定尺寸回退、双倍帧率时间轴保护和运行时 P95 降级；固定提交和子模块校验已接入 | macOS 两个模型的低分辨率 warmup 已通过；真实分辨率完整链路尚未达到发布验收，本地播放器模型链、HDR 原生输出待完成 |
 | 终版 F3 | 已完成普通 HLS 编码器回退、远程 RIFE + Real-ESRGAN rawvideo 管线、独立音轨/软字幕和受认证诊断刷新 | 模型链硬件编码、终端字幕探测、断线恢复和跨厂商证据待完成 |
 | 终版 F4 | 删除条件和双版本稳定门槛已固化 | 必须经过两个正式版本，不在当前阶段删除 libVLC |
 

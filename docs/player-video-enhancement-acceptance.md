@@ -35,6 +35,9 @@ Real-ESRGAN 模型归档固定为 `v0.2.5.0/realesrgan-ncnn-vulkan-20220424-wind
 - 显存或帧时间超过当前会话预算时，不创建推理会话。
 - 模型初始化失败只允许回退 Shader 或原画，不能中断基础播放。
 - 超分和插帧不得无条件同时满负载；远程组合预算按一次 RIFE 与两次 Real-ESRGAN 处理计算，超限时优先关闭 RIFE。
+- RIFE 倍率必须由源帧率、滚动 P95、显存、输出 FPS 上限和协议硬上限共同决定；不得按 GPU 品牌或型号直接判定可用。
+- 当前协议固定中间时刻 `0.5`，AI 实时上限必须保持 2x。未经任意 timestep、场景切换和质量矩阵验收，不得开放 3x；不得用递归 RIFE 冒充已验收的实时 4x。
+- 远程会话必须报告 `sourceFrameRate`、`targetFrameRate`、`selectedMultiplier`、`maxFeasibleMultiplier`、安全预算、预计成本、模型 P95 和样本数；运行中容量超限后 2 秒内应显示 1x 与实际关闭状态。
 - 字幕和 OSD 不得进入模型输入帧，必须在增强后合成。
 - RIFE 运行中失败后，每个源帧继续重复输出并补齐尾帧，维持编码器既定双倍帧率和原始时长。
 - Real-ESRGAN 运行中失败后，使用最近邻 2x 保持编码器固定输入尺寸，同时实际增强状态变为关闭。
@@ -46,7 +49,7 @@ Real-ESRGAN 模型归档固定为 `v0.2.5.0/realesrgan-ncnn-vulkan-20220424-wind
 测试主机为 macOS `26.4.1`、Intel `x86_64`、AMD Radeon RX 6750 XT，LunarG Vulkan SDK `1.3.296.0`，Vulkan 通过 MoltenVK/Metal。
 
 - Real-ESRGAN `realesr-animevideov3-x2`：真实握手和 warmup 通过，最新实测 `24.46 ms`，满足 `33 ms` 单帧预算。
-- RIFE `rife-v4.6`：使用固定 NCNN/libwebp/glslang 提交重新构建后，真实握手和 warmup 通过，最新实测 `25.99 ms`，未满足 `16 ms` 实时预算；不能标记为实时插帧通过。
+- RIFE `rife-v4.6`：使用固定 NCNN/libwebp/glslang 提交重新构建后，真实握手和 warmup 通过，最新实测 `25.99 ms`。2x 每个源帧区间只执行一次 RIFE，不能再用固定 `16 ms` 输出帧间隔作为所有源帧率的判断；24 FPS 在 80% 利用率下的模型链安全窗口为 `33.33 ms`。但当前 warmup 分辨率和单样本仍不足以证明真实视频 P95，因此不能标记为实时插帧通过。
 - 上述结果只证明 Vulkan sidecar、模型加载、协议和单次推理链路，不代表 30 分钟播放、HDR、字幕、远程编码或 Windows/Linux 真机矩阵已完成。
 - RIFE 旧缓存曾使用错误 libwebp 提交，已由固定提交的重建 bundle 和新实测结果替换。
 
@@ -80,6 +83,8 @@ Real-ESRGAN 模型归档固定为 `v0.2.5.0/realesrgan-ncnn-vulkan-20220424-wind
 - 分别在 NVIDIA、AMD、Intel 环境确认 NVENC、AMF、QSV 的实际编码器诊断。
 - 禁用全部硬件编码器后确认回退 `libx264`，且界面显示编码降级。
 - RIFE 或 Real-ESRGAN 只有在摘要、预算、真实 Vulkan 握手和 warmup 通过后才能出现在 `modelBackend`；运行中失败后 2 秒内通过受认证会话状态读取更新 `degradationReason`、实际增强和插帧状态。
+- 对 23.976/24、25、29.97/30 和 60 FPS 源分别核对容量诊断：目标只能为 47.952/48、50、59.94/60 和保持 60；任何 P95、显存或输出上限不满足的场景必须显示 1x 并关闭 RIFE。
+- 至少采集 120 个真实分辨率样本后记录滚动 P95；启动 warmup 只能作为第一个临时样本，不能单独作为 `device-passed` 证据。
 - 请求 `clear` 时优先使用 Real-ESRGAN 2x；不可用时回退 FFmpeg 清晰滤镜。请求 `balanced` 时保持轻量 FFmpeg 滤镜。
 - 当前远程链固定软字幕并保持字幕不进入模型输入；终端能力探测和烧录字幕尚未完成，不得标记为已验收。
 - 普通 HLS 验收 NVENC/AMF/QSV/libx264；模型 rawvideo 链当前使用 libx264，硬件编码接入前不得记录跨厂商模型编码通过。
