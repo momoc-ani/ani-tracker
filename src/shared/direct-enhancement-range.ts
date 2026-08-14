@@ -49,7 +49,7 @@ export function createDirectEnhancementRangeFetch(
     const range = requestHeaders.get("range");
     if (!range) {
       telemetry.requestCount += 1;
-      return baseFetch(input, init);
+      return baseFetch.call(globalThis, input, init);
     }
 
     const maximumRetries = normalizeRangeRetryCount(limits.maximumRangeRetries);
@@ -272,7 +272,8 @@ async function performRangeFetch(context: RangeFetchContext, headers: Headers): 
       `F5-B Range 请求超过 ${context.limits.maximumRangeRequests} 次上限`
     );
   }
-  return context.baseFetch(context.input, { ...context.init, headers });
+  // Chromium 的 Window.fetch 是 WebIDL 方法，作为裸函数传递后直接调用会触发 Illegal invocation。
+  return context.baseFetch.call(globalThis, context.input, { ...context.init, headers });
 }
 
 function validateRangeResponse(response: Response, expectedStartByte?: number): DirectEnhancementContentRange {

@@ -83,6 +83,26 @@ test("F5-H 可重试状态恢复且 416 不进入重试", async () => {
   assert.equal(rangeErrorTelemetry.retryCount, 0);
 });
 
+test("F5-H 将浏览器原生 fetch 绑定到全局对象", async () => {
+  let observedThis: unknown;
+  const nativeStyleFetch = function (this: unknown): Promise<Response> {
+    observedThis = this;
+    return Promise.resolve(rangeResponse([1, 2], "bytes 0-1/2"));
+  } as typeof fetch;
+  const rangeFetch = createDirectEnhancementRangeFetch(
+    nativeStyleFetch,
+    createDirectEnhancementRangeTelemetry(),
+    { maximumRangeRequests: 1, rangeRetryBaseDelayMs: 0 }
+  );
+
+  const response = await rangeFetch("https://example.test/video.mp4", {
+    headers: { range: "bytes=0-1" }
+  });
+
+  assert.equal(observedThis, globalThis);
+  assert.deepEqual([...new Uint8Array(await response.arrayBuffer())], [1, 2]);
+});
+
 function rangeResponse(bytes: number[], contentRange: string): Response {
   return new Response(Uint8Array.from(bytes), {
     status: 206,
