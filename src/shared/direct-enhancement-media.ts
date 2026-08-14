@@ -362,6 +362,25 @@ export class DirectEnhancementFrameQueue<T extends DirectEnhancementQueuedFrame>
   }
 }
 
+/** 限制解码器待处理帧与已解码帧的总量，避免预解码覆盖近期展示帧。 */
+export function hasDirectEnhancementDecodeCapacity(input: {
+  decodedFrameCount: number;
+  pendingFrameCount: number;
+  maximumBufferedFrames: number;
+}): boolean {
+  if (
+    !Number.isSafeInteger(input.decodedFrameCount)
+    || input.decodedFrameCount < 0
+    || !Number.isSafeInteger(input.pendingFrameCount)
+    || input.pendingFrameCount < 0
+    || !Number.isSafeInteger(input.maximumBufferedFrames)
+    || input.maximumBufferedFrames < 1
+  ) {
+    return false;
+  }
+  return input.decodedFrameCount + input.pendingFrameCount < input.maximumBufferedFrames;
+}
+
 /** 解析受控 ASS 转换结果或原生 WebVTT，供独立音频时钟驱动 DOM 字幕。 */
 export function parseDirectEnhancementSubtitleCues(
   vttText: string

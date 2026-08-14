@@ -6,6 +6,7 @@ import {
   DirectEnhancementPerformanceMonitor,
   evaluateDirectEnhancementGpuResources,
   evaluateDirectEnhancementMediaCandidate,
+  hasDirectEnhancementDecodeCapacity,
   isDirectEnhancementRetryableStatus,
   normalizeDirectEnhancementVideoCodec,
   parseDirectEnhancementContentRange,
@@ -47,6 +48,24 @@ test("F5-D 帧队列溢出时优先丢弃最旧帧", () => {
     { id: 2, timestampSeconds: 2 },
     { id: 3, timestampSeconds: 3 }
   ]);
+});
+
+test("F5-D 预解码把解码器队列和已解码帧计入同一个上限", () => {
+  assert.equal(hasDirectEnhancementDecodeCapacity({
+    decodedFrameCount: 7,
+    pendingFrameCount: 0,
+    maximumBufferedFrames: 8
+  }), true);
+  assert.equal(hasDirectEnhancementDecodeCapacity({
+    decodedFrameCount: 4,
+    pendingFrameCount: 4,
+    maximumBufferedFrames: 8
+  }), false);
+  assert.equal(hasDirectEnhancementDecodeCapacity({
+    decodedFrameCount: 0,
+    pendingFrameCount: 8,
+    maximumBufferedFrames: 8
+  }), false);
 });
 
 test("F5-E 清晰档负载超限时先降到均衡档", () => {

@@ -2,7 +2,8 @@ import { EncodedPacketSink, MP4, type EncodedPacket } from "mediabunny";
 import {
   DirectEnhancementFrameQueue,
   DirectEnhancementPerformanceMonitor,
-  evaluateDirectEnhancementMediaCandidate
+  evaluateDirectEnhancementMediaCandidate,
+  hasDirectEnhancementDecodeCapacity
 } from "@shared/direct-enhancement-media";
 import {
   createDirectEnhancementMediaInput,
@@ -20,7 +21,7 @@ import {
 const DECODE_AHEAD_SECONDS = 2;
 const FIRST_FRAME_TIMEOUT_MS = 8_000;
 const GPU_QUEUE_SAMPLE_INTERVAL_FRAMES = 30;
-const MAX_DECODER_QUEUE_SIZE = 8;
+const MAX_BUFFERED_VIDEO_FRAMES = 8;
 const MAX_PLAYBACK_RANGE_REQUESTS = 4_096;
 
 interface QueuedVideoFrame {
@@ -107,7 +108,7 @@ export async function createDirectEnhancementPlayback(
 }
 
 class DirectEnhancementPlayback implements DirectEnhancementPlaybackController {
-  private readonly frameQueue = new DirectEnhancementFrameQueue<QueuedVideoFrame>(8);
+  private readonly frameQueue = new DirectEnhancementFrameQueue<QueuedVideoFrame>(MAX_BUFFERED_VIDEO_FRAMES);
   private readonly performanceMonitor = new DirectEnhancementPerformanceMonitor();
   private readonly stateListeners = new Set<(state: DirectEnhancementPlaybackState) => void>();
   private readonly mediaInput;
@@ -119,6 +120,7 @@ class DirectEnhancementPlayback implements DirectEnhancementPlaybackController {
   private packetSink?: EncodedPacketSink;
   private nextPacket: EncodedPacket | null | undefined;
   private decodePump?: Promise<void>;
+  private pendingVideoFrames = 0;
   private animationFrame?: number;
   private generation = 0;
   private requestedPreset: "balanced" | "clear";
@@ -384,6 +386,7 @@ class DirectEnhancementPlayback implements DirectEnhancementPlaybackController {
   private createDecoder(config: VideoDecoderConfig): VideoDecoder {
     const decoder = new VideoDecoder({
       output: (frame) => {
+        this.pendingVideoFrames = Math.max(0, this.pendingVideoFrames - 1);
         if (this.disposed || this.failed) {
           frame.close();
           return;
@@ -458,6 +461,7 @@ class DirectEnhancementPlayback implements DirectEnhancementPlaybackController {
     this.nextPacket = undefined;
     this.closeQueuedFrames();
     this.decoder.reset();
+    this.pendingVideoFrames = 0;
     this.decoder.configure(this.decoderConfig);
     const packet = await this.packetSink.getKeyPacket(Math.max(0, positionSeconds));
     if (generation !== this.generation || this.disposed) return;
@@ -543,9 +547,19 @@ class DirectEnhancementPlayback implements DirectEnhancementPlaybackController {
         && generation === this.generation
         && packet.timestamp <= target
         && this.decoder
-        && this.decoder.decodeQueueSize < MAX_DECODER_QUEUE_SIZE
+        && hasDirectEnhancementDecodeCapacity({
+          decodedFrameCount: this.frameQueue.size,
+          pendingFrameCount: this.pendingVideoFrames,
+          maximumBufferedFrames: MAX_BUFFERED_VIDEO_FRAMES
+        })
       ) {
-        this.decoder.decode(packet.toEncodedVideoChunk());
+        this.pendingVideoFrames += 1;
+        try {
+          this.decoder.decode(packet.toEncodedVideoChunk());
+        } catch (error) {
+          this.pendingVideoFrames = Math.max(0, this.pendingVideoFrames - 1);
+          throw error;
+        }
         packet = await this.packetSink!.getNextPacket(packet);
         if (generation !== this.generation || this.disposed) return;
         this.nextPacket = packet;
