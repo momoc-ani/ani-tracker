@@ -838,21 +838,21 @@ class TauriClientCore implements AppClient {
     });
   }
 
-  /** 读取 Tauri libVLC 后端能力。 */
+  /** 读取 Tauri libmpv 后端能力。 */
   async getDesktopPlayerCapabilities(): Promise<PlayerCapabilities> {
     return invoke<PlayerCapabilities>("get_desktop_player_capabilities").catch((error) => {
       throw normalizeTauriError("get_desktop_player_capabilities", error);
     });
   }
 
-  /** 向 Tauri libVLC 后端发送统一命令。 */
+  /** 向 Tauri libmpv 后端发送统一命令。 */
   async dispatchDesktopPlayerCommand(command: PlayerCommand): Promise<PlayerCommandResult> {
     return invoke<PlayerCommandResult>("dispatch_desktop_player_command", { command }).catch((error) => {
       throw normalizeTauriError("dispatch_desktop_player_command", error);
     });
   }
 
-  /** 订阅 Tauri libVLC 完整快照。 */
+  /** 订阅 Tauri libmpv 完整快照。 */
   onDesktopPlayerSnapshot(listener: (snapshot: PlayerSnapshot) => void): () => void {
     let disposed = false;
     let unlisten: UnlistenFn | undefined;

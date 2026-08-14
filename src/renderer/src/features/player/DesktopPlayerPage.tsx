@@ -53,7 +53,7 @@ interface DesktopPlayerPageProps {
   onClose: () => void;
 }
 
-/** 加载桌面播放列表，并将专用控制页连接到主进程 libVLC 后端。 */
+/** 加载桌面播放列表，并将专用控制页连接到主进程 libmpv 后端。 */
 export function DesktopPlayerPage({ taskId, initialFileIndex, onClose }: DesktopPlayerPageProps) {
   const [playlist, setPlaylist] = useState<RemotePlaylistItem[]>([]);
   const [downloadTasks, setDownloadTasks] = useState<DownloadTask[]>([]);
@@ -107,7 +107,7 @@ export function DesktopPlayerPage({ taskId, initialFileIndex, onClose }: Desktop
           });
         });
       }
-      console.info("[player] 桌面 libVLC 播放列表读取完成", {
+      console.info("[player] 桌面 libmpv 播放列表读取完成", {
         taskId,
         itemCount: items.length,
         fileIndex: initialItem.fileIndex
@@ -133,7 +133,7 @@ export function DesktopPlayerPage({ taskId, initialFileIndex, onClose }: Desktop
   }, []);
 
   return (
-    <DesktopVlcControls
+    <DesktopMpvControls
       activeItem={activeItem}
       anime={anime}
       downloadTasks={downloadTasks}
@@ -147,7 +147,7 @@ export function DesktopPlayerPage({ taskId, initialFileIndex, onClose }: Desktop
   );
 }
 
-interface DesktopVlcControlsProps {
+interface DesktopMpvControlsProps {
   activeItem: RemotePlaylistItem | null;
   anime?: Anime;
   downloadTasks: DownloadTask[];
@@ -160,7 +160,7 @@ interface DesktopVlcControlsProps {
 }
 
 /** 将播放器控制层交互映射为 preload 暴露的统一命令。 */
-function DesktopVlcControls({
+function DesktopMpvControls({
   activeItem,
   anime,
   downloadTasks,
@@ -170,7 +170,7 @@ function DesktopVlcControls({
   onClose,
   onSelectItem,
   playlist
-}: DesktopVlcControlsProps) {
+}: DesktopMpvControlsProps) {
   const toolbarTimerRef = useRef<number>();
   const activeSessionIdRef = useRef<string>();
   const commandSequenceRef = useRef(0);
@@ -242,8 +242,8 @@ function DesktopVlcControls({
       if (active) setCapabilities(result);
     }).catch((caught) => {
       if (!active) return;
-      console.error("[player] libVLC 能力读取失败", caught);
-      setPlaybackError(caught instanceof Error ? caught.message : "libVLC 能力读取失败");
+      console.error("[player] libmpv 能力读取失败", caught);
+      setPlaybackError(caught instanceof Error ? caught.message : "libmpv 能力读取失败");
     });
     return () => { active = false; };
   }, []);
@@ -265,7 +265,7 @@ function DesktopVlcControls({
     setPlaybackError(null);
     queueMicrotask(() => {
       if (!active) return;
-      console.info("[player] 正在创建桌面 libVLC 会话", {
+      console.info("[player] 正在创建桌面 libmpv 会话", {
         taskId: activeItem.task.id,
         fileIndex: activeItem.fileIndex
       });
@@ -336,7 +336,7 @@ function DesktopVlcControls({
         }
       }).catch((caught) => {
         if (!active) return;
-        console.error("[player] 桌面 libVLC 会话加载失败", {
+        console.error("[player] 桌面 libmpv 会话加载失败", {
           taskId: activeItem.task.id,
           fileIndex: activeItem.fileIndex,
           error: caught

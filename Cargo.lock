@@ -5088,6 +5088,7 @@ dependencies = [
  "ani-contracts",
  "ani-media",
  "async-trait",
+ "cc",
  "dunce",
  "libloading 0.8.9",
  "log",

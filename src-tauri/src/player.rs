@@ -22,7 +22,7 @@ use ani_repository::{DownloadRepository, MediaRepository, PlaybackRepository};
 use ani_storage::Storage;
 use chrono::{Duration as ChronoDuration, SecondsFormat, Utc};
 #[cfg(target_os = "macos")]
-use objc2_app_kit::NSWindow;
+use objc2_app_kit::{NSWindow, NSWindowOrderingMode};
 #[cfg(target_os = "macos")]
 use objc2_foundation::{NSPoint, NSRect, NSSize};
 #[cfg(desktop)]
@@ -31,7 +31,7 @@ use tauri::window::{Color, WindowBuilder};
 use tauri::LogicalPosition;
 #[cfg(desktop)]
 use tauri::Manager;
-use tauri::{AppHandle, Emitter, Runtime, Window, WindowEvent};
+use tauri::{AppHandle, Emitter, Runtime, WebviewWindow, Window, WindowEvent};
 #[cfg(desktop)]
 use tauri::{PhysicalPosition, PhysicalSize, WebviewUrl, WebviewWindowBuilder};
 use tauri_plugin_ani_player::AniPlayerExt;
@@ -243,7 +243,7 @@ impl AppPlayerState {
         ))
     }
 
-    /// 创建视频原生窗口与透明控制层，并装配当前平台 libVLC transport。
+    /// 创建视频原生窗口与透明控制层，并装配桌面 libmpv transport。
     #[cfg(desktop)]
     pub(crate) async fn open_desktop_window(
         &self,
@@ -257,14 +257,15 @@ impl AppPlayerState {
             .inner_size(PLAYER_WINDOW_WIDTH, PLAYER_WINDOW_HEIGHT)
             .min_inner_size(640.0, 360.0)
             .decorations(false)
+            .focusable(false)
             .shadow(false)
             .background_color(Color(0, 0, 0, 255))
             .visible(false)
             .build()
-            .map_err(|error| format!("创建 libVLC 视频窗口失败：{error}"))?;
+            .map_err(|error| format!("创建 MPV 视频窗口失败：{error}"))?;
         video
             .center()
-            .map_err(|error| format!("定位 libVLC 视频窗口失败：{error}"))?;
+            .map_err(|error| format!("定位 MPV 视频窗口失败：{error}"))?;
 
         let route = player_route(&input);
         let controls_builder = WebviewWindowBuilder::new(
@@ -291,11 +292,17 @@ impl AppPlayerState {
                 .ns_window()
                 .map_err(|error| format!("读取播放器父窗口 NSWindow 失败：{error}"))?,
         );
+        #[cfg(target_os = "linux")]
+        let video_gtk_window = video
+            .gtk_window()
+            .map_err(|error| format!("读取播放器父窗口 GTK Window 失败：{error}"))?;
+        #[cfg(target_os = "linux")]
+        let controls_builder = controls_builder.transient_for_raw(&video_gtk_window);
         let controls = match controls_builder.build() {
             Ok(window) => window,
             Err(error) => {
                 let _ = video.close();
-                return Err(format!("创建 libVLC 控制层失败：{error}"));
+                return Err(format!("创建 MPV 控制层失败：{error}"));
             }
         };
         #[cfg(target_os = "macos")]
@@ -305,20 +312,22 @@ impl AppPlayerState {
             .map_err(|error| format!("读取视频窗口初始位置失败：{error}"))?;
         controls
             .set_position(initial_position)
-            .map_err(|error| format!("定位 libVLC 控制层失败：{error}"))?;
+            .map_err(|error| format!("定位 MPV 控制层失败：{error}"))?;
         let controls_window = controls.as_ref().window();
         sync_video_window_bounds(&controls_window, &video)?;
 
         let target = resolve_video_target(&video)?;
         video
             .show()
-            .map_err(|error| format!("显示 libVLC 视频窗口失败：{error}"))?;
+            .map_err(|error| format!("显示 MPV 视频窗口失败：{error}"))?;
         controls
             .show()
-            .map_err(|error| format!("显示 libVLC 控制层失败：{error}"))?;
+            .map_err(|error| format!("显示 MPV 控制层失败：{error}"))?;
+        #[cfg(target_os = "macos")]
+        ensure_macos_player_window_layering(&video, &controls)?;
         controls
             .set_focus()
-            .map_err(|error| format!("聚焦 libVLC 控制层失败：{error}"))?;
+            .map_err(|error| format!("聚焦 MPV 控制层失败：{error}"))?;
 
         let controller = Arc::new(TauriPlayerWindowController {
             app: self.app.clone(),
@@ -329,6 +338,9 @@ impl AppPlayerState {
             .ani_player()
             .create_desktop_transport(target, controller);
         *self.service.write().await = Some(Arc::new(PlayerService::new(transport)));
+        controls
+            .set_focus()
+            .map_err(|error| format!("恢复 MPV 控制层焦点失败：{error}"))?;
         self.start_snapshot_polling();
         log::info!(
             "Tauri 桌面播放器窗口已打开 task_id={} file_index={:?}",
@@ -338,7 +350,7 @@ impl AppPlayerState {
         Ok(())
     }
 
-    /// 关闭桌面播放器窗口并幂等释放 libVLC。
+    /// 关闭桌面播放器窗口并幂等释放 libmpv。
     pub(crate) async fn close_desktop_window(&self) -> Result<(), String> {
         self.poll_generation.fetch_add(1, Ordering::SeqCst);
         #[cfg(desktop)]
@@ -920,8 +932,8 @@ fn sync_video_window_bounds<R: Runtime>(
     Ok(())
 }
 
-/// 按视频父窗口的物理边界同步 macOS 透明控制子窗。
-#[cfg(target_os = "macos")]
+/// 按视频宿主的物理边界同步透明控制层。
+#[cfg(desktop)]
 fn sync_controls_window_bounds<R: Runtime>(
     video: &Window<R>,
     controls: &Window<R>,
@@ -956,6 +968,64 @@ fn sync_controls_window_bounds<R: Runtime>(
     Ok(())
 }
 
+#[cfg(desktop)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VideoWindowEventAction {
+    None,
+    RestoreControlFocus,
+    SyncControlBounds,
+    CloseControlWindow,
+}
+
+#[cfg(desktop)]
+fn video_window_event_action(event: &WindowEvent) -> VideoWindowEventAction {
+    match event {
+        WindowEvent::Focused(true) => VideoWindowEventAction::RestoreControlFocus,
+        WindowEvent::Moved(_)
+        | WindowEvent::Resized(_)
+        | WindowEvent::ScaleFactorChanged { .. } => VideoWindowEventAction::SyncControlBounds,
+        WindowEvent::Destroyed => VideoWindowEventAction::CloseControlWindow,
+        _ => VideoWindowEventAction::None,
+    }
+}
+
+/// 在 AppKit 主线程显式恢复视频父窗和控制子窗层级，避免 OpenGL 窗口截获输入。
+#[cfg(target_os = "macos")]
+fn ensure_macos_player_window_layering<R: Runtime>(
+    video: &Window<R>,
+    controls: &WebviewWindow<R>,
+) -> Result<(), String> {
+    let video_window = video
+        .ns_window()
+        .map_err(|error| format!("读取播放器视频父窗失败：{error}"))?
+        as usize;
+    let controls_window = controls
+        .ns_window()
+        .map_err(|error| format!("读取播放器控制子窗失败：{error}"))?
+        as usize;
+    video
+        .run_on_main_thread(move || {
+            // SAFETY: 指针由调用期间仍存活的 Tauri 窗口持有，闭包在 AppKit 主线程执行。
+            unsafe {
+                let video_window = &*(video_window as *mut NSWindow);
+                let controls_window = &*(controls_window as *mut NSWindow);
+                match controls_window.parentWindow() {
+                    Some(parent) if std::ptr::eq(&*parent, video_window) => {}
+                    Some(parent) => {
+                        parent.removeChildWindow(controls_window);
+                        video_window
+                            .addChildWindow_ordered(controls_window, NSWindowOrderingMode::Above);
+                    }
+                    None => video_window
+                        .addChildWindow_ordered(controls_window, NSWindowOrderingMode::Above),
+                }
+                controls_window.makeKeyAndOrderFront(None);
+            }
+        })
+        .map_err(|error| format!("提交播放器窗口层级同步失败：{error}"))?;
+    Ok(())
+}
+
 /// 扣除视频窗原生边框，使其物理外框与透明控制层完全重合。
 #[cfg(desktop)]
 fn inner_size_for_outer_bounds(
@@ -986,9 +1056,9 @@ fn resolve_video_target(video: &Window) -> Result<DesktopVideoTarget, String> {
 #[cfg(target_os = "macos")]
 fn resolve_video_target(video: &Window) -> Result<DesktopVideoTarget, String> {
     video
-        .ns_view()
-        .map(|view| DesktopVideoTarget::MacOs(view as usize))
-        .map_err(|error| format!("读取播放器 NSView 失败：{error}"))
+        .ns_window()
+        .map(|window| DesktopVideoTarget::MacOs(window as usize))
+        .map_err(|error| format!("读取播放器 NSWindow 失败：{error}"))
 }
 
 #[cfg(target_os = "linux")]
@@ -1008,7 +1078,7 @@ fn resolve_video_target(video: &Window) -> Result<DesktopVideoTarget, String> {
 
 fn unavailable_capabilities(reason: String) -> PlayerCapabilities {
     PlayerCapabilities {
-        backend: PlayerBackend::Libvlc,
+        backend: PlayerBackend::Mpv,
         platform: PlayerHostPlatform::TauriDesktop,
         availability: PlayerAvailability::Unavailable,
         can_seek: false,
@@ -1149,7 +1219,7 @@ impl AppPlayerState {
         loop {
             if let Some(service) = self.service.read().await.clone() {
                 return service.capabilities().await.unwrap_or_else(|error| {
-                    unavailable_capabilities(format!("读取 libVLC 能力失败：{error}"))
+                    unavailable_capabilities(format!("读取 MPV 能力失败：{error}"))
                 });
             }
             #[cfg(desktop)]
@@ -1161,10 +1231,10 @@ impl AppPlayerState {
                 return unavailable_capabilities("播放器窗口尚未打开".to_owned());
             }
             if started_at.elapsed() >= PLAYER_SERVICE_READY_TIMEOUT {
-                return unavailable_capabilities("libVLC 初始化超时".to_owned());
+                return unavailable_capabilities("MPV 初始化超时".to_owned());
             }
             if !waiting_logged {
-                log::info!("播放器控制层正在等待 libVLC 服务初始化");
+                log::info!("播放器控制层正在等待 MPV 服务初始化");
                 waiting_logged = true;
             }
             tokio::time::sleep(PLAYER_SERVICE_READY_POLL_INTERVAL).await;
@@ -1203,24 +1273,42 @@ impl AppPlayerState {
         }
         #[cfg(desktop)]
         {
-            #[cfg(target_os = "macos")]
             if window.label() == PLAYER_VIDEO_WINDOW_LABEL {
-                if matches!(
-                    event,
-                    WindowEvent::Moved(_)
-                        | WindowEvent::Resized(_)
-                        | WindowEvent::ScaleFactorChanged { .. }
-                ) {
-                    if let Some(controls) = window
-                        .app_handle()
-                        .get_webview_window(PLAYER_CONTROL_WINDOW_LABEL)
-                    {
-                        if let Err(error) =
-                            sync_controls_window_bounds(window, &controls.as_ref().window())
-                        {
-                            log::warn!("同步 macOS 播放器控制子窗边界失败 error={error}");
+                let controls = window
+                    .app_handle()
+                    .get_webview_window(PLAYER_CONTROL_WINDOW_LABEL);
+                match video_window_event_action(event) {
+                    VideoWindowEventAction::RestoreControlFocus => {
+                        if let Some(controls) = controls {
+                            #[cfg(target_os = "macos")]
+                            if let Err(error) =
+                                ensure_macos_player_window_layering(window, &controls)
+                            {
+                                log::warn!("恢复 macOS 播放器控制层焦点失败 error={error}");
+                            }
+                            #[cfg(not(target_os = "macos"))]
+                            if let Err(error) = controls.set_focus() {
+                                log::warn!("恢复 MPV 控制层焦点失败 error={error}");
+                            }
                         }
                     }
+                    VideoWindowEventAction::SyncControlBounds => {
+                        if let Some(controls) = controls {
+                            if let Err(error) =
+                                sync_controls_window_bounds(window, &controls.as_ref().window())
+                            {
+                                log::warn!("同步播放器控制层物理边界失败 error={error}");
+                            }
+                        }
+                    }
+                    VideoWindowEventAction::CloseControlWindow => {
+                        if let Some(controls) = controls {
+                            if let Err(error) = controls.close() {
+                                log::warn!("视频宿主销毁后关闭播放器控制层失败 error={error}");
+                            }
+                        }
+                    }
+                    VideoWindowEventAction::None => {}
                 }
                 return;
             }
@@ -1233,7 +1321,7 @@ impl AppPlayerState {
                 | WindowEvent::ScaleFactorChanged { .. } => {
                     if let Some(video) = window.app_handle().get_window(PLAYER_VIDEO_WINDOW_LABEL) {
                         if let Err(error) = sync_video_window_bounds(window, &video) {
-                            log::warn!("同步 libVLC 视频窗口物理边界失败 error={error}");
+                            log::warn!("同步 MPV 视频窗口物理边界失败 error={error}");
                         }
                     }
                 }
@@ -1251,7 +1339,7 @@ impl AppPlayerState {
                             }
                             if let Some(service) = state.service.write().await.take() {
                                 if let Err(error) = service.shutdown().await {
-                                    log::warn!("播放器窗口销毁后释放 libVLC 失败 error={error}");
+                                    log::warn!("播放器窗口销毁后释放 MPV 失败 error={error}");
                                 }
                             }
                         }
@@ -1341,11 +1429,11 @@ impl AppPlayerState {
                 match service.snapshot().await {
                     Ok(Some(snapshot)) => {
                         if let Err(error) = state.app.emit(PLAYER_SNAPSHOT_EVENT, snapshot) {
-                            log::warn!("发布 libVLC 播放快照失败 error={error}");
+                            log::warn!("发布 MPV 播放快照失败 error={error}");
                         }
                     }
                     Ok(None) => {}
-                    Err(error) => log::warn!("读取 libVLC 播放快照失败 error={error}"),
+                    Err(error) => log::warn!("读取 MPV 播放快照失败 error={error}"),
                 }
             }
         });
@@ -1496,6 +1584,31 @@ mod tests {
                 PhysicalSize::new(8, 8),
             ),
             PhysicalSize::new(1, 1)
+        );
+    }
+
+    #[cfg(desktop)]
+    #[test]
+    fn maps_video_window_events_to_cross_platform_pair_actions() {
+        assert_eq!(
+            video_window_event_action(&WindowEvent::Focused(true)),
+            VideoWindowEventAction::RestoreControlFocus
+        );
+        assert_eq!(
+            video_window_event_action(&WindowEvent::Moved(PhysicalPosition::new(10, 20))),
+            VideoWindowEventAction::SyncControlBounds
+        );
+        assert_eq!(
+            video_window_event_action(&WindowEvent::Resized(PhysicalSize::new(1280, 720))),
+            VideoWindowEventAction::SyncControlBounds
+        );
+        assert_eq!(
+            video_window_event_action(&WindowEvent::Destroyed),
+            VideoWindowEventAction::CloseControlWindow
+        );
+        assert_eq!(
+            video_window_event_action(&WindowEvent::Focused(false)),
+            VideoWindowEventAction::None
         );
     }
 }

@@ -12,6 +12,21 @@ fn main() {
         link_ios_xcframework("MobileVLCKit");
         println!("cargo:rustc-link-lib=framework=SwiftUI");
     }
+
+    if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
+        build_macos_mpv_surface();
+    }
+}
+
+/// 编译只负责创建 NSOpenGLView/CGL drawable 的轻量 AppKit 桥。
+fn build_macos_mpv_surface() {
+    println!("cargo:rerun-if-changed=native/macos_mpv_surface.m");
+    cc::Build::new()
+        .file("native/macos_mpv_surface.m")
+        .flag("-fno-objc-arc")
+        .compile("ani_mpv_macos_surface");
+    println!("cargo:rustc-link-lib=framework=AppKit");
+    println!("cargo:rustc-link-lib=framework=OpenGL");
 }
 
 /// 选择当前 iOS 目标对应的 XCFramework 切片，并传递给 Rust 最终链接器。

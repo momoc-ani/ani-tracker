@@ -1,6 +1,8 @@
 use std::ffi::{c_char, c_int, c_void, CStr, CString};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
+#[cfg(target_os = "macos")]
+use std::time::{Duration, Instant};
 
 use ani_contracts::{
     PlayerAspectRatio, PlayerAvailability, PlayerBackend, PlayerCapabilities, PlayerCommand,
@@ -15,8 +17,14 @@ use libloading::Library;
 
 use crate::desktop::{DesktopVideoTarget, DesktopWindowController};
 
+#[cfg(target_os = "macos")]
+#[path = "macos_render.rs"]
+mod macos_render;
+
 const PLAYBACK_RATES: &[f64] = &[0.5, 0.75, 1.0, 1.25, 1.5, 2.0];
 const DROP_SCORE_THRESHOLD: u32 = 8;
+#[cfg(target_os = "macos")]
+const MACOS_FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(8);
 
 type MpvHandle = c_void;
 type MpvCreate = unsafe extern "C" fn() -> *mut MpvHandle;
@@ -71,6 +79,18 @@ struct MpvApi {
     wait_event: MpvWaitEvent,
     free: MpvFree,
     error_string: MpvErrorString,
+    #[cfg(target_os = "macos")]
+    render_context_create: macos_render::MpvRenderContextCreate,
+    #[cfg(target_os = "macos")]
+    render_context_set_update_callback: macos_render::MpvRenderContextSetUpdateCallback,
+    #[cfg(target_os = "macos")]
+    render_context_update: macos_render::MpvRenderContextUpdate,
+    #[cfg(target_os = "macos")]
+    render_context_render: macos_render::MpvRenderContextRender,
+    #[cfg(target_os = "macos")]
+    render_context_report_swap: macos_render::MpvRenderContextReportSwap,
+    #[cfg(target_os = "macos")]
+    render_context_free: macos_render::MpvRenderContextFree,
 }
 
 impl MpvApi {
@@ -89,6 +109,24 @@ impl MpvApi {
                 wait_event: load_mpv_symbol(&library, b"mpv_wait_event\0")?,
                 free: load_mpv_symbol(&library, b"mpv_free\0")?,
                 error_string: load_mpv_symbol(&library, b"mpv_error_string\0")?,
+                #[cfg(target_os = "macos")]
+                render_context_create: load_mpv_symbol(&library, b"mpv_render_context_create\0")?,
+                #[cfg(target_os = "macos")]
+                render_context_set_update_callback: load_mpv_symbol(
+                    &library,
+                    b"mpv_render_context_set_update_callback\0",
+                )?,
+                #[cfg(target_os = "macos")]
+                render_context_update: load_mpv_symbol(&library, b"mpv_render_context_update\0")?,
+                #[cfg(target_os = "macos")]
+                render_context_render: load_mpv_symbol(&library, b"mpv_render_context_render\0")?,
+                #[cfg(target_os = "macos")]
+                render_context_report_swap: load_mpv_symbol(
+                    &library,
+                    b"mpv_render_context_report_swap\0",
+                )?,
+                #[cfg(target_os = "macos")]
+                render_context_free: load_mpv_symbol(&library, b"mpv_render_context_free\0")?,
                 _library: library,
             })
         }
@@ -165,6 +203,13 @@ struct MpvRuntimeState {
     drop_score: u32,
     sequence: u64,
     load_pending: bool,
+    subtitles_configured: bool,
+    #[cfg(target_os = "macos")]
+    file_loaded: bool,
+    #[cfg(target_os = "macos")]
+    first_frame_started_at: Option<Instant>,
+    #[cfg(target_os = "macos")]
+    first_frame_baseline: u64,
     closed: bool,
 }
 
@@ -176,6 +221,8 @@ struct MpvRuntime {
     capabilities: PlayerCapabilities,
     shaders: ShaderResources,
     state: Mutex<MpvRuntimeState>,
+    #[cfg(target_os = "macos")]
+    macos_renderer: Mutex<Option<macos_render::MacMpvRenderer>>,
 }
 
 impl MpvRuntime {
@@ -202,6 +249,7 @@ impl MpvRuntime {
             ));
         }
         let initialize = (|| {
+            #[cfg(not(target_os = "macos"))]
             set_option(&api, handle, "wid", &video_target_id(target))?;
             for (name, value) in platform_options() {
                 set_option(&api, handle, name, value)?;
@@ -215,6 +263,24 @@ impl MpvRuntime {
             unsafe { (api.terminate_destroy)(handle) };
             return Err(error);
         }
+        #[cfg(target_os = "macos")]
+        let macos_renderer = match target {
+            DesktopVideoTarget::MacOs(view) => {
+                match macos_render::MacMpvRenderer::new(api.clone(), handle, view) {
+                    Ok(renderer) => renderer,
+                    Err(error) => {
+                        unsafe { (api.terminate_destroy)(handle) };
+                        return Err(error);
+                    }
+                }
+            }
+            _ => {
+                unsafe { (api.terminate_destroy)(handle) };
+                return Err(PlayerTransportError::Unavailable(
+                    "macOS libmpv render API 缺少 NSView 宿主".to_owned(),
+                ));
+            }
+        };
         let shaders = ShaderResources::resolve(shader_roots);
         log::info!(
             "Tauri 桌面 libmpv 初始化完成 client_api={}.{} shaders={}",
@@ -241,8 +307,17 @@ impl MpvRuntime {
                 drop_score: 0,
                 sequence: 0,
                 load_pending: false,
+                subtitles_configured: true,
+                #[cfg(target_os = "macos")]
+                file_loaded: false,
+                #[cfg(target_os = "macos")]
+                first_frame_started_at: None,
+                #[cfg(target_os = "macos")]
+                first_frame_baseline: 0,
                 closed: false,
             }),
+            #[cfg(target_os = "macos")]
+            macos_renderer: Mutex::new(Some(macos_renderer)),
         })
     }
 
@@ -306,7 +381,7 @@ impl MpvRuntime {
                 if !available {
                     return Ok(unsupported(
                         &command_id,
-                        "当前媒体、gpu-next 渲染器或显示输出未形成完整 HDR 链路",
+                        "当前媒体、MPV GPU 渲染器或显示输出未形成完整 HDR 链路",
                     ));
                 }
             }
@@ -432,6 +507,8 @@ impl MpvRuntime {
         source: PlayerMediaSource,
         start_position_seconds: Option<f64>,
     ) -> Result<(), PlayerTransportError> {
+        #[cfg(target_os = "macos")]
+        self.begin_macos_first_frame_check(state)?;
         let source_value = local_path_string(&source.uri);
         let mut args = vec!["loadfile".to_owned(), source_value, "replace".to_owned()];
         if let Some(position) = start_position_seconds {
@@ -439,16 +516,6 @@ impl MpvRuntime {
             args.push(format!("start={}", position.max(0.0)));
         }
         self.command_owned(&args)?;
-        for subtitle in &source.subtitles {
-            let flag = if subtitle.default { "select" } else { "auto" };
-            self.command(&[
-                "sub-add",
-                &local_path_string(&subtitle.uri),
-                flag,
-                &subtitle.label,
-                subtitle.language.as_deref().unwrap_or("und"),
-            ])?;
-        }
         self.set_property(
             "sub-scale",
             &format!("{:.2}", f64::from(state.subtitle_scale) / 100.0),
@@ -467,6 +534,7 @@ impl MpvRuntime {
         state.drop_score = 0;
         state.enhancement_degraded = false;
         state.load_pending = true;
+        state.subtitles_configured = false;
         state.snapshot = Some(initial_snapshot(
             session_id,
             source,
@@ -477,6 +545,24 @@ impl MpvRuntime {
             state.frame_interpolation,
         ));
         log::info!("Tauri 桌面 libmpv 已加载媒体 session_id={session_id}");
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    fn begin_macos_first_frame_check(
+        &self,
+        state: &mut MpvRuntimeState,
+    ) -> Result<(), PlayerTransportError> {
+        let renderer = self
+            .macos_renderer
+            .lock()
+            .map_err(|error| PlayerTransportError::Native(error.to_string()))?;
+        let renderer = renderer.as_ref().ok_or_else(|| {
+            PlayerTransportError::Unavailable("macOS libmpv render API 已释放".to_owned())
+        })?;
+        state.first_frame_baseline = renderer.begin_media_load()?;
+        state.first_frame_started_at = Some(Instant::now());
+        state.file_loaded = false;
         Ok(())
     }
 
@@ -564,7 +650,31 @@ impl MpvRuntime {
         let load_event = self.poll_events();
         if state.load_pending {
             match load_event {
-                Some(MpvLoadEvent::Loaded) => state.load_pending = false,
+                Some(MpvLoadEvent::Loaded) => {
+                    if !state.subtitles_configured {
+                        let source = state.active_source.clone().ok_or_else(|| {
+                            PlayerTransportError::InvalidResponse(
+                                "libmpv 文件加载完成但媒体源已丢失".to_owned(),
+                            )
+                        })?;
+                        if let Err(error) = self.configure_subtitles_after_load(&source) {
+                            state.load_pending = false;
+                            snapshot.status = PlayerStatus::Error;
+                            snapshot.error = Some(decoder_error(error.to_string()));
+                            state.snapshot = Some(snapshot);
+                            return Err(error);
+                        }
+                        state.subtitles_configured = true;
+                    }
+                    #[cfg(target_os = "macos")]
+                    {
+                        state.file_loaded = true;
+                    }
+                    #[cfg(not(target_os = "macos"))]
+                    {
+                        state.load_pending = false;
+                    }
+                }
                 Some(MpvLoadEvent::Failed(error)) => {
                     state.load_pending = false;
                     snapshot.status = PlayerStatus::Error;
@@ -573,6 +683,41 @@ impl MpvRuntime {
                     return Err(PlayerTransportError::LoadFailed(error));
                 }
                 None => {}
+            }
+        }
+        #[cfg(target_os = "macos")]
+        if state.load_pending {
+            let renderer = self
+                .macos_renderer
+                .lock()
+                .map_err(|error| PlayerTransportError::Native(error.to_string()))?;
+            let renderer = renderer.as_ref().ok_or_else(|| {
+                PlayerTransportError::Unavailable("macOS libmpv render API 已释放".to_owned())
+            })?;
+            if let Some(error) = renderer.last_error()? {
+                state.load_pending = false;
+                snapshot.status = PlayerStatus::Error;
+                snapshot.error = Some(decoder_error(error.clone()));
+                state.snapshot = Some(snapshot);
+                return Err(PlayerTransportError::LoadFailed(error));
+            }
+            if state.file_loaded && renderer.rendered_frames()? > state.first_frame_baseline {
+                state.load_pending = false;
+                state.first_frame_started_at = None;
+                log::info!("macOS libmpv 首帧已交换到原生 OpenGL 表面");
+            } else if state
+                .first_frame_started_at
+                .is_some_and(|started| started.elapsed() >= MACOS_FIRST_FRAME_TIMEOUT)
+            {
+                let error = format!(
+                    "macOS libmpv 在 8 秒内未输出首帧：{}",
+                    renderer.diagnostics()?
+                );
+                state.load_pending = false;
+                snapshot.status = PlayerStatus::Error;
+                snapshot.error = Some(decoder_error(error.clone()));
+                state.snapshot = Some(snapshot);
+                return Err(PlayerTransportError::LoadFailed(error));
             }
         }
         let position = self
@@ -610,6 +755,14 @@ impl MpvRuntime {
         snapshot.playback_rate = self.property_f64("speed").unwrap_or(1.0);
         snapshot.audio_tracks = self.read_tracks(PlayerTrackKind::Audio);
         snapshot.subtitle_tracks = self.read_tracks(PlayerTrackKind::Subtitle);
+        snapshot.enhancement_diagnostics.renderer = self
+            .property_string("current-vo")
+            .or_else(|| Some(platform_renderer_name().to_owned()));
+        snapshot.enhancement_diagnostics.decoder = self
+            .property_string("hwdec-current")
+            .filter(|decoder| decoder != "no")
+            .or_else(|| self.property_string("video-codec"))
+            .or_else(|| Some(platform_decoder_name().to_owned()));
         let hdr_capabilities = self.read_hdr_capabilities();
         snapshot.enhancement_diagnostics.hdr_capabilities = hdr_capabilities;
         snapshot.capabilities.supports_hdr = hdr_capabilities.available();
@@ -627,6 +780,77 @@ impl MpvRuntime {
         snapshot.sequence = state.sequence;
         state.snapshot = Some(snapshot);
         Ok(())
+    }
+
+    /// 在 FILE_LOADED 后添加外挂字幕，并为内封字幕显式选择中文优先的默认轨。
+    fn configure_subtitles_after_load(
+        &self,
+        source: &PlayerMediaSource,
+    ) -> Result<(), PlayerTransportError> {
+        if !source.subtitles.is_empty() {
+            let selected_index = source
+                .subtitles
+                .iter()
+                .position(|subtitle| subtitle.default)
+                .unwrap_or(0);
+            for (index, subtitle) in source.subtitles.iter().enumerate() {
+                let flag = if index == selected_index {
+                    "select"
+                } else {
+                    "auto"
+                };
+                self.command(&[
+                    "sub-add",
+                    &local_path_string(&subtitle.uri),
+                    flag,
+                    &subtitle.label,
+                    subtitle.language.as_deref().unwrap_or("und"),
+                ])?;
+            }
+            log::info!(
+                "libmpv 外挂字幕已加载 count={} selected={}",
+                source.subtitles.len(),
+                source.subtitles[selected_index].label
+            );
+            return Ok(());
+        }
+
+        let tracks = self.read_subtitle_candidates();
+        if let Some(track) = preferred_subtitle_track(&tracks) {
+            self.set_property("sid", &track.id)?;
+            log::info!(
+                "libmpv 内封字幕已默认选择 id={} language={} title={}",
+                track.id,
+                track.language.as_deref().unwrap_or("und"),
+                track.title.as_deref().unwrap_or("<untitled>")
+            );
+        } else {
+            log::info!("libmpv 当前媒体没有可用字幕轨");
+        }
+        Ok(())
+    }
+
+    fn read_subtitle_candidates(&self) -> Vec<SubtitleTrackCandidate> {
+        let count = self.property_u64("track-list/count").unwrap_or(0).min(128);
+        (0..count)
+            .filter_map(|index| {
+                let prefix = format!("track-list/{index}");
+                if self.property_string(&format!("{prefix}/type")).as_deref() != Some("sub") {
+                    return None;
+                }
+                Some(SubtitleTrackCandidate {
+                    id: self.property_string(&format!("{prefix}/id"))?,
+                    title: self.property_string(&format!("{prefix}/title")),
+                    language: self.property_string(&format!("{prefix}/lang")),
+                    default: self
+                        .property_bool(&format!("{prefix}/default"))
+                        .unwrap_or(false),
+                    forced: self
+                        .property_bool(&format!("{prefix}/forced"))
+                        .unwrap_or(false),
+                })
+            })
+            .collect()
     }
 
     fn read_hdr_capabilities(&self) -> PlayerHdrCapabilities {
@@ -849,7 +1073,17 @@ impl MpvRuntime {
             return Ok(());
         }
         state.closed = true;
+        #[cfg(target_os = "macos")]
+        let renderer_result = self
+            .macos_renderer
+            .lock()
+            .map_err(|error| PlayerTransportError::Native(error.to_string()))?
+            .take()
+            .map(macos_render::MacMpvRenderer::shutdown)
+            .transpose();
         unsafe { (self.api.terminate_destroy)(self.handle()) };
+        #[cfg(target_os = "macos")]
+        renderer_result?;
         if let Some(snapshot) = state.snapshot.as_mut() {
             snapshot.status = PlayerStatus::Closed;
             snapshot.sequence = snapshot.sequence.saturating_add(1);
@@ -857,6 +1091,66 @@ impl MpvRuntime {
         log::info!("Tauri 桌面 libmpv 已释放 target={:?}", self.target);
         Ok(())
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SubtitleTrackCandidate {
+    id: String,
+    title: Option<String>,
+    language: Option<String>,
+    default: bool,
+    forced: bool,
+}
+
+fn preferred_subtitle_track(tracks: &[SubtitleTrackCandidate]) -> Option<&SubtitleTrackCandidate> {
+    let mut best: Option<(&SubtitleTrackCandidate, i32)> = None;
+    for track in tracks {
+        let score = subtitle_track_score(track);
+        if best.is_none_or(|(_, current_score)| score > current_score) {
+            best = Some((track, score));
+        }
+    }
+    best.map(|(track, _)| track)
+}
+
+fn subtitle_track_score(track: &SubtitleTrackCandidate) -> i32 {
+    let language = track
+        .language
+        .as_deref()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase()
+        .replace('_', "-");
+    let title = track
+        .title
+        .as_deref()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    let simplified = matches!(language.as_str(), "zh-cn" | "zh-hans" | "chs" | "sc" | "cn")
+        || ["简体", "简中", "简日", "chs", "simplified"]
+            .iter()
+            .any(|marker| title.contains(marker));
+    let chinese = simplified
+        || language == "zh"
+        || language.starts_with("zh-")
+        || matches!(language.as_str(), "chi" | "zho" | "cht" | "tc")
+        || ["中文", "中字", "繁体", "繁中", "cht"]
+            .iter()
+            .any(|marker| title.contains(marker));
+    let mut score = 0;
+    if simplified {
+        score += 400;
+    } else if chinese {
+        score += 300;
+    }
+    if track.default {
+        score += 100;
+    }
+    if track.forced {
+        score -= 200;
+    }
+    score
 }
 
 impl Drop for MpvRuntime {
@@ -867,7 +1161,7 @@ impl Drop for MpvRuntime {
     }
 }
 
-/// libmpv 缺失时保留可查询能力，由桌面装配层决定是否回退 libVLC。
+/// libmpv 缺失时保留可查询能力，并向桌面页面返回结构化不可用原因。
 pub struct MpvPlayerTransport {
     runtime: Option<Arc<MpvRuntime>>,
     unavailable_reason: Option<String>,
@@ -889,7 +1183,7 @@ impl MpvPlayerTransport {
             },
             Err(error) => {
                 let message = error.to_string();
-                log::warn!("Tauri 桌面 libmpv 不可用，将尝试 libVLC error={message}");
+                log::error!("Tauri 桌面 libmpv 不可用 error={message}");
                 Self {
                     runtime: None,
                     unavailable_reason: Some(message),
@@ -1083,7 +1377,11 @@ fn platform_options() -> Vec<(&'static str, &'static str)> {
         ("hwdec", "d3d11va"),
     ];
     #[cfg(target_os = "macos")]
-    return vec![("vo", "gpu-next"), ("hwdec", "videotoolbox")];
+    return vec![
+        ("vo", "libmpv"),
+        ("gpu-hwdec-interop", "auto"),
+        ("hwdec", "videotoolbox"),
+    ];
     #[cfg(target_os = "linux")]
     return vec![
         ("vo", "gpu-next"),
@@ -1113,13 +1411,18 @@ fn set_option(
     name: &str,
     value: &str,
 ) -> Result<(), PlayerTransportError> {
-    let name = c_string(name, "mpv 选项名")?;
-    let value = c_string(value, "mpv 选项值")?;
-    ensure_mpv_success(
-        api,
-        unsafe { (api.set_option_string)(handle, name.as_ptr(), value.as_ptr()) },
-        "配置 libmpv",
-    )
+    let option_name = c_string(name, "mpv 选项名")?;
+    let option_value = c_string(value, "mpv 选项值")?;
+    let status =
+        unsafe { (api.set_option_string)(handle, option_name.as_ptr(), option_value.as_ptr()) };
+    if status >= 0 {
+        Ok(())
+    } else {
+        Err(PlayerTransportError::Native(format!(
+            "配置 libmpv 失败 option={name} value={value} status={status}：{}",
+            api.error_message(status)
+        )))
+    }
 }
 
 fn c_string(value: &str, label: &str) -> Result<CString, PlayerTransportError> {
@@ -1142,6 +1445,7 @@ fn ensure_mpv_success(
     }
 }
 
+#[cfg(not(target_os = "macos"))]
 fn video_target_id(target: DesktopVideoTarget) -> String {
     match target {
         DesktopVideoTarget::Windows(value) => value.to_string(),
@@ -1280,8 +1584,8 @@ fn initial_snapshot(
         hdr: ani_contracts::PlayerHdrMode::Off,
         enhancement_diagnostics: ani_contracts::PlayerEnhancementDiagnostics {
             pipeline,
-            renderer: Some("gpu-next".to_owned()),
-            decoder: Some("hardware-auto".to_owned()),
+            renderer: Some(platform_renderer_name().to_owned()),
+            decoder: Some(platform_decoder_name().to_owned()),
             dropped_frames: 0,
             ..Default::default()
         },
@@ -1298,10 +1602,35 @@ fn enhancement_pipeline(
     enhancement: PlayerVideoEnhancement,
 ) -> String {
     if capabilities.supports_video_enhancement && enhancement != PlayerVideoEnhancement::Off {
-        "libmpv-gpu-next-anime4k".to_owned()
+        format!("{}-anime4k", platform_renderer_pipeline())
     } else {
-        "libmpv-gpu-next".to_owned()
+        platform_renderer_pipeline().to_owned()
     }
+}
+
+fn platform_renderer_name() -> &'static str {
+    #[cfg(target_os = "macos")]
+    return "libmpv-opengl-cgl";
+    #[cfg(not(target_os = "macos"))]
+    return "gpu-next";
+}
+
+fn platform_renderer_pipeline() -> &'static str {
+    #[cfg(target_os = "macos")]
+    return "libmpv-render-api-opengl";
+    #[cfg(not(target_os = "macos"))]
+    return "libmpv-gpu-next";
+}
+
+fn platform_decoder_name() -> &'static str {
+    #[cfg(target_os = "windows")]
+    return "d3d11va";
+    #[cfg(target_os = "macos")]
+    return "videotoolbox";
+    #[cfg(target_os = "linux")]
+    return "vaapi";
+    #[allow(unreachable_code)]
+    "hardware-auto"
 }
 
 fn accepted(command_id: String) -> PlayerCommandResult {
@@ -1335,6 +1664,19 @@ mod tests {
                 ("vo", "gpu-next"),
                 ("gpu-api", "d3d11"),
                 ("hwdec", "d3d11va")
+            ]
+        );
+    }
+
+    #[test]
+    fn configures_macos_render_api_without_global_gpu_api_option() {
+        #[cfg(target_os = "macos")]
+        assert_eq!(
+            platform_options(),
+            vec![
+                ("vo", "libmpv"),
+                ("gpu-hwdec-interop", "auto"),
+                ("hwdec", "videotoolbox")
             ]
         );
     }
@@ -1386,5 +1728,55 @@ mod tests {
         assert!(is_hdr_transfer("HLG"));
         assert!(!is_hdr_transfer("bt.1886"));
         assert!(!is_hdr_transfer("srgb"));
+    }
+
+    #[test]
+    fn prefers_simplified_chinese_subtitles_over_default_english() {
+        let tracks = vec![
+            SubtitleTrackCandidate {
+                id: "1".to_owned(),
+                title: Some("English".to_owned()),
+                language: Some("eng".to_owned()),
+                default: true,
+                forced: false,
+            },
+            SubtitleTrackCandidate {
+                id: "2".to_owned(),
+                title: Some("简体中文".to_owned()),
+                language: Some("chi".to_owned()),
+                default: false,
+                forced: false,
+            },
+        ];
+
+        assert_eq!(
+            preferred_subtitle_track(&tracks).map(|track| track.id.as_str()),
+            Some("2")
+        );
+    }
+
+    #[test]
+    fn avoids_forced_sign_tracks_when_a_full_subtitle_track_exists() {
+        let tracks = vec![
+            SubtitleTrackCandidate {
+                id: "1".to_owned(),
+                title: Some("简中 Signs".to_owned()),
+                language: Some("zh-Hans".to_owned()),
+                default: true,
+                forced: true,
+            },
+            SubtitleTrackCandidate {
+                id: "2".to_owned(),
+                title: Some("简中 Full".to_owned()),
+                language: Some("zh-Hans".to_owned()),
+                default: false,
+                forced: false,
+            },
+        ];
+
+        assert_eq!(
+            preferred_subtitle_track(&tracks).map(|track| track.id.as_str()),
+            Some("2")
+        );
     }
 }

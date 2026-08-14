@@ -5,8 +5,6 @@ use tauri::{
 
 #[cfg(desktop)]
 mod desktop;
-#[cfg(desktop)]
-mod desktop_runtime;
 #[cfg(mobile)]
 mod mobile;
 #[cfg(desktop)]
