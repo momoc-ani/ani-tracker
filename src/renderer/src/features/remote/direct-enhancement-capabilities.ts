@@ -3,6 +3,7 @@ import {
   evaluateDirectEnhancementCapabilities,
   type DirectEnhancementCapabilities
 } from "@shared/direct-enhancement";
+import { verifyDirectEnhancementShader } from "./direct-enhancement-webgpu";
 
 interface BrowserVideoDecoder {
   isConfigSupported(config: {
@@ -69,6 +70,7 @@ export async function probeDirectEnhancementCapabilities(
     videoFrameAvailable: globals.VideoFrame !== undefined,
     audioDecoderAvailable: Boolean(globals.AudioDecoder?.isConfigSupported),
     audioDataAvailable: globals.AudioData !== undefined,
+    shaderAvailable: false,
     webGpuAvailable: Boolean(webGpu?.requestAdapter),
     gpuDeviceAvailable: false,
     offscreenCanvasAvailable: globals.OffscreenCanvas !== undefined,
@@ -90,6 +92,8 @@ export async function probeDirectEnhancementCapabilities(
       console.info("[remote] WebGPU 直传增强设备探测失败", { error });
     }
   }
+
+  input.shaderAvailable = await verifyDirectEnhancementShader();
 
   if (videoDecoder?.isConfigSupported) {
     for (const candidate of DIRECT_ENHANCEMENT_CODEC_CANDIDATES) {

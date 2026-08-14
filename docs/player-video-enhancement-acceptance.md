@@ -98,11 +98,11 @@ Real-ESRGAN 模型归档固定为 `v0.2.5.0/realesrgan-ncnn-vulkan-20220424-wind
 
 ## 6. WebCodecs/WebGPU 直传增强验收
 
-- F5-A 能力探测已实现并有共享单元测试，覆盖 Audio/Video WebCodecs、WebGPU 和候选 codec；F5-B 已加入受控 MP4/WebM Range demux 诊断、实际 decoder config、关键帧和绝对时钟基础。在 shader、音频样本调度和时钟接管完成前，`supportsDirectEnhancement` 必须保持 `false`。
+- F5-A 能力探测已实现并有共享单元测试，覆盖 Audio/Video WebCodecs、WebGPU、候选 codec 和内置 WGSL SHA-256；F5-B 已加入受控 MP4/WebM Range demux 诊断、实际 decoder config、关键帧和绝对时钟基础；F5-C 已加入外部 VideoFrame shader 工厂。在 shader 画布接管、音频样本调度和时钟接管完成前，`supportsDirectEnhancement` 必须保持 `false`。
 - 能力探测必须同时确认 `VideoDecoder`、`AudioDecoder`、目标 codec 的 `isConfigSupported`、WebGPU adapter/device、WGSL shader 摘要和音视频时钟；任一项失败都不能展示“直传增强已启用”。
 - 直传增强必须从原文件的 HTTP Range 读取并在终端解码，不得启动服务端 FFmpeg/模型转码进程；网络面板和服务端会话诊断必须能区分 `direct` 与 `direct-enhanced`。
 - 首批只验收 `mediabunny 1.53.1` 受控适配器支持的 MP4/WebM 组合；诊断阶段必须遵守 32 MiB 缓存、2 个并发、24 次 Range、64 MiB 累计响应和 8 秒窗口。H.265、MKV、HDR 和浏览器不支持的 codec 必须明确回退原始直传或 HLS，不能输出黑帧或假增强状态。
-- WebGPU shader 只处理视频帧，字幕和 OSD 在 shader 输出后叠加；切换字幕、字幕缩放和 ASS/VTT 不得导致文字被锐化或重复绘制。
+- WebGPU shader 只处理视频帧，当前 F5-C 工厂尚未接管现有画布；正式接管后字幕和 OSD 必须在 shader 输出后叠加，切换字幕、字幕缩放和 ASS/VTT 不得导致文字被锐化或重复绘制。
 - 连续播放 30 分钟，确认首帧、暂停/恢复、关键帧拖动、全屏、音画同步、GPU 资源释放和页面重新进入；帧预算超限时必须在 2 秒内回退原画直传。
 - Chrome/Edge、Safari macOS、Firefox（若能力未开放）分别记录 `device-passed` 或结构化回退原因；不能以桌面浏览器支持代替移动浏览器证据。
 - WGSL 必须来自应用内置资源并校验摘要，不能从远端 URL 加载可执行 shader 或模型代码。

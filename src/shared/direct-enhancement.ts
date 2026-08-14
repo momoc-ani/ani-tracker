@@ -10,6 +10,7 @@ export interface DirectEnhancementCapabilityInput {
   videoFrameAvailable: boolean;
   audioDecoderAvailable: boolean;
   audioDataAvailable: boolean;
+  shaderAvailable: boolean;
   webGpuAvailable: boolean;
   gpuDeviceAvailable: boolean;
   offscreenCanvasAvailable: boolean;
@@ -23,6 +24,7 @@ export interface DirectEnhancementCapabilities {
   supported: boolean;
   webCodecs: boolean;
   audioWebCodecs: boolean;
+  shader: boolean;
   webGpu: boolean;
   offscreenCanvas: boolean;
   mediaCapabilities: boolean;
@@ -47,6 +49,7 @@ export function evaluateDirectEnhancementCapabilities(
     && webGpu
     && input.offscreenCanvasAvailable
     && input.mediaCapabilitiesAvailable
+    && input.shaderAvailable
     && supportedCodecs.some((codec) => smoothCodecs.includes(codec));
 
   let reason: string | undefined;
@@ -60,6 +63,8 @@ export function evaluateDirectEnhancementCapabilities(
     reason = "当前浏览器未提供 OffscreenCanvas";
   } else if (!input.mediaCapabilitiesAvailable) {
     reason = "当前浏览器未提供 MediaCapabilities 解码诊断";
+  } else if (!input.shaderAvailable) {
+    reason = "应用内置 WebGPU shader 摘要校验失败";
   } else if (supportedCodecs.length === 0) {
     reason = "当前浏览器没有通过探测的直传增强视频编码";
   } else if (!supportedCodecs.some((codec) => smoothCodecs.includes(codec))) {
@@ -70,6 +75,7 @@ export function evaluateDirectEnhancementCapabilities(
     supported,
     webCodecs,
     audioWebCodecs,
+    shader: input.shaderAvailable,
     webGpu,
     offscreenCanvas: input.offscreenCanvasAvailable,
     mediaCapabilities: input.mediaCapabilitiesAvailable,

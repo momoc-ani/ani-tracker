@@ -129,6 +129,9 @@ importers:
       '@vitejs/plugin-react':
         specifier: ^4.3.2
         version: 4.7.0(vite@5.4.21(@types/node@22.20.1))
+      '@webgpu/types':
+        specifier: 0.1.61
+        version: 0.1.61
       autoprefixer:
         specifier: ^10.4.20
         version: 10.5.2(postcss@8.5.18)
@@ -1420,6 +1423,9 @@ packages:
     engines: {node: ^14.18.0 || >=16.0.0}
     peerDependencies:
       vite: ^4.2.0 || ^5.0.0 || ^6.0.0 || ^7.0.0
+
+  '@webgpu/types@0.1.61':
+    resolution: {integrity: sha512-w2HbBvH+qO19SB5pJOJFKs533CdZqxl3fcGonqL321VHkW7W/iBo6H8bjDy6pr/+pbMwIu5dnuaAxH7NxBqUrQ==}
 
   accepts@2.0.0:
     resolution: {integrity: sha512-5cvg6CtKwfgdmVqY1WIiXKc3Q1bkRqGLi+2W/6ao+6Y7gu/RCwRuAhGEzh5B4KlszSuTLgZYuqFqo5bImjNKng==}
@@ -4039,6 +4045,8 @@ snapshots:
       vite: 5.4.21(@types/node@22.20.1)
     transitivePeerDependencies:
       - supports-color
+
+  '@webgpu/types@0.1.61': {}
 
   accepts@2.0.0:
     dependencies:
