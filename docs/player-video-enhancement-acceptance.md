@@ -46,9 +46,9 @@ Real-ESRGAN 模型归档固定为 `v0.2.5.0/realesrgan-ncnn-vulkan-20220424-wind
 测试主机为 macOS `26.4.1`、Intel `x86_64`、AMD Radeon RX 6750 XT，LunarG Vulkan SDK `1.3.296.0`，Vulkan 通过 MoltenVK/Metal。
 
 - Real-ESRGAN `realesr-animevideov3-x2`：真实握手和 warmup 通过，最新实测 `24.46 ms`，满足 `33 ms` 单帧预算。
-- RIFE `rife-v4.6`：真实握手和 warmup 通过，`118.57 ms`，未满足 `16 ms` 实时预算；不能标记为实时插帧通过。
+- RIFE `rife-v4.6`：使用固定 NCNN/libwebp/glslang 提交重新构建后，真实握手和 warmup 通过，最新实测 `25.99 ms`，未满足 `16 ms` 实时预算；不能标记为实时插帧通过。
 - 上述结果只证明 Vulkan sidecar、模型加载、协议和单次推理链路，不代表 30 分钟播放、HDR、字幕、远程编码或 Windows/Linux 真机矩阵已完成。
-- RIFE 旧缓存曾使用错误 libwebp 提交；脚本现已固定并校验 NCNN、libwebp、glslang 提交，需网络恢复后重新构建并复测 RIFE 才能替换旧证据。
+- RIFE 旧缓存曾使用错误 libwebp 提交，已由固定提交的重建 bundle 和新实测结果替换。
 
 ## 3. 桌面 GPU 矩阵
 
