@@ -46,7 +46,7 @@ async function main(args) {
       : await mountPinnedIina(options, temporaryDirectory);
     if (!localSource) mountedDirectory = join(temporaryDirectory, "mount");
 
-    const sourceFiles = await collectRuntimeFiles(sourceDirectory);
+    const sourceFiles = await collectRuntimeFiles(sourceDirectory, options.arch);
     if (!sourceFiles.some((file) => basename(file) === "libmpv.2.dylib")) {
       throw new Error(`[libmpv] IINA libmpv core missing: ${sourceDirectory}`);
     }
@@ -145,6 +145,18 @@ export function parseLipoArchitectures(output) {
   return [...output.matchAll(/(?:^|\s)(x86_64|arm64)(?=\s|$)/g)].map((match) => match[1]);
 }
 
+/** 将项目架构名转换为 macOS Mach-O 工具使用的架构名。 */
+export function macosBinaryArchitecture(arch) {
+  if (arch === "x64") return "x86_64";
+  if (arch === "arm64") return "arm64";
+  throw new Error(`[libmpv] unsupported macOS architecture: ${arch}`);
+}
+
+/** 只读取目标切片的依赖，避免把另一架构的私有依赖加入运行时闭包。 */
+export function architectureScopedOtoolArgs(file, arch) {
+  return ["-arch", macosBinaryArchitecture(arch), "-L", file];
+}
+
 async function mountPinnedIina(options, temporaryDirectory) {
   const cacheDirectory = resolve(options.cacheRoot, `iina-${MACOS_LIBMPV.version}`);
   const archivePath = join(cacheDirectory, MACOS_LIBMPV.archive);
@@ -196,7 +208,7 @@ async function listDylibs(directory) {
     .sort((left, right) => basename(left).localeCompare(basename(right), "en"));
 }
 
-async function collectRuntimeFiles(directory) {
+async function collectRuntimeFiles(directory, arch) {
   const candidates = await listDylibs(directory);
   const byName = new Map(candidates.map((file) => [basename(file), file]));
   const core = byName.get("libmpv.2.dylib");
@@ -205,7 +217,8 @@ async function collectRuntimeFiles(directory) {
   const pending = [core];
   while (pending.length > 0) {
     const file = pending.shift();
-    for (const dependency of parseRpathDependencies(captureCommand("otool", ["-L", file]))) {
+    const dependencies = captureCommand("otool", architectureScopedOtoolArgs(file, arch));
+    for (const dependency of parseRpathDependencies(dependencies)) {
       if (selected.has(dependency)) continue;
       const dependencyFile = byName.get(dependency);
       if (!dependencyFile) {
@@ -219,7 +232,7 @@ async function collectRuntimeFiles(directory) {
 }
 
 function thinDylib(source, target, arch) {
-  const architecture = arch === "x64" ? "x86_64" : "arm64";
+  const architecture = macosBinaryArchitecture(arch);
   const available = parseLipoArchitectures(captureCommand("lipo", ["-archs", source]));
   if (!available.includes(architecture)) {
     throw new Error(`[libmpv] ${basename(source)} does not contain ${architecture}`);
@@ -239,7 +252,7 @@ function addLoaderRpath(file) {
 
 function validateRuntimeClosure(files, arch) {
   const names = new Set(files.map((file) => basename(file)));
-  const architecture = arch === "x64" ? "x86_64" : "arm64";
+  const architecture = macosBinaryArchitecture(arch);
   for (const file of files) {
     const architectures = parseLipoArchitectures(captureCommand("lipo", ["-archs", file]));
     if (architectures.length !== 1 || architectures[0] !== architecture) {

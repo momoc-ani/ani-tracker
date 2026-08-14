@@ -2,8 +2,10 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  architectureScopedOtoolArgs,
   createSourceManifest,
   MACOS_LIBMPV,
+  macosBinaryArchitecture,
   parseArgs,
   parseLipoArchitectures,
   parseRpathDependencies
@@ -62,4 +64,14 @@ test("兼容 fat 与 non-fat Mach-O 的 lipo 架构输出", () => {
   assert.deepEqual(parseLipoArchitectures("Non-fat file: lib.dylib is architecture: x86_64\n"), [
     "x86_64"
   ]);
+});
+
+test("按目标切片读取依赖以排除另一架构的私有 dylib", () => {
+  assert.equal(macosBinaryArchitecture("x64"), "x86_64");
+  assert.equal(macosBinaryArchitecture("arm64"), "arm64");
+  assert.deepEqual(
+    architectureScopedOtoolArgs("/runtime/libjxl.0.10.dylib", "arm64"),
+    ["-arch", "arm64", "-L", "/runtime/libjxl.0.10.dylib"]
+  );
+  assert.throws(() => macosBinaryArchitecture("riscv64"), /unsupported macOS architecture/);
 });
