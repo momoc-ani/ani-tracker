@@ -3,6 +3,7 @@ import { test } from "node:test";
 import {
   DirectEnhancementFrameQueue,
   DirectEnhancementMediaClock,
+  DirectEnhancementPerformanceMonitor,
   evaluateDirectEnhancementMediaCandidate,
   normalizeDirectEnhancementVideoCodec
 } from "../direct-enhancement-media";
@@ -42,6 +43,59 @@ test("F5-D 帧队列溢出时优先丢弃最旧帧", () => {
     { id: 2, timestampSeconds: 2 },
     { id: 3, timestampSeconds: 3 }
   ]);
+});
+
+test("F5-E 清晰档负载超限时先降到均衡档", () => {
+  const monitor = new DirectEnhancementPerformanceMonitor();
+  for (let index = 0; index < 10; index += 1) monitor.recordGpuQueueDuration(21 + index);
+
+  const result = monitor.snapshot("clear");
+  assert.equal(result.action, "degrade");
+  assert.match(result.reason ?? "", /GPU 队列 P95/);
+  assert.equal(result.gpuQueueP95Ms, 30);
+});
+
+test("F5-E 均衡档持续丢帧或音画漂移时退出增强", () => {
+  const pressure = new DirectEnhancementPerformanceMonitor();
+  for (let index = 0; index < 80; index += 1) {
+    pressure.recordPresentation(index / 24, index / 24, 1);
+  }
+  assert.equal(pressure.snapshot("balanced").action, "fallback");
+
+  const drift = new DirectEnhancementPerformanceMonitor();
+  for (let index = 0; index < 12; index += 1) {
+    drift.recordPresentation(index, index - 0.3);
+  }
+  const driftResult = drift.snapshot("clear");
+  assert.equal(driftResult.action, "fallback");
+  assert.match(driftResult.reason ?? "", /音画漂移/);
+});
+
+test("F5-E 短时压力不足以触发误降级", () => {
+  const monitor = new DirectEnhancementPerformanceMonitor();
+  for (let index = 0; index < 9; index += 1) monitor.recordGpuQueueDuration(40);
+  for (let index = 0; index < 20; index += 1) {
+    monitor.recordPresentation(index / 24, index / 24 - 0.01, 1);
+  }
+  assert.equal(monitor.snapshot("clear").action, "keep");
+});
+
+test("F5-E 帧预算随源帧率收紧且不按 GPU 品牌硬编码", () => {
+  const source24Fps = new DirectEnhancementPerformanceMonitor();
+  const source60Fps = new DirectEnhancementPerformanceMonitor();
+  for (let index = 0; index < 60; index += 1) {
+    source24Fps.recordPresentation(index / 24, index / 24);
+    source60Fps.recordPresentation(index / 60, index / 60);
+  }
+  for (let index = 0; index < 10; index += 1) {
+    source24Fps.recordGpuQueueDuration(14);
+    source60Fps.recordGpuQueueDuration(14);
+  }
+
+  assert.equal(source24Fps.snapshot("balanced").action, "keep");
+  assert.equal(source60Fps.snapshot("balanced").action, "fallback");
+  assert.equal(Math.round(source24Fps.snapshot("balanced").frameBudgetMs * 10) / 10, 33.3);
+  assert.equal(Math.round(source60Fps.snapshot("balanced").frameBudgetMs * 10) / 10, 13.3);
 });
 
 test("F5-B 拒绝 MKV、H.265 和 WebM/H.264", () => {

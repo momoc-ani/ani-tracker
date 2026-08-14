@@ -853,7 +853,11 @@ export function RemoteVideoPlayer({
   const statusBadges = [
     session?.mode === "hls" ? "实时转码" : session ? "原文件直传" : undefined,
     directEnhancementStatus === "active"
-      ? `终端增强 ${directEnhancementPreset === "clear" ? "清晰" : "均衡"}`
+      ? `终端增强 ${
+        (directEnhancementDiagnostics?.effectivePreset ?? directEnhancementPreset) === "clear"
+          ? "清晰"
+          : "均衡"
+      }`
       : directEnhancementStatus === "probing" || directEnhancementStatus === "starting"
         ? "终端增强准备中"
         : directEnhancementStatus === "degraded"
@@ -900,7 +904,14 @@ export function RemoteVideoPlayer({
         className="player-video-stage"
         aria-label={`${animeTitle} ${episodeLabel} 视频播放器`}
         data-direct-enhancement-active={directEnhancementStatus === "active" ? "true" : undefined}
-        data-direct-enhancement-degradation={directEnhancementDegradationReason}
+        data-direct-enhancement-av-drift-ms={directEnhancementDiagnostics?.currentAvDriftMs}
+        data-direct-enhancement-degradation={
+          directEnhancementDegradationReason ?? directEnhancementDiagnostics?.degradationReason
+        }
+        data-direct-enhancement-drop-ratio={directEnhancementDiagnostics?.droppedFrameRatio}
+        data-direct-enhancement-effective-preset={directEnhancementDiagnostics?.effectivePreset}
+        data-direct-enhancement-frame-budget-ms={directEnhancementDiagnostics?.frameBudgetMs}
+        data-direct-enhancement-gpu-p95-ms={directEnhancementDiagnostics?.gpuQueueP95Ms}
         data-direct-enhancement-rendered-frames={directEnhancementDiagnostics?.renderedFrames}
         data-direct-enhancement-status={directEnhancementStatus}
         data-remote-fullscreen={environment === "remote" ? remoteFullscreenMode ?? undefined : undefined}
@@ -993,6 +1004,11 @@ export function RemoteVideoPlayer({
           videoEnhancementAvailable={requestedMode === "transcode" || directEnhancementAvailable}
           videoEnhancementDegraded={requestedMode === "direct"
             ? directEnhancementStatus === "degraded"
+              || Boolean(directEnhancementDiagnostics?.degradationReason)
+              || Boolean(
+                directEnhancementDiagnostics
+                && directEnhancementDiagnostics.effectivePreset !== directEnhancementPreset
+              )
             : Boolean(sessionDiagnostics?.degradationReason)}
           visible={toolbarVisible}
           volume={volume}

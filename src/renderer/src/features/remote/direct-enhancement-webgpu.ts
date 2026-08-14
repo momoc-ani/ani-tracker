@@ -54,7 +54,9 @@ fn fragment(input: VertexOutput) -> @location(0) vec4<f32> {
 const DIRECT_ENHANCEMENT_WGSL_SHA256 = "2d01d34bcf4bd5958b0e25d4146b451ff7546ed3dc0f0899fa1bed8d7a48a957";
 
 export interface DirectEnhancementWebGpuRenderer {
+  readonly deviceLost: Promise<GPUDeviceLostInfo>;
   render(frame: VideoFrame, strength?: number): void;
+  waitForSubmittedWork(): Promise<void>;
   dispose(): void;
 }
 
@@ -107,6 +109,7 @@ export async function createDirectEnhancementWebGpuRenderer(
   const layout = pipeline.getBindGroupLayout(0);
 
   return {
+    deviceLost: device.lost,
     render(frame, strength = 0.35) {
       const width = Math.max(1, frame.displayWidth || frame.codedWidth);
       const height = Math.max(1, frame.displayHeight || frame.codedHeight);
@@ -139,6 +142,9 @@ export async function createDirectEnhancementWebGpuRenderer(
       pass.draw(6);
       pass.end();
       device.queue.submit([encoder.finish()]);
+    },
+    waitForSubmittedWork() {
+      return device.queue.onSubmittedWorkDone();
     },
     dispose() {
       context.unconfigure?.();

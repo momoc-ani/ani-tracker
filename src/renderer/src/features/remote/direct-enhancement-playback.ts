@@ -1,6 +1,7 @@
 import { EncodedPacketSink, MP4, type EncodedPacket } from "mediabunny";
 import {
   DirectEnhancementFrameQueue,
+  DirectEnhancementPerformanceMonitor,
   evaluateDirectEnhancementMediaCandidate
 } from "@shared/direct-enhancement-media";
 import {
@@ -14,6 +15,7 @@ import {
 
 const DECODE_AHEAD_SECONDS = 2;
 const FIRST_FRAME_TIMEOUT_MS = 8_000;
+const GPU_QUEUE_SAMPLE_INTERVAL_FRAMES = 30;
 const MAX_DECODER_QUEUE_SIZE = 8;
 const MAX_PLAYBACK_RANGE_REQUESTS = 4_096;
 
@@ -27,8 +29,15 @@ export interface DirectEnhancementPlaybackDiagnostics {
   renderedFrames: number;
   droppedFrames: number;
   decoderQueueSize: number;
+  droppedFrameRatio: number;
+  frameBudgetMs: number;
+  currentAvDriftMs: number;
+  maximumAvDriftMs: number;
+  requestedPreset: "balanced" | "clear";
+  effectivePreset: "balanced" | "clear";
   rangeRequestCount: number;
   receivedRangeBytes: number;
+  gpuQueueP95Ms?: number;
   degradationReason?: string;
 }
 
@@ -66,6 +75,7 @@ export async function createDirectEnhancementPlayback(
 
 class DirectEnhancementPlayback implements DirectEnhancementPlaybackController {
   private readonly frameQueue = new DirectEnhancementFrameQueue<QueuedVideoFrame>(8);
+  private readonly performanceMonitor = new DirectEnhancementPerformanceMonitor();
   private readonly mediaInput;
   private readonly telemetry: DirectEnhancementRangeTelemetry;
   private decoder?: VideoDecoder;
@@ -76,14 +86,21 @@ class DirectEnhancementPlayback implements DirectEnhancementPlaybackController {
   private decodePump?: Promise<void>;
   private animationFrame?: number;
   private generation = 0;
-  private preset: "balanced" | "clear";
+  private requestedPreset: "balanced" | "clear";
+  private effectivePreset: "balanced" | "clear";
   private renderedFrames = 0;
   private droppedFrames = 0;
+  private droppedSincePresentation = 0;
   private disposed = false;
   private failed = false;
   private awaitingPresentedFrame = true;
+  private awaitingPresentedSinceMs = performance.now();
+  private lastPresentedAtMs?: number;
+  private lastPresentedMediaTimeSeconds?: number;
+  private gpuQueueSamplePending = false;
   private readySettled = false;
   private failureError?: Error;
+  private automaticDegradationReason?: string;
   private lastDiagnosticsPublishedAt = 0;
   private readonly readyPromise: Promise<void>;
   private readonly resolveReady: () => void;
@@ -100,7 +117,8 @@ class DirectEnhancementPlayback implements DirectEnhancementPlaybackController {
     });
     this.mediaInput = handle.input;
     this.telemetry = handle.telemetry;
-    this.preset = options.preset;
+    this.requestedPreset = options.preset;
+    this.effectivePreset = options.preset;
   }
 
   async initialize(): Promise<void> {
@@ -144,6 +162,14 @@ class DirectEnhancementPlayback implements DirectEnhancementPlaybackController {
       this.throwIfStopped();
     }
     this.renderer = renderer;
+    void renderer.deviceLost.then((info) => {
+      if (this.disposed) return;
+      this.fail(new Error(
+        info.message
+          ? `WebGPU 设备已丢失：${info.message}`
+          : `WebGPU 设备已丢失：${info.reason}`
+      ));
+    });
     this.packetSink = new EncodedPacketSink(videoTrack);
     this.decoderConfig = config;
     this.decoder = this.createDecoder(config);
@@ -157,19 +183,33 @@ class DirectEnhancementPlayback implements DirectEnhancementPlaybackController {
   }
 
   setPreset(preset: "balanced" | "clear"): void {
-    this.preset = preset;
+    this.requestedPreset = preset;
+    this.effectivePreset = preset;
+    this.automaticDegradationReason = undefined;
+    this.performanceMonitor.resetLoadWindow();
+    this.publishDiagnostics(undefined, true);
   }
 
   getDiagnostics(): DirectEnhancementPlaybackDiagnostics {
+    const performanceSnapshot = this.performanceMonitor.snapshot(this.effectivePreset);
     return {
       active: !this.disposed && !this.failed,
       renderedFrames: this.renderedFrames,
       droppedFrames: this.droppedFrames,
       decoderQueueSize: this.decoder?.decodeQueueSize ?? 0,
+      droppedFrameRatio: performanceSnapshot.droppedFrameRatio,
+      frameBudgetMs: performanceSnapshot.frameBudgetMs,
+      currentAvDriftMs: performanceSnapshot.currentAvDriftMs,
+      maximumAvDriftMs: performanceSnapshot.maximumAvDriftMs,
+      requestedPreset: this.requestedPreset,
+      effectivePreset: this.effectivePreset,
       rangeRequestCount: this.telemetry.rangeRequestCount,
       receivedRangeBytes: this.telemetry.receivedRangeBytes,
-      ...(this.failed ? {
-        degradationReason: this.failureError?.message ?? "WebCodecs/WebGPU 视频循环已失败"
+      ...(performanceSnapshot.gpuQueueP95Ms === undefined
+        ? {}
+        : { gpuQueueP95Ms: performanceSnapshot.gpuQueueP95Ms }),
+      ...(this.failureError || this.automaticDegradationReason ? {
+        degradationReason: this.failureError?.message ?? this.automaticDegradationReason
       } : {})
     };
   }
@@ -207,6 +247,7 @@ class DirectEnhancementPlayback implements DirectEnhancementPlaybackController {
           timestampSeconds: frame.timestamp / 1_000_000
         });
         this.droppedFrames += discarded.length;
+        if (!this.awaitingPresentedFrame) this.droppedSincePresentation += discarded.length;
         discarded.forEach((item) => item.frame.close());
       },
       error: (error) => this.fail(error)
@@ -247,6 +288,10 @@ class DirectEnhancementPlayback implements DirectEnhancementPlaybackController {
     if (this.disposed || this.failed || !this.packetSink || !this.decoder || !this.decoderConfig) return;
     const generation = ++this.generation;
     this.awaitingPresentedFrame = true;
+    this.awaitingPresentedSinceMs = performance.now();
+    this.lastPresentedAtMs = undefined;
+    this.lastPresentedMediaTimeSeconds = undefined;
+    this.droppedSincePresentation = 0;
     this.nextPacket = undefined;
     this.closeQueuedFrames();
     this.decoder.reset();
@@ -269,13 +314,45 @@ class DirectEnhancementPlayback implements DirectEnhancementPlaybackController {
     const positionSeconds = Math.max(0, this.options.mediaElement.currentTime || 0);
     const selection = this.frameQueue.take(positionSeconds);
     this.droppedFrames += selection.discarded.length;
+    if (!this.awaitingPresentedFrame) {
+      this.droppedSincePresentation += selection.discarded.length;
+    }
     selection.discarded.forEach((item) => item.frame.close());
-    if (selection.frame && this.renderer) {
+    const selectedFrameDriftMs = selection.frame
+      ? Math.abs(positionSeconds - selection.frame.timestampSeconds) * 1_000
+      : 0;
+    if (selection.frame && selectedFrameDriftMs > 250) {
+      this.droppedFrames += 1;
+      if (!this.awaitingPresentedFrame) {
+        this.droppedSincePresentation += 1;
+        this.performanceMonitor.recordClockDrift(
+          positionSeconds,
+          selection.frame.timestampSeconds
+        );
+        this.applyPerformanceRecommendation();
+      }
+      selection.frame.frame.close();
+    } else if (selection.frame && this.renderer) {
       try {
-        this.renderer.render(selection.frame.frame, this.preset === "clear" ? 0.5 : 0.3);
+        this.renderer.render(
+          selection.frame.frame,
+          this.effectivePreset === "clear" ? 0.5 : 0.3
+        );
         this.renderedFrames += 1;
         this.awaitingPresentedFrame = false;
+        this.lastPresentedAtMs = performance.now();
+        this.lastPresentedMediaTimeSeconds = positionSeconds;
+        this.performanceMonitor.recordPresentation(
+          positionSeconds,
+          selection.frame.timestampSeconds,
+          this.droppedSincePresentation
+        );
+        this.droppedSincePresentation = 0;
         this.settleReady();
+        this.applyPerformanceRecommendation();
+        if (this.renderedFrames % GPU_QUEUE_SAMPLE_INTERVAL_FRAMES === 0) {
+          this.sampleGpuQueueLatency();
+        }
       } catch (error) {
         this.fail(error);
       } finally {
@@ -283,6 +360,7 @@ class DirectEnhancementPlayback implements DirectEnhancementPlaybackController {
       }
     }
     void this.ensureDecodeWindow(this.generation);
+    this.checkFrameStarvation(positionSeconds);
     this.publishDiagnostics();
     if (
       this.awaitingPresentedFrame
@@ -320,6 +398,59 @@ class DirectEnhancementPlayback implements DirectEnhancementPlaybackController {
 
   private closeQueuedFrames(): void {
     this.frameQueue.clear().forEach((item) => item.frame.close());
+  }
+
+  private sampleGpuQueueLatency(): void {
+    const renderer = this.renderer;
+    if (!renderer || this.gpuQueueSamplePending || this.disposed || this.failed) return;
+    this.gpuQueueSamplePending = true;
+    const startedAt = performance.now();
+    void renderer.waitForSubmittedWork()
+      .then(() => {
+        if (this.disposed || this.failed) return;
+        this.performanceMonitor.recordGpuQueueDuration(performance.now() - startedAt);
+        this.applyPerformanceRecommendation();
+        this.publishDiagnostics(undefined, true);
+      })
+      .catch((error) => this.fail(error))
+      .finally(() => {
+        this.gpuQueueSamplePending = false;
+      });
+  }
+
+  private applyPerformanceRecommendation(): void {
+    const recommendation = this.performanceMonitor.snapshot(this.effectivePreset);
+    if (recommendation.action === "keep") return;
+    if (recommendation.action === "degrade" && this.effectivePreset === "clear") {
+      this.effectivePreset = "balanced";
+      this.automaticDegradationReason = recommendation.reason ?? "清晰档超过实时帧预算";
+      this.performanceMonitor.resetLoadWindow();
+      this.publishDiagnostics(undefined, true);
+      console.info("[remote] F5-E 直传增强已自动降为均衡档", {
+        reason: this.automaticDegradationReason
+      });
+      return;
+    }
+    this.fail(new Error(recommendation.reason ?? "直传增强超过实时帧预算"));
+  }
+
+  private checkFrameStarvation(positionSeconds: number): void {
+    if (this.disposed || this.failed) return;
+    const now = performance.now();
+    if (this.awaitingPresentedFrame) {
+      if (now - this.awaitingPresentedSinceMs > FIRST_FRAME_TIMEOUT_MS) {
+        this.fail(new Error("关键帧拖动后 8 秒内未恢复增强画面"));
+      }
+      return;
+    }
+    if (
+      this.lastPresentedAtMs !== undefined
+      && this.lastPresentedMediaTimeSeconds !== undefined
+      && positionSeconds - this.lastPresentedMediaTimeSeconds > 0.5
+      && now - this.lastPresentedAtMs > 2_000
+    ) {
+      this.fail(new Error("媒体时钟持续前进但增强画面超过 2 秒没有更新"));
+    }
   }
 
   private fail(caught: unknown): void {
