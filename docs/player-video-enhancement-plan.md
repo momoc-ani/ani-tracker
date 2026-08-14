@@ -1,6 +1,6 @@
 # PC 内置播放器与画质增强执行计划
 
-> 当前实现边界（2026-08-14）：桌面 Windows/Linux 已接入 libmpv、gpu-next、硬解路径、Anime4K Shader、字幕后合成、掉帧自动降级和 libVLC 回退。远程 HLS 已按 NVENC/AMF/QSV/libx264 探测普通转码编码器；模型链已接入 RIFE 插帧和 Real-ESRGAN 2x 动画超分，采用 `FFmpeg RGB24 解码 -> 可选 RIFE -> 可选 Real-ESRGAN -> FFmpeg 编码`，并通过受认证会话诊断报告实际模型与降级原因。RIFE 已增加按源帧率、模型滚动 P95、显存、60 FPS 输出上限、80% 利用率和 5 ms 链路余量计算的容量门禁，当前协议因 timestep 固定为 `0.5` 而硬限制为 2x；运行时超预算会关闭模型并维持既定时间轴。macOS Intel + AMD RX 6750 XT + MoltenVK 已完成真实 sidecar 握手：Real-ESRGAN 最新 warmup `24.46 ms`；RIFE 最新 warmup `25.99 ms`。这些低分辨率 warmup 只可作为启动样本，真实分辨率滚动 P95 和完整播放矩阵未通过前不能标记为实时插帧验收通过。本地 libmpv 模型链、HDR 原生输出和跨 GPU 真机证据仍未完成。
+> 当前实现边界（2026-08-14）：桌面 Windows/Linux/macOS 已统一使用 libmpv，接入 gpu-next/Render API、平台硬解路径、Anime4K Shader、字幕后合成、掉帧自动降级和双窗口同步；PC 播放路径不再保留 libVLC。远程 HLS 已按 NVENC/AMF/QSV/libx264 探测普通转码编码器；模型链已接入 RIFE 插帧和 Real-ESRGAN 2x 动画超分，采用 `FFmpeg RGB24 解码 -> 可选 RIFE -> 可选 Real-ESRGAN -> FFmpeg 编码`，并通过受认证会话诊断报告实际模型与降级原因。RIFE 已增加按源帧率、模型滚动 P95、显存、60 FPS 输出上限、80% 利用率和 5 ms 链路余量计算的容量门禁，当前协议因 timestep 固定为 `0.5` 而硬限制为 2x；运行时超预算会关闭模型并维持既定时间轴。macOS Intel + AMD RX 6750 XT + MoltenVK 已完成真实 sidecar 握手：Real-ESRGAN 最新 warmup `24.46 ms`；RIFE 最新 warmup `25.99 ms`。这些低分辨率 warmup 只可作为启动样本，真实分辨率滚动 P95 和完整播放矩阵未通过前不能标记为实时插帧验收通过。本地 libmpv 模型链、HDR 原生输出和跨 GPU 真机证据仍未完成。
 
 正式模型包、HDR、远程输出和真实 GPU 的逐项执行与证据要求见 [播放器终版发布验收清单](./player-video-enhancement-acceptance.md)。
 
@@ -12,7 +12,7 @@
 本地视频 -> libmpv 硬件解码 -> gpu-next -> Anime4K shader -> 字幕/OSD -> 原生窗口
 ```
 
-迁移期只运行一个 PC 播放内核：Windows 与 Linux 优先初始化 libmpv；动态库缺失、初始化失败或首次加载失败时，释放 libmpv 后回退到现有 libVLC。macOS 首版继续使用已经完成窗口实机验证的 libVLC，下一阶段通过 libmpv render API + Metal 接入，不能使用官方未承诺的 NSView `wid` 嵌入。Android、iOS 和远程 Web 播放器继续使用原实现。
+PC 播放路径只运行 libmpv：Windows 使用原生 HWND `wid`、D3D11 和 D3D11VA，Linux 使用 X11/XWayland、Vulkan 和 VAAPI，macOS 使用原生 Render API 表面；不把 macOS 的 `wid` 嵌入限制扩散到其他平台。动态库或初始化失败时报告结构化错误，不能偷偷启动第二个 PC 播放内核。Android、iOS 和远程 Web 播放器继续使用各自的实现。
 
 最终本地链路：
 
@@ -25,6 +25,12 @@
 ```text
 输入 -> FFmpeg RGB24 解码 -> 可选 RIFE -> 可选 Real-ESRGAN 2x -> FFmpeg 编码 -> HLS -> 远程播放器
 ```
+
+远程增强的模式边界：
+
+- `direct` 只传输原文件，远端服务不解码视频像素，因此不能执行 Anime4K、FFmpeg 画质滤镜、Real-ESRGAN 或 RIFE；增强字段必须保持关闭。
+- `transcode` 在主机侧解码并重新编码为 HLS，才可以执行 FFmpeg 滤镜或模型帧管线。后端会再次校验模式，伪造直传增强请求会被拒绝。
+- 这不是浏览器本地 GPU 增强。未来若接入 WebGPU/WebCodecs 或 wasm shader，才可以另建“直传 + 终端增强”路径；该路径不应与当前服务端转码模型链混用。
 
 目标远程链路：
 
@@ -60,7 +66,7 @@ cost(m) = (m - 1) * rife_p95_ms
 
 更高刷新率显示器不直接提高 AI 倍率。首选输出 48/50/60 FPS 后由显示链做轻量帧呈现；本地 libmpv 可用 `display-resample` 作为低成本兜底，远程可选择 FFmpeg `minterpolate` 的 60 FPS 运动补偿。未来只有在任意 timestep 协议、场景切换检测、真实 P95 和质量矩阵全部完成后，才开放 3x；4x 及以上优先作为离线转码档位，不作为实时默认。
 
-普通 HLS 已按 NVIDIA NVENC、AMD AMF、Intel QSV 选择，全部不可用时回退 libx264。模型 rawvideo 链当前使用 libx264，接入跨厂商硬件编码和对应真机证据仍属于后续发布门禁。
+普通 HLS 与模型 rawvideo 链都按 NVIDIA NVENC、AMD AMF、Intel QSV 选择，全部不可用时回退 libx264。模型链当前使用探测通过的首个编码器；跨厂商真机证据和模型编码器逐候选重试仍属于后续发布门禁。
 
 ## 首版阶段
 
@@ -70,14 +76,14 @@ cost(m) = (m - 1) * rife_p95_ms
 - 动态加载 libmpv C API，不让 Rust 编译依赖具体 GPU SDK。
 - 保留现有视频窗口和透明控制窗口结构，以及 macOS 全屏、最大化和拖动同步。
 - 覆盖加载、播放/暂停、跳转、音量/静音、倍速、音轨、字幕轨、字幕大小、画面比例、快照、重试和关闭。
-- 首次加载失败时自动释放 libmpv 并回退 libVLC；回退后快照能力同步到前端。
+- 首次加载失败时释放 libmpv 并返回结构化错误；前端显示可恢复的重试/关闭动作。
 
-验收：现有播放器功能无回归，单次会话不会同时运行 libmpv 和 libVLC。
+验收：现有播放器功能无回归，单次会话只运行 libmpv。
 
 ### P1：跨厂商 GPU 路径
 
 - Windows：`gpu-next + d3d11 + d3d11va`，覆盖 NVIDIA、AMD、Intel。
-- macOS 首版：维持 libVLC + VideoToolbox；下一阶段使用 libmpv render API + Metal，不能把 `wid` 当作已支持能力。
+- macOS：libmpv Render API 原生表面 + VideoToolbox；不得把 `wid` 当作 macOS 原生渲染能力。
 - Linux：`gpu-next + vulkan + vaapi`，首版窗口继续使用 X11/XWayland，并由系统 `libmpv1` 提供运行时。
 - 不引入 CUDA、TensorRT 或任何单一显卡厂商作为必需依赖。
 
@@ -111,7 +117,7 @@ cost(m) = (m - 1) * rife_p95_ms
 - 实机矩阵：Windows NVIDIA/AMD/Intel、Apple Silicon/Intel macOS、Linux AMD/Intel/NVIDIA。
 - 完成矩阵后，将 libmpv 从可选资源提升为发布必需资源。
 
-验收：Windows 安装包在未安装 mpv/IINA/VLC 的干净系统启动；Linux DEB/RPM 由包管理器补齐 libmpv，AppImage 在宿主缺少 libmpv 时回退 libVLC；回退路径至少保留一个稳定版。
+验收：Windows 安装包在未安装 mpv/IINA/VLC 的干净系统启动；Linux DEB/RPM 由包管理器补齐 libmpv，AppImage 明确报告缺少 libmpv 的安装错误；不再维护桌面 libVLC 回退路径。
 
 ## 最终阶段
 
@@ -123,7 +129,7 @@ cost(m) = (m - 1) * rife_p95_ms
 4. **模型插帧适配器**：独立 `FrameInterpolator` 端口和 RIFE `rife-v4.6` 已接入远程链；使用有界双帧队列，运行失败后重复帧维持双倍输出帧率和原始时长，字幕不得进入模型输入。
 5. **HDR 能力**：同时满足源视频色彩元数据、渲染器和显示器能力后才开启；不满足条件时保持 SDR，不用滤镜伪装 HDR。
 6. **远程增强输出**：基础 HLS 已按 NVENC/AMF/QSV/libx264 探测并报告降级；RIFE 与 Real-ESRGAN 已进入独立 rawvideo 管线，音轨和软字幕不经过模型，实际模型后端与运行时降级通过 2 秒诊断轮询展示。模型链硬件编码、终端字幕能力探测和断线恢复仍待增强。
-7. **双版本稳定期**：至少两个版本完成 Windows NVIDIA/AMD/Intel、macOS Apple Silicon/Intel、Linux AMD/Intel/NVIDIA 的基础播放与 Shader 矩阵后，才评估移除桌面 libVLC。
+7. **跨平台稳定期**：至少两个版本完成 Windows NVIDIA/AMD/Intel、macOS Apple Silicon/Intel、Linux AMD/Intel/NVIDIA 的基础播放与 Shader 矩阵后，才将 libmpv 标记为稳定发布后端。
 
 ### 终版能力开关规则
 
@@ -148,7 +154,7 @@ cost(m) = (m - 1) * rife_p95_ms
 - Windows/Linux Release Runner 的真实 RIFE、Real-ESRGAN Vulkan 构建、握手、warmup 和帧耗时证据；macOS 已完成 sidecar 级别验证，但尚未完成 30 分钟播放矩阵。
 - 解码、模型 rawvideo 编码的独立 P95，显示刷新率/终端 FPS 上限探测，以及按分辨率和 GPU 缓存的容量基线；当前远程门禁使用 80% 利用率和 5 ms 固定余量保守覆盖未拆分成本。
 - RIFE 任意 timestep 协议、场景切换检测和 3x 质量矩阵；完成前实时 AI 硬上限保持 2x，4x 及以上只评估离线转码。
-- 模型 rawvideo 链的 NVENC/AMF/QSV 编码、终端字幕能力探测、自适应码率和断线恢复。
+- 模型 rawvideo 链的跨厂商真机证据、逐候选编码器重试、终端字幕能力探测、自适应码率和断线恢复。
 - libmpv render API + Metal 的 macOS 原生输出。
 - HDR 源元数据、渲染器、显示器能力探测和原生输出。
 - Windows NVIDIA/AMD/Intel、macOS、Linux 真机矩阵与两个正式版本稳定期。
@@ -157,12 +163,12 @@ cost(m) = (m - 1) * rife_p95_ms
 
 | 阶段 | 代码状态 | 发布验收状态 |
 | --- | --- | --- |
-| 首版 P0-P3 | 已完成：libmpv/libVLC 单内核切换、跨厂商硬解配置、Anime4K、字幕后合成和掉帧降级 | macOS 仍使用 libVLC；各平台真机需持续回归 |
+| 首版 P0-P3 | 已完成：libmpv 单内核、跨厂商硬解配置、Anime4K、字幕后合成和掉帧降级 | 各平台真机需持续回归 |
 | 首版 P4 | 已完成发布资源门禁和实机矩阵声明 | Windows/AMD/NVIDIA/Intel、macOS、Linux 实机结果待采集 |
 | 终版 F1 | 已完成能力、诊断、按源帧率/滚动 P95/显存/输出上限计算的 2x 容量门禁、权重/可执行文件摘要校验和安全降级契约 | 真实 GPU 显存值仍使用配置预算；解码/编码 P95 和真机数据待采集 |
 | 终版 F2 | 已完成 RIFE 与 Real-ESRGAN 端口、长驻 sidecar、内存帧协议、2x 固定尺寸回退、双倍帧率时间轴保护和运行时 P95 降级；固定提交和子模块校验已接入 | macOS 两个模型的低分辨率 warmup 已通过；真实分辨率完整链路尚未达到发布验收，本地播放器模型链、HDR 原生输出待完成 |
 | 终版 F3 | 已完成普通 HLS 编码器回退、远程 RIFE + Real-ESRGAN rawvideo 管线、独立音轨/软字幕和受认证诊断刷新 | 模型链硬件编码、终端字幕探测、断线恢复和跨厂商证据待完成 |
-| 终版 F4 | 删除条件和双版本稳定门槛已固化 | 必须经过两个正式版本，不在当前阶段删除 libVLC |
+| 终版 F4 | PC libVLC 已从播放器、安装包和工作流移除 | 仍需两个正式版本完成跨平台真机矩阵，确认 libmpv 发布稳定性 |
 
 ### F1：能力调度层
 
@@ -182,15 +188,15 @@ cost(m) = (m - 1) * rife_p95_ms
 - 基础 HLS 已使用独立编码器探测；RIFE 与 Real-ESRGAN 处理内存 RGB24 帧，字幕保持独立软字幕，不进入模型输入。
 - 当前固定软字幕；按终端能力选择烧录字幕仍待实现。
 - 自适应码率、断线恢复、延迟模式和带宽探测纳入远程会话契约。
-- 目标模型链按 NVENC/AMF/QSV 选择，最后回退 libx264，并在会话诊断中标记降级；当前模型 rawvideo 链固定 libx264。
+- 模型链按 NVENC/AMF/QSV 选择，最后回退 libx264，并在会话诊断中标记实际编码器；当前使用探测通过的首个候选，后续补齐逐候选启动重试。
 
-### F4：移除 PC libVLC
+### F4：PC libmpv 稳定发布
 
-只有在以下条件全部满足后删除桌面 libVLC：
+PC libVLC 已不再属于播放器、安装包或桌面工作流。剩余发布门禁是：
 
 - libmpv 发布资源在全部桌面架构稳定可重定位。
 - 基础播放与增强实机矩阵连续两个版本通过。
 - 崩溃率、初始化失败率和首帧时间达到既定门槛。
-- 回退遥测显示不再依赖 libVLC 处理常见媒体。
+- 缺失资源和初始化失败均有结构化错误与可恢复操作。
 
-移动端 libVLC 不受此删除计划影响。
+移动端 libVLC 不受此 PC 播放器迁移影响。

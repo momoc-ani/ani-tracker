@@ -62,11 +62,11 @@ Real-ESRGAN 模型归档固定为 `v0.2.5.0/realesrgan-ncnn-vulkan-20220424-wind
 | Windows | x64 | NVIDIA | D3D11、D3D11VA、gpu-next、Anime4K、字幕后合成 |
 | Windows | x64 | AMD | D3D11、D3D11VA、gpu-next、Anime4K、字幕后合成 |
 | Windows | x64 | Intel | D3D11、D3D11VA、gpu-next、Anime4K、字幕后合成 |
-| macOS | arm64 | Apple | VideoToolbox；完成 render API 后再验收 Metal 增强输出 |
-| macOS | x64 | Intel/AMD | VideoToolbox；完成 render API 后再验收 Metal 增强输出 |
+| macOS | arm64 | Apple | Render API、VideoToolbox、Anime4K、字幕后合成 |
+| macOS | x64 | Intel/AMD | Render API、VideoToolbox、Anime4K、字幕后合成 |
 | Linux | x64 | AMD/Intel/NVIDIA | Vulkan、VA-API 或明确记录的实际硬解后端、gpu-next、Anime4K |
 
-结果记录：安装包 SHA-256、系统版本、GPU 型号、驱动版本、实际渲染器、实际解码器、首帧耗时、30 分钟丢帧、崩溃次数、自动降级次数和 libVLC 回退原因。Windows 安装包还必须在未安装 mpv、IINA、VLC 的干净系统启动。
+结果记录：安装包 SHA-256、系统版本、GPU 型号、驱动版本、实际渲染器、实际解码器、首帧耗时、30 分钟丢帧、崩溃次数、自动降级次数和 libmpv 初始化错误。Windows 安装包还必须在未安装 mpv、IINA、VLC 的干净系统启动。
 
 ## 4. HDR 验收
 
@@ -80,6 +80,10 @@ Real-ESRGAN 模型归档固定为 `v0.2.5.0/realesrgan-ncnn-vulkan-20220424-wind
 
 ## 5. 远程增强输出验收
 
+- `direct` 模式只发送原文件，不经过 FFmpeg 编码；服务端不改变视频码流，画质上限等于原文件和终端解码能力。
+- `transcode` 模式必须重新编码为 HLS，当前普通和模型管线使用 H.264 视频候选、`yuv420p` 像素格式和 AAC 160 kbps 音频，因此属于有损输出，可能降低码率、色深和 HDR 元数据保留能力。模型超分只增加处理后的像素，不会恢复原始编码中已丢失的细节。
+- 原始下载文件始终保持不变；压缩只发生在远端会话的输出流。需要无损保真时选择直传，接受转码损失后再启用远端画质增强或插帧。
+- 若未来增加 WebGPU/WebCodecs 或 wasm shader，才可另行实现“直传 + 终端本地增强”；当前远端浏览器没有这条路径。
 - 分别在 NVIDIA、AMD、Intel 环境确认 NVENC、AMF、QSV 的实际编码器诊断。
 - 禁用全部硬件编码器后确认回退 `libx264`，且界面显示编码降级。
 - RIFE 或 Real-ESRGAN 只有在摘要、预算、真实 Vulkan 握手和 warmup 通过后才能出现在 `modelBackend`；运行中失败后 2 秒内通过受认证会话状态读取更新 `degradationReason`、实际增强和插帧状态。
@@ -87,7 +91,7 @@ Real-ESRGAN 模型归档固定为 `v0.2.5.0/realesrgan-ncnn-vulkan-20220424-wind
 - 至少采集 120 个真实分辨率样本后记录滚动 P95；启动 warmup 只能作为第一个临时样本，不能单独作为 `device-passed` 证据。
 - 请求 `clear` 时优先使用 Real-ESRGAN 2x；不可用时回退 FFmpeg 清晰滤镜。请求 `balanced` 时保持轻量 FFmpeg 滤镜。
 - 当前远程链固定软字幕并保持字幕不进入模型输入；终端能力探测和烧录字幕尚未完成，不得标记为已验收。
-- 普通 HLS 验收 NVENC/AMF/QSV/libx264；模型 rawvideo 链当前使用 libx264，硬件编码接入前不得记录跨厂商模型编码通过。
+- 普通 HLS 和模型 rawvideo 链都验收 NVENC/AMF/QSV/libx264；模型链使用探测通过的首个候选，未完成对应 GPU 真机证据前不得记录跨厂商模型编码通过。
 - 播放中断网后恢复，确认会话、HLS 清单、播放位置和字幕状态可恢复。
 
 结果记录：输入管线、实际编码器、是否软件回退、字幕模式、输出分辨率/帧率/码率、首段耗时、重连耗时和失败原因。
@@ -97,17 +101,17 @@ Real-ESRGAN 模型归档固定为 `v0.2.5.0/realesrgan-ncnn-vulkan-20220424-wind
 - `implemented`：源码、单元/集成测试和静态门禁已通过，不代表真实硬件通过。
 - `release-runner`：同一候选 SHA 的正式 Release Runner 已完成构建、打包、真实 sidecar 握手和 warmup。
 - `device-passed`：指定系统、GPU、驱动和安装包完成持续播放及降级场景。
-- `stable-version`：正式版本完成全部适用矩阵；只有连续两个版本均为此状态才能删除桌面 libVLC。
+- `stable-version`：正式版本完成全部适用矩阵；连续两个版本均为此状态后，才可将 libmpv 标记为稳定发布后端。
 
 `scripts/player-enhancement-matrix.mjs` 只校验必须登记的目标和证据字段，不把任何目标自动标记为通过。
 
-## 7. libVLC 移除门槛
+## 7. PC libmpv 稳定发布门槛
 
-桌面 libVLC 只能在连续两个正式版本完成全部适用真机矩阵后移除。两个版本都必须满足：
+PC 播放器、安装包和桌面工作流已经移除 libVLC。连续两个正式版本仍需满足：
 
 - libmpv 发布资源在各桌面架构可重定位，干净系统可启动。
 - 常见媒体的初始化失败率、崩溃率和首帧 P95 达标。
-- 回退记录不再显示 libVLC 承担常见媒体播放。
-- macOS render API + Metal 路径已经完成，不以未承诺的 `wid` 嵌入替代。
+- 缺失资源和初始化失败均有结构化错误与可恢复操作。
+- macOS 使用 Render API 原生表面，不以未承诺的 `wid` 嵌入替代。
 
-移动端 libVLC 不属于本删除范围。任何一项缺证据都继续保留桌面回退。
+移动端 libVLC 不属于本迁移范围。
