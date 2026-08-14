@@ -871,10 +871,104 @@ pub struct RemoteInterpolationCapacity {
     pub latency_sample_count: u64,
 }
 
-/// 远程增强输出的实际编码诊断，不代表请求一定使用了硬件编码。
+/// 远程媒体会话实际采用的传输与增强路径。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RemotePlaybackPath {
+    #[default]
+    Direct,
+    DirectEnhanced,
+    Hls,
+}
+
+/// 远程浏览器中 WebCodecs/WebGPU 直传增强的生命周期状态。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RemoteDirectEnhancementStatus {
+    #[default]
+    Idle,
+    Probing,
+    Starting,
+    Active,
+    Degraded,
+}
+
+/// 远程浏览器提交的直传增强能力和有界运行指标。
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RemoteDirectEnhancementDiagnostics {
+    pub sequence: u64,
+    pub status: RemoteDirectEnhancementStatus,
+    #[serde(default)]
+    pub capability_supported: bool,
+    #[serde(default)]
+    pub web_codecs: bool,
+    #[serde(default)]
+    pub audio_web_codecs: bool,
+    #[serde(default)]
+    pub audio_context: bool,
+    #[serde(default)]
+    pub shader: bool,
+    #[serde(default)]
+    pub web_gpu: bool,
+    #[serde(default)]
+    pub offscreen_canvas: bool,
+    #[serde(default)]
+    pub media_capabilities: bool,
+    #[serde(default)]
+    pub supported_codecs: Vec<String>,
+    #[serde(default)]
+    pub smooth_codecs: Vec<String>,
+    #[serde(default)]
+    pub power_efficient_codecs: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_preset: Option<PlayerVideoEnhancement>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effective_preset: Option<PlayerVideoEnhancement>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio_clock: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub has_audio_track: Option<bool>,
+    #[serde(default)]
+    pub rendered_frames: u64,
+    #[serde(default)]
+    pub dropped_frames: u64,
+    #[serde(default)]
+    pub dropped_frame_ratio: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frame_budget_ms: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gpu_queue_p95_ms: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_av_drift_ms: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub maximum_av_drift_ms: Option<f64>,
+    #[serde(default)]
+    pub range_request_count: u64,
+    #[serde(default)]
+    pub received_range_bytes: u64,
+    #[serde(default)]
+    pub range_retry_count: u64,
+    #[serde(default)]
+    pub recovered_range_count: u64,
+    #[serde(default)]
+    pub network_failure_count: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gpu_estimated_working_set_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gpu_resource_budget_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub degradation_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reported_at: Option<String>,
+}
+
+/// 远程增强输出的实际传输和编码诊断，不代表请求一定使用了硬件编码。
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RemotePlaybackDiagnostics {
+    #[serde(default)]
+    pub playback_path: RemotePlaybackPath,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub encoder: Option<String>,
     #[serde(default)]
@@ -893,6 +987,8 @@ pub struct RemotePlaybackDiagnostics {
     pub interpolation_capacity: Option<RemoteInterpolationCapacity>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub degradation_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub direct_enhancement: Option<RemoteDirectEnhancementDiagnostics>,
 }
 
 /// 远程转码实际请求的像素处理链；直传模式必须保持关闭。
@@ -937,7 +1033,7 @@ mod tests {
         DownloadServiceStatus, EmbeddedTorrentCoreStatus, ImageCacheResolveResult, PlaybackSession,
         PlayerCommand, PlayerCommandAction, PlayerCommandResult, PlayerDetectionResult,
         PlayerHdrCapabilities, PlayerHostPlatform, PlayerSnapshot, PlayerStatus,
-        QbittorrentManagedStatus, RemoteGatewayStatus, RemotePairingChallenge,
+        QbittorrentManagedStatus, RemoteGatewayStatus, RemotePairingChallenge, RemotePlaybackPath,
         RemotePlaybackSession, TorrentConnectionTestResult,
     };
 
@@ -1026,6 +1122,10 @@ mod tests {
         assert_eq!(fixture.payload.pairing_challenge.code, "123456");
         assert!(fixture.payload.image_cache.url.starts_with("https://"));
         assert_eq!(fixture.payload.playback_session.mode, "direct");
+        assert_eq!(
+            fixture.payload.playback_session.diagnostics.playback_path,
+            RemotePlaybackPath::Direct
+        );
     }
 
     /// 验证 Rust 能严格解码前端共用的播放器快照金样。

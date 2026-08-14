@@ -1,7 +1,8 @@
 import {
   closeRemotePlaybackSession,
   createRemotePlaybackSession,
-  getRemotePlaybackSession
+  getRemotePlaybackSession,
+  reportRemoteDirectEnhancementDiagnostics
 } from "@/lib/api";
 import type { PlaybackSessionClient } from "@/features/player/playback-session-client";
 
@@ -11,5 +12,6 @@ export type { PlaybackSessionClient } from "@/features/player/playback-session-c
 export const remotePlaybackSessionClient: PlaybackSessionClient = {
   create: createRemotePlaybackSession,
   refresh: getRemotePlaybackSession,
+  reportDirectEnhancement: reportRemoteDirectEnhancementDiagnostics,
   close: closeRemotePlaybackSession
 };

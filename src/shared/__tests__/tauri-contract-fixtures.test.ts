@@ -87,6 +87,7 @@ test("Tauri P6 远程网关契约金样可被 TypeScript 接受", () => {
   assert.equal(fixture.payload.pairingChallenge.code, "123456");
   assert.equal(fixture.payload.playbackSession.mode, "direct");
   assert.equal(fixture.payload.playbackSession.diagnostics?.enhancedFrameInput, false);
+  assert.equal(fixture.payload.playbackSession.diagnostics?.playbackPath, undefined);
 });
 
 /** 读取 P6 桌面功能对等金样，验证采集和单集预览字段。 */

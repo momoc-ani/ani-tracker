@@ -5,9 +5,9 @@ use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use ani_contracts::{
-    PlayerFrameInterpolation, PlayerVideoEnhancement, RemoteInterpolationCapacity,
-    RemotePlaybackDiagnostics, RemotePlaybackEnhancement, RemotePlaybackSession,
-    RemotePlaybackSubtitle,
+    PlayerFrameInterpolation, PlayerVideoEnhancement, RemoteDirectEnhancementDiagnostics,
+    RemoteDirectEnhancementStatus, RemoteInterpolationCapacity, RemotePlaybackDiagnostics,
+    RemotePlaybackEnhancement, RemotePlaybackPath, RemotePlaybackSession, RemotePlaybackSubtitle,
 };
 use ani_domain::{AppSettings, DownloadTask, MediaFile, PlaybackCheckpoint};
 use ani_media::model_sidecar::{ModelSidecarConfig, ModelSidecarRuntime};
@@ -42,6 +42,9 @@ const RIFE_HARD_MAX_MULTIPLIER: u8 = 2;
 const REMOTE_OUTPUT_FRAME_RATE_CAP: f64 = 60.0;
 const MODEL_PIPELINE_UTILIZATION_LIMIT: f64 = 0.8;
 const MODEL_PIPELINE_SAFETY_MARGIN_MS: f64 = 5.0;
+const MAX_DIRECT_DIAGNOSTIC_CODECS: usize = 16;
+const MAX_DIRECT_DIAGNOSTIC_CODEC_BYTES: usize = 64;
+const MAX_DIRECT_DIAGNOSTIC_REASON_BYTES: usize = 512;
 #[cfg(target_os = "macos")]
 const ENCODER_CANDIDATES: &[(&str, &str)] = &[
     ("h264_videotoolbox", "videotoolbox"),
@@ -446,6 +449,11 @@ impl RemoteMediaSessionService {
             .await;
         let mut process = None;
         let mut diagnostics = RemotePlaybackDiagnostics {
+            playback_path: if mode == "hls" {
+                RemotePlaybackPath::Hls
+            } else {
+                RemotePlaybackPath::Direct
+            },
             subtitle_mode: Some("soft".to_owned()),
             enhanced_frame_input: enhancement.video_enhancement != PlayerVideoEnhancement::Off
                 || enhancement.frame_interpolation != PlayerFrameInterpolation::Off,
@@ -526,6 +534,47 @@ impl RemoteMediaSessionService {
             start_position_seconds
         );
         Ok(public)
+    }
+
+    /// 接收设备拥有的直传会话所上报的 WebCodecs/WebGPU 运行快照。
+    pub async fn report_direct_enhancement(
+        &self,
+        session_id: &str,
+        device_id: &str,
+        mut diagnostics: RemoteDirectEnhancementDiagnostics,
+    ) -> Result<RemotePlaybackSession, RemoteMediaError> {
+        validate_direct_enhancement_diagnostics(&diagnostics)?;
+        let record = self
+            .require_session(session_id, Some(device_id), None)
+            .await?;
+        if record.access != SessionAccess::Browser {
+            return Err(session_not_found());
+        }
+        let mut public = record.public.lock().await;
+        if public.mode != "direct" {
+            return Err(RemoteMediaError::new(
+                409,
+                "MEDIA_DIRECT_DIAGNOSTICS_INVALID_MODE",
+                "只有原文件直传会话可以上报终端增强诊断",
+            ));
+        }
+        if public
+            .diagnostics
+            .direct_enhancement
+            .as_ref()
+            .is_some_and(|current| current.sequence >= diagnostics.sequence)
+        {
+            return Ok(public.clone());
+        }
+        diagnostics.reported_at = Some(Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true));
+        public.diagnostics.playback_path =
+            if diagnostics.status == RemoteDirectEnhancementStatus::Active {
+                RemotePlaybackPath::DirectEnhanced
+            } else {
+                RemotePlaybackPath::Direct
+            };
+        public.diagnostics.direct_enhancement = Some(diagnostics);
+        Ok(public.clone())
     }
 
     /// 返回设备拥有会话中的媒体资源。
@@ -2020,6 +2069,137 @@ fn join_degradation_reasons(current: Option<String>, additional: Vec<String>) ->
         }
     }
     (!reasons.is_empty()).then(|| reasons.join("；"))
+}
+
+fn validate_direct_enhancement_diagnostics(
+    diagnostics: &RemoteDirectEnhancementDiagnostics,
+) -> Result<(), RemoteMediaError> {
+    if diagnostics.sequence == 0 {
+        return Err(invalid_direct_diagnostics("诊断序号必须大于 0"));
+    }
+    let has_smooth_codec = diagnostics
+        .smooth_codecs
+        .iter()
+        .any(|codec| diagnostics.supported_codecs.contains(codec));
+    let capability_supported = diagnostics.web_codecs
+        && diagnostics.audio_web_codecs
+        && diagnostics.audio_context
+        && diagnostics.shader
+        && diagnostics.web_gpu
+        && diagnostics.offscreen_canvas
+        && diagnostics.media_capabilities
+        && has_smooth_codec;
+    if diagnostics.capability_supported != capability_supported {
+        return Err(invalid_direct_diagnostics("终端能力汇总结论与明细不一致"));
+    }
+    if diagnostics.status == RemoteDirectEnhancementStatus::Active {
+        if !diagnostics.capability_supported {
+            return Err(invalid_direct_diagnostics(
+                "增强激活状态必须已通过终端能力探测",
+            ));
+        }
+        if !matches!(
+            diagnostics.effective_preset,
+            Some(PlayerVideoEnhancement::Balanced | PlayerVideoEnhancement::Clear)
+        ) {
+            return Err(invalid_direct_diagnostics(
+                "增强激活状态必须报告实际画质预设",
+            ));
+        }
+        if diagnostics.audio_clock.as_deref() != Some("audio-context") {
+            return Err(invalid_direct_diagnostics(
+                "增强激活状态必须使用 AudioContext 主时钟",
+            ));
+        }
+    }
+    for preset in [diagnostics.requested_preset, diagnostics.effective_preset]
+        .into_iter()
+        .flatten()
+    {
+        if preset == PlayerVideoEnhancement::Off {
+            return Err(invalid_direct_diagnostics(
+                "终端增强预设只能是 balanced 或 clear",
+            ));
+        }
+    }
+    if diagnostics
+        .audio_clock
+        .as_deref()
+        .is_some_and(|clock| clock != "audio-context")
+    {
+        return Err(invalid_direct_diagnostics("音频时钟类型无效"));
+    }
+    validate_direct_metric(diagnostics.dropped_frame_ratio, 0.0, 1.0, "丢帧比例")?;
+    for (value, maximum, label) in [
+        (diagnostics.frame_budget_ms, 1_000.0, "帧预算"),
+        (diagnostics.gpu_queue_p95_ms, 60_000.0, "GPU P95"),
+        (
+            diagnostics.current_av_drift_ms.map(f64::abs),
+            60_000.0,
+            "当前音画漂移",
+        ),
+        (
+            diagnostics.maximum_av_drift_ms.map(f64::abs),
+            60_000.0,
+            "最大音画漂移",
+        ),
+    ] {
+        if let Some(value) = value {
+            validate_direct_metric(value, 0.0, maximum, label)?;
+        }
+    }
+    if diagnostics.recovered_range_count > diagnostics.range_retry_count
+        || diagnostics.range_retry_count > diagnostics.range_request_count
+    {
+        return Err(invalid_direct_diagnostics("Range 恢复计数关系无效"));
+    }
+    for codecs in [
+        &diagnostics.supported_codecs,
+        &diagnostics.smooth_codecs,
+        &diagnostics.power_efficient_codecs,
+    ] {
+        if codecs.len() > MAX_DIRECT_DIAGNOSTIC_CODECS
+            || codecs.iter().any(|codec| {
+                codec.trim().is_empty() || codec.len() > MAX_DIRECT_DIAGNOSTIC_CODEC_BYTES
+            })
+        {
+            return Err(invalid_direct_diagnostics("编解码器能力列表无效"));
+        }
+    }
+    if diagnostics
+        .smooth_codecs
+        .iter()
+        .chain(&diagnostics.power_efficient_codecs)
+        .any(|codec| !diagnostics.supported_codecs.contains(codec))
+    {
+        return Err(invalid_direct_diagnostics(
+            "流畅或节能编解码器不在支持列表中",
+        ));
+    }
+    if diagnostics
+        .degradation_reason
+        .as_ref()
+        .is_some_and(|reason| reason.len() > MAX_DIRECT_DIAGNOSTIC_REASON_BYTES)
+    {
+        return Err(invalid_direct_diagnostics("降级原因超过长度上限"));
+    }
+    Ok(())
+}
+
+fn validate_direct_metric(
+    value: f64,
+    minimum: f64,
+    maximum: f64,
+    label: &str,
+) -> Result<(), RemoteMediaError> {
+    if !value.is_finite() || value < minimum || value > maximum {
+        return Err(invalid_direct_diagnostics(format!("{label}超出有效范围")));
+    }
+    Ok(())
+}
+
+fn invalid_direct_diagnostics(message: impl Into<String>) -> RemoteMediaError {
+    RemoteMediaError::new(400, "MEDIA_DIRECT_DIAGNOSTICS_INVALID", message)
 }
 
 fn validate_remote_enhancement(

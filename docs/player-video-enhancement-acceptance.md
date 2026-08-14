@@ -101,6 +101,7 @@ Real-ESRGAN 模型归档固定为 `v0.2.5.0/realesrgan-ncnn-vulkan-20220424-wind
 - F5-A 能力探测已实现并有共享单元测试，覆盖 Audio/Video WebCodecs、AudioContext、WebGPU、候选 codec 和内置 WGSL SHA-256；F5-B/C 已加入受控 MP4/WebM Range demux、实际 decoder config、关键帧、绝对时钟、外部 VideoFrame shader 工厂及 1x1 OffscreenCanvas 首帧 smoke test；F5-D 已加入连续 VideoDecoder、有界帧队列、可见画布、关键帧拖动、预设切换和原画回退；F5-E 已加入 device-lost、源帧率帧预算、GPU P95、丢帧、连续漂移和无帧门禁；F5-F 已加入独立 AudioDecoder/AudioContext 音轨调度、暂停、拖动、倍速、音量、静音、结束态和独立 ASS/VTT cue 时钟。增强激活后卸载 ArtPlayer 原媒体源，不再连续重复 Range/视频解码；尚未完成真机矩阵，因此 `supportsDirectEnhancement` 必须保持 `false`。
 - 能力探测必须同时确认 `VideoDecoder`、`AudioDecoder`、目标 codec 的 `isConfigSupported`、WebGPU adapter/device、WGSL shader 摘要和音视频时钟；任一项失败都不能展示“直传增强已启用”。
 - 直传增强必须从原文件的 HTTP Range 读取并在终端解码，不得启动服务端 FFmpeg/模型转码进程；网络面板和服务端会话诊断必须能区分 `direct` 与 `direct-enhanced`。
+- 客户端诊断上报必须绑定已配对设备和当前直传会话，并覆盖能力结果、实际档位、AudioContext 主时钟、帧/GPU/漂移/Range 指标和降级原因；伪造 `active`、越界指标、HLS 会话上报和迟到序号不得覆盖服务端快照。增强回退后服务端 `playbackPath` 必须从 `direct-enhanced` 恢复为 `direct`。
 - 首批只验收 `mediabunny 1.53.1` 受控适配器支持的 MP4/WebM 组合；诊断阶段必须遵守 32 MiB 缓存、2 个并发、24 次 Range、64 MiB 累计响应和 8 秒窗口。H.265、MKV、HDR 和浏览器不支持的 codec 必须明确回退原始直传或 HLS，不能输出黑帧或假增强状态。
 - 人为中断一个 Range 建连和一个响应体，确认客户端最多重试两次、从已交付的下一字节继续、严格核对 `Content-Range`，且重试仍计入请求/字节总预算；401/403/416 和取消操作不得重试。恢复成功时播放时间轴不能倒退或重复音频，恢复失败必须回退原画。
 - WebGPU shader 只处理视频帧；F5-D 只有在增强首帧成功后才显示画布，并通过 ArtPlayer DOM 保留字幕层。F5-F 将 ASS 转为 VTT cue，再由 AudioContext 主时钟直接选择活动字幕；仍须用真实 ASS/VTT 样本确认默认字幕、切换、拖动和缩放不会被锐化、遮挡、重复绘制或丢失。

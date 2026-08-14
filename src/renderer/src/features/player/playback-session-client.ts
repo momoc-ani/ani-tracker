@@ -1,4 +1,5 @@
 import type {
+  RemoteDirectEnhancementReport,
   RemotePlaybackEnhancement,
   RemotePlaybackRequestMode,
   RemotePlaybackSession
@@ -14,6 +15,10 @@ export interface PlaybackSessionClient {
     startPositionSeconds?: number
   ): Promise<RemotePlaybackSession>;
   refresh?(sessionId: string): Promise<RemotePlaybackSession>;
+  reportDirectEnhancement?(
+    sessionId: string,
+    diagnostics: RemoteDirectEnhancementReport
+  ): Promise<RemotePlaybackSession>;
   close(sessionId: string): Promise<void>;
 }
 

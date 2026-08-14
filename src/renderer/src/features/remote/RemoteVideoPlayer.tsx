@@ -28,6 +28,7 @@ import {
 } from "@/lib/api";
 import { cn } from "@/lib/cn";
 import type {
+  RemoteDirectEnhancementReport,
   RemotePlaybackEnhancement,
   RemotePlaybackDiagnostics,
   RemotePlaybackRequestMode,
@@ -120,6 +121,7 @@ export function RemoteVideoPlayer({
   const playerAdapterRef = useRef<ArtPlayerAdapter | null>(null);
   const directEnhancementControllerRef = useRef<DirectEnhancementPlaybackController | null>(null);
   const directEnhancementRunRef = useRef(0);
+  const directEnhancementReportSequenceRef = useRef(0);
   const toolbarTimerRef = useRef<number>();
   const automaticFallbackStartedRef = useRef(false);
   const commandSequenceRef = useRef(0);
@@ -347,7 +349,7 @@ export function RemoteVideoPlayer({
   }, [activeItem, requestedMode, retryNonce, sessionClient, sessionEnhancement, sessionStartRequestId]);
 
   useEffect(() => {
-    if (!session || session.mode !== "hls" || !sessionClient.refresh) return;
+    if (environment !== "remote" || !session || !sessionClient.refresh) return;
     return startPlaybackSessionRefresh({
       intervalMs: 2_000,
       refresh: () => sessionClient.refresh!(session.id),
@@ -356,7 +358,7 @@ export function RemoteVideoPlayer({
       schedule: window.setInterval.bind(window),
       cancel: window.clearInterval.bind(window)
     });
-  }, [session?.id, session?.mode, sessionClient]);
+  }, [environment, session?.id, sessionClient]);
 
   /** 原文件发生媒体错误时仅自动升级一次实时转码。 */
   const startAutomaticTranscode = useCallback((): void => {
@@ -605,6 +607,52 @@ export function RemoteVideoPlayer({
       directEnhancementControllerRef.current?.setPreset(directEnhancementPreset);
     }
   }, [directEnhancementPreset]);
+
+  useEffect(() => {
+    if (
+      environment !== "remote"
+      || session?.mode !== "direct"
+      || !sessionClient.reportDirectEnhancement
+      || !directEnhancementRequested
+      || !directEnhancementCapabilities
+      || !directEnhancementPreset
+      || (directEnhancementStatus === "active" && !directEnhancementDiagnostics)
+    ) return;
+    let active = true;
+    const timeout = window.setTimeout(() => {
+      const sequence = ++directEnhancementReportSequenceRef.current;
+      const report = buildRemoteDirectEnhancementReport({
+        capabilities: directEnhancementCapabilities,
+        diagnostics: directEnhancementDiagnostics,
+        degradationReason: directEnhancementDegradationReason,
+        requestedPreset: directEnhancementPreset,
+        sequence,
+        status: directEnhancementStatus
+      });
+      void sessionClient.reportDirectEnhancement!(session.id, report)
+        .then((updated) => {
+          if (active && updated.id === session.id) setSessionDiagnostics(updated.diagnostics);
+        })
+        .catch((error) => {
+          if (active) console.warn("[remote] F5-I 终端增强诊断上报失败", { error });
+        });
+    }, directEnhancementStatus === "active" ? 250 : 0);
+    return () => {
+      active = false;
+      window.clearTimeout(timeout);
+    };
+  }, [
+    directEnhancementCapabilities,
+    directEnhancementDegradationReason,
+    directEnhancementDiagnostics,
+    directEnhancementPreset,
+    directEnhancementRequested,
+    directEnhancementStatus,
+    environment,
+    session?.id,
+    session?.mode,
+    sessionClient
+  ]);
 
   /** 手动切换播放模式，并允许下次直传失败时再次自动升级。 */
   const handleModeChange = (value: RemotePlaybackRequestMode): void => {
@@ -1003,6 +1051,7 @@ export function RemoteVideoPlayer({
         data-direct-enhancement-network-failures={directEnhancementDiagnostics?.networkFailureCount}
         data-direct-enhancement-rendered-frames={directEnhancementDiagnostics?.renderedFrames}
         data-direct-enhancement-status={directEnhancementStatus}
+        data-remote-playback-path={sessionDiagnostics?.playbackPath}
         data-remote-fullscreen={environment === "remote" ? remoteFullscreenMode ?? undefined : undefined}
       >
         <canvas
@@ -1133,6 +1182,59 @@ export function RemoteVideoPlayer({
 function createRemoteCommandId(sequenceRef: { current: number }): string {
   sequenceRef.current += 1;
   return `remote-${Date.now()}-${sequenceRef.current}`;
+}
+
+function buildRemoteDirectEnhancementReport(input: {
+  capabilities: DirectEnhancementCapabilities;
+  diagnostics?: DirectEnhancementPlaybackDiagnostics;
+  degradationReason?: string;
+  requestedPreset: "balanced" | "clear";
+  sequence: number;
+  status: DirectEnhancementStatus;
+}): RemoteDirectEnhancementReport {
+  const { capabilities, diagnostics } = input;
+  const status = !capabilities.supported && input.status === "idle" ? "degraded" : input.status;
+  const degradationReason = input.degradationReason
+    ?? diagnostics?.degradationReason
+    ?? (capabilities.supported ? undefined : capabilities.reason);
+  return {
+    sequence: input.sequence,
+    status,
+    capabilitySupported: capabilities.supported,
+    webCodecs: capabilities.webCodecs,
+    audioWebCodecs: capabilities.audioWebCodecs,
+    audioContext: capabilities.audioContext,
+    shader: capabilities.shader,
+    webGpu: capabilities.webGpu,
+    offscreenCanvas: capabilities.offscreenCanvas,
+    mediaCapabilities: capabilities.mediaCapabilities,
+    supportedCodecs: capabilities.supportedCodecs,
+    smoothCodecs: capabilities.smoothCodecs,
+    powerEfficientCodecs: capabilities.powerEfficientCodecs,
+    requestedPreset: input.requestedPreset,
+    ...(diagnostics?.effectivePreset ? { effectivePreset: diagnostics.effectivePreset } : {}),
+    ...(diagnostics?.audioClock ? { audioClock: diagnostics.audioClock } : {}),
+    ...(diagnostics ? { hasAudioTrack: diagnostics.hasAudioTrack } : {}),
+    renderedFrames: diagnostics?.renderedFrames ?? 0,
+    droppedFrames: diagnostics?.droppedFrames ?? 0,
+    droppedFrameRatio: diagnostics?.droppedFrameRatio ?? 0,
+    ...(diagnostics?.frameBudgetMs === undefined ? {} : { frameBudgetMs: diagnostics.frameBudgetMs }),
+    ...(diagnostics?.gpuQueueP95Ms === undefined ? {} : { gpuQueueP95Ms: diagnostics.gpuQueueP95Ms }),
+    ...(diagnostics?.currentAvDriftMs === undefined ? {} : { currentAvDriftMs: diagnostics.currentAvDriftMs }),
+    ...(diagnostics?.maximumAvDriftMs === undefined ? {} : { maximumAvDriftMs: diagnostics.maximumAvDriftMs }),
+    rangeRequestCount: diagnostics?.rangeRequestCount ?? 0,
+    receivedRangeBytes: diagnostics?.receivedRangeBytes ?? 0,
+    rangeRetryCount: diagnostics?.rangeRetryCount ?? 0,
+    recoveredRangeCount: diagnostics?.recoveredRangeCount ?? 0,
+    networkFailureCount: diagnostics?.networkFailureCount ?? 0,
+    ...(diagnostics?.gpuEstimatedWorkingSetBytes === undefined
+      ? {}
+      : { gpuEstimatedWorkingSetBytes: diagnostics.gpuEstimatedWorkingSetBytes }),
+    ...(diagnostics?.gpuResourceBudgetBytes === undefined
+      ? {}
+      : { gpuResourceBudgetBytes: diagnostics.gpuResourceBudgetBytes }),
+    ...(degradationReason ? { degradationReason } : {})
+  };
 }
 
 /** 读取标准或 WebKit 的当前全屏元素。 */

@@ -1,5 +1,6 @@
 import type {
   ImageCacheResolveResult,
+  RemoteDirectEnhancementReport,
   RemotePlaybackEnhancement,
   RemotePlaybackRequestMode,
   RemotePlaybackSession
@@ -219,6 +220,34 @@ export async function getRemotePlaybackSession(sessionId: string): Promise<Remot
   if (!response.ok || !payload.id) {
     if (response.status === 401) clearRemoteDeviceToken();
     throw new Error(payload.error ?? `播放会话状态读取失败：${response.status}`);
+  }
+  return payload;
+}
+
+/** 将终端 WebCodecs/WebGPU 实际运行状态写回设备绑定的播放会话。 */
+export async function reportRemoteDirectEnhancementDiagnostics(
+  sessionId: string,
+  diagnostics: RemoteDirectEnhancementReport
+): Promise<RemotePlaybackSession> {
+  const baseUrl = getRemoteBaseUrl();
+  const accessToken = window.localStorage.getItem(REMOTE_TOKEN_STORAGE_KEY);
+  if (!accessToken) throw new Error("当前设备尚未完成远程配对");
+  const response = await fetch(
+    `${baseUrl}/api/media/sessions/${encodeURIComponent(sessionId)}/diagnostics`,
+    {
+      method: "PUT",
+      credentials: "same-origin",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${accessToken}`
+      },
+      body: JSON.stringify(diagnostics)
+    }
+  );
+  const payload = (await response.json().catch(() => ({}))) as RemotePlaybackSession & { error?: string };
+  if (!response.ok || !payload.id) {
+    if (response.status === 401) clearRemoteDeviceToken();
+    throw new Error(payload.error ?? `终端增强诊断上报失败：${response.status}`);
   }
   return payload;
 }

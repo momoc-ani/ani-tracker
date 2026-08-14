@@ -5,7 +5,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use ani_contracts::{
-    RemoteCertificateInfo, RemoteGatewayStatus, RemotePairingChallenge, RemotePlaybackEnhancement,
+    RemoteCertificateInfo, RemoteDirectEnhancementDiagnostics, RemoteGatewayStatus,
+    RemotePairingChallenge, RemotePlaybackEnhancement,
 };
 use axum::body::{to_bytes, Body};
 use axum::extract::{ConnectInfo, Request, State};
@@ -579,6 +580,28 @@ async fn handle_request(
         }
         return Ok(response);
     }
+    if method == Method::PUT {
+        if let Some(session_id) = parse_browser_media_diagnostics_route(&path) {
+            let device = authenticate(core, request.headers(), true).await?;
+            consume_rate_limit(
+                core,
+                format!("media:{}:diagnostics", device.id),
+                120,
+                Duration::from_secs(60),
+            )
+            .await?;
+            let diagnostics: RemoteDirectEnhancementDiagnostics = parse_body(request).await?;
+            let session = core
+                .media
+                .report_direct_enhancement(&session_id, &device.id, diagnostics)
+                .await
+                .map_err(GatewayHttpError::from_media)?;
+            return Ok(json_response(
+                StatusCode::OK,
+                serde_json::to_value(session)?,
+            ));
+        }
+    }
     if let Some(route) = parse_browser_media_route(&path) {
         if method == Method::DELETE && route.asset_name.is_none() {
             let device = authenticate(core, request.headers(), true).await?;
@@ -1130,6 +1153,12 @@ fn parse_browser_media_route(path: &str) -> Option<BrowserMediaRoute> {
     })
 }
 
+fn parse_browser_media_diagnostics_route(path: &str) -> Option<String> {
+    let rest = path.strip_prefix("/api/media/sessions/")?;
+    let session_id = rest.strip_suffix("/diagnostics")?;
+    valid_token(session_id, 32).then(|| session_id.to_owned())
+}
+
 fn parse_external_media_route(path: &str) -> Option<ExternalMediaRoute> {
     let rest = path.strip_prefix("/api/media/external/")?;
     let mut parts = rest.split('/');
@@ -1446,6 +1475,16 @@ mod tests {
         ))
         .expect("named media route");
         assert_eq!(named.asset_name, "测试 SP01.mkv");
+        assert_eq!(
+            parse_browser_media_diagnostics_route(&format!(
+                "/api/media/sessions/{session}/diagnostics"
+            )),
+            Some(session)
+        );
+        assert!(
+            parse_browser_media_diagnostics_route("/api/media/sessions/short/diagnostics")
+                .is_none()
+        );
     }
 
     /// 验证 HTTPS 的 HTTP/2 authority 与 HTTP/1.1 Host 都进入同一白名单校验。
@@ -1768,6 +1807,188 @@ mod tests {
         .expect("media session status response");
         assert_eq!(status["id"], session["id"]);
         assert_eq!(status["diagnostics"]["enhancedFrameInput"], false);
+        assert_eq!(status["diagnostics"]["playbackPath"], "direct");
+        let diagnostics_response = client
+            .put(format!(
+                "{base_url}/api/media/sessions/{session_id}/diagnostics"
+            ))
+            .bearer_auth(token)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(
+                json!({
+                    "sequence": 1,
+                    "status": "active",
+                    "capabilitySupported": true,
+                    "webCodecs": true,
+                    "audioWebCodecs": true,
+                    "audioContext": true,
+                    "shader": true,
+                    "webGpu": true,
+                    "offscreenCanvas": true,
+                    "mediaCapabilities": true,
+                    "supportedCodecs": ["avc1.640028"],
+                    "smoothCodecs": ["avc1.640028"],
+                    "powerEfficientCodecs": ["avc1.640028"],
+                    "requestedPreset": "clear",
+                    "effectivePreset": "balanced",
+                    "audioClock": "audio-context",
+                    "hasAudioTrack": true,
+                    "renderedFrames": 120,
+                    "droppedFrames": 2,
+                    "droppedFrameRatio": 0.0164,
+                    "frameBudgetMs": 26.67,
+                    "gpuQueueP95Ms": 8.4,
+                    "currentAvDriftMs": 12.5,
+                    "maximumAvDriftMs": 42.0,
+                    "rangeRequestCount": 12,
+                    "receivedRangeBytes": 1048576,
+                    "rangeRetryCount": 1,
+                    "recoveredRangeCount": 1,
+                    "networkFailureCount": 1,
+                    "gpuEstimatedWorkingSetBytes": 134217728,
+                    "gpuResourceBudgetBytes": 536870912
+                })
+                .to_string(),
+            )
+            .send()
+            .await
+            .expect("direct enhancement diagnostics request");
+        assert_eq!(diagnostics_response.status(), reqwest::StatusCode::OK);
+        let diagnostics: Value = serde_json::from_str(
+            &diagnostics_response
+                .text()
+                .await
+                .expect("direct enhancement diagnostics body"),
+        )
+        .expect("direct enhancement diagnostics response");
+        assert_eq!(
+            diagnostics["diagnostics"]["playbackPath"],
+            "direct-enhanced"
+        );
+        assert_eq!(
+            diagnostics["diagnostics"]["directEnhancement"]["sequence"],
+            1
+        );
+        assert!(diagnostics["diagnostics"]["directEnhancement"]["reportedAt"].is_string());
+
+        let degraded_response = client
+            .put(format!(
+                "{base_url}/api/media/sessions/{session_id}/diagnostics"
+            ))
+            .bearer_auth(token)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(
+                json!({
+                    "sequence": 2,
+                    "status": "degraded",
+                    "capabilitySupported": true,
+                    "webCodecs": true,
+                    "audioWebCodecs": true,
+                    "audioContext": true,
+                    "shader": true,
+                    "webGpu": true,
+                    "offscreenCanvas": true,
+                    "mediaCapabilities": true,
+                    "supportedCodecs": ["avc1.640028"],
+                    "smoothCodecs": ["avc1.640028"],
+                    "powerEfficientCodecs": ["avc1.640028"],
+                    "requestedPreset": "clear",
+                    "effectivePreset": "balanced",
+                    "audioClock": "audio-context",
+                    "hasAudioTrack": true,
+                    "renderedFrames": 121,
+                    "droppedFrames": 2,
+                    "droppedFrameRatio": 0.0162,
+                    "rangeRequestCount": 13,
+                    "receivedRangeBytes": 1100000,
+                    "rangeRetryCount": 1,
+                    "recoveredRangeCount": 1,
+                    "networkFailureCount": 1,
+                    "degradationReason": "WebGPU device lost"
+                })
+                .to_string(),
+            )
+            .send()
+            .await
+            .expect("degraded direct enhancement diagnostics request");
+        assert_eq!(degraded_response.status(), reqwest::StatusCode::OK);
+        let degraded: Value = serde_json::from_str(
+            &degraded_response
+                .text()
+                .await
+                .expect("degraded direct enhancement diagnostics body"),
+        )
+        .expect("degraded direct enhancement diagnostics response");
+        assert_eq!(degraded["diagnostics"]["playbackPath"], "direct");
+        assert_eq!(
+            degraded["diagnostics"]["directEnhancement"]["degradationReason"],
+            "WebGPU device lost"
+        );
+        let stale_response = client
+            .put(format!(
+                "{base_url}/api/media/sessions/{session_id}/diagnostics"
+            ))
+            .bearer_auth(token)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(
+                json!({
+                    "sequence": 1,
+                    "status": "idle",
+                    "renderedFrames": 0,
+                    "droppedFrames": 0,
+                    "droppedFrameRatio": 0.0,
+                    "rangeRequestCount": 0,
+                    "receivedRangeBytes": 0,
+                    "rangeRetryCount": 0,
+                    "recoveredRangeCount": 0,
+                    "networkFailureCount": 0
+                })
+                .to_string(),
+            )
+            .send()
+            .await
+            .expect("stale direct enhancement diagnostics request");
+        assert_eq!(stale_response.status(), reqwest::StatusCode::OK);
+        let stale: Value = serde_json::from_str(
+            &stale_response
+                .text()
+                .await
+                .expect("stale direct enhancement diagnostics body"),
+        )
+        .expect("stale direct enhancement diagnostics response");
+        assert_eq!(stale["diagnostics"]["directEnhancement"]["sequence"], 2);
+        assert_eq!(
+            stale["diagnostics"]["directEnhancement"]["status"],
+            "degraded"
+        );
+
+        let invalid_active = client
+            .put(format!(
+                "{base_url}/api/media/sessions/{session_id}/diagnostics"
+            ))
+            .bearer_auth(token)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(
+                json!({
+                    "sequence": 3,
+                    "status": "active",
+                    "capabilitySupported": true,
+                    "effectivePreset": "balanced",
+                    "renderedFrames": 1,
+                    "droppedFrames": 0,
+                    "droppedFrameRatio": 0.0,
+                    "rangeRequestCount": 1,
+                    "receivedRangeBytes": 1,
+                    "rangeRetryCount": 0,
+                    "recoveredRangeCount": 0,
+                    "networkFailureCount": 0
+                })
+                .to_string(),
+            )
+            .send()
+            .await
+            .expect("invalid active direct enhancement diagnostics request");
+        assert_eq!(invalid_active.status(), reqwest::StatusCode::BAD_REQUEST);
         let stream_url = session["streamUrl"].as_str().expect("stream url");
         let range_response = client
             .get(format!("{base_url}{stream_url}"))
