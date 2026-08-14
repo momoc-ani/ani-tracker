@@ -38,6 +38,9 @@ const ART_PLAYER_CAPABILITIES: PlayerCapabilities = {
   supportsHdr: false
 };
 
+// 远程点播列表在转码完成前属于 EVENT 流，必须把同步点固定在列表起点，避免追赶快速增长的直播边缘。
+const REMOTE_HLS_LIVE_SYNC_DURATION_COUNT = 1_000_000;
+
 export interface ArtPlayerAdapterOptions {
   container: HTMLDivElement;
   sessionId: string;
@@ -244,7 +247,7 @@ export class ArtPlayerAdapter implements UnifiedPlayerAdapter {
       lock: false,
       fastForward: false,
       customType: {
-        m3u8: (video, url, art) => this.attachHls(video, url, art)
+        m3u8: (video, url, art) => this.attachHls(video, url, art, startPositionSeconds)
       }
     }, () => {
       if (this.player !== player || this.disposed) return;
@@ -275,25 +278,46 @@ export class ArtPlayerAdapter implements UnifiedPlayerAdapter {
     }
   }
 
-  /** 为不支持原生 HLS 的浏览器挂接 hls.js。 */
-  private attachHls(video: HTMLVideoElement, url: string, art: Artplayer): void {
-    if (video.canPlayType("application/vnd.apple.mpegurl")) {
-      video.src = url;
-      return;
-    }
+  /** 优先挂接 hls.js，并在浏览器不支持 MSE 时回退原生 HLS。 */
+  private attachHls(
+    video: HTMLVideoElement,
+    url: string,
+    art: Artplayer,
+    startPositionSeconds?: number
+  ): void {
     if (!Hls.isSupported()) {
+      if (video.canPlayType("application/vnd.apple.mpegurl")) {
+        video.src = url;
+        return;
+      }
       this.fail("unsupported", "当前浏览器不支持 HLS 实时转码播放");
       return;
     }
     this.hls?.destroy();
-    const hls = new Hls({ enableWorker: false });
+    const startPosition = startPositionSeconds !== undefined && Number.isFinite(startPositionSeconds)
+      ? Math.max(0, startPositionSeconds)
+      : 0;
+    const hls = new Hls({
+      enableWorker: false,
+      startPosition,
+      liveSyncDurationCount: REMOTE_HLS_LIVE_SYNC_DURATION_COUNT,
+      maxLiveSyncPlaybackRate: 1
+    });
     this.hls = hls;
     art.hls = hls;
-    hls.loadSource(url);
-    hls.attachMedia(video);
     hls.on(Hls.Events.ERROR, (_event, data) => {
-      if (data.fatal) this.fail("network", "实时转码视频流中断，请重试");
+      if (!data.fatal) return;
+      console.error("[remote] HLS 播放发生致命错误", {
+        type: data.type,
+        details: data.details,
+        reason: data.reason ?? data.error.message,
+        responseCode: data.response?.code,
+        url: data.url
+      });
+      this.fail("network", "实时转码视频流中断，请重试");
     });
+    hls.attachMedia(video);
+    hls.loadSource(url);
   }
 
   /** 监听 ArtPlayer 的 video/fullscreen/pip 事件。 */
@@ -301,6 +325,15 @@ export class ArtPlayerAdapter implements UnifiedPlayerAdapter {
     const active = () => this.player === player && !this.disposed;
     player.on("video:error", () => {
       if (!active()) return;
+      const video = player.template.$video;
+      console.error("[remote] 浏览器媒体元素播放失败", {
+        code: video.error?.code,
+        message: video.error?.message,
+        currentSrc: video.currentSrc,
+        readyState: video.readyState,
+        networkState: video.networkState,
+        mode: this.source?.mode
+      });
       this.fail(
         this.source?.mode === "direct" ? "decoder" : "network",
         this.source?.mode === "direct"

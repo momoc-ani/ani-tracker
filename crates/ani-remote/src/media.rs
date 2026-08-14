@@ -1,7 +1,7 @@
 use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use ani_contracts::{
@@ -26,24 +26,41 @@ use serde::Deserialize;
 use std::process::Stdio;
 use subtle::ConstantTimeEq;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::process::{Child, ChildStdin, ChildStdout, Command};
+use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
 use tokio::sync::{mpsc, Mutex};
 use tokio::task::JoinHandle;
 
 const SESSION_TTL: Duration = Duration::from_secs(30 * 60);
 const TRANSCODER_START_TIMEOUT: Duration = Duration::from_secs(20);
+const ENCODER_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+const HLS_SEGMENT_SECONDS: &str = "2";
+const FFMPEG_STDERR_LIMIT: usize = 32 * 1024;
 const MAX_SESSIONS: usize = 2;
 const RIFE_FRAME_QUEUE_CAPACITY: usize = 2;
 const RIFE_HARD_MAX_MULTIPLIER: u8 = 2;
 const REMOTE_OUTPUT_FRAME_RATE_CAP: f64 = 60.0;
 const MODEL_PIPELINE_UTILIZATION_LIMIT: f64 = 0.8;
 const MODEL_PIPELINE_SAFETY_MARGIN_MS: f64 = 5.0;
+#[cfg(target_os = "macos")]
+const ENCODER_CANDIDATES: &[(&str, &str)] = &[
+    ("h264_videotoolbox", "videotoolbox"),
+    ("libx264", "libx264"),
+];
+#[cfg(target_os = "windows")]
 const ENCODER_CANDIDATES: &[(&str, &str)] = &[
     ("h264_nvenc", "nvenc"),
     ("h264_amf", "amf"),
     ("h264_qsv", "qsv"),
     ("libx264", "libx264"),
 ];
+#[cfg(target_os = "linux")]
+const ENCODER_CANDIDATES: &[(&str, &str)] = &[
+    ("h264_nvenc", "nvenc"),
+    ("h264_qsv", "qsv"),
+    ("libx264", "libx264"),
+];
+#[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
+const ENCODER_CANDIDATES: &[(&str, &str)] = &[("libx264", "libx264")];
 const MEDIA_FILE_SEGMENT_ENCODE_SET: &AsciiSet = &CONTROLS
     .add(b' ')
     .add(b'"')
@@ -144,12 +161,16 @@ struct MediaProcess {
     decoder: Option<Child>,
     pipeline: Option<JoinHandle<Result<(), String>>>,
     pipeline_state: Option<Arc<Mutex<ModelPipelineState>>>,
+    stderr_captures: Vec<FfmpegStderrCapture>,
 }
 
 impl Drop for MediaProcess {
     fn drop(&mut self) {
         if let Some(pipeline) = self.pipeline.take() {
             pipeline.abort();
+        }
+        for capture in self.stderr_captures.drain(..) {
+            capture.abort();
         }
     }
 }
@@ -166,6 +187,52 @@ impl MediaProcess {
         }
         let _ = self.encoder.kill().await;
         let _ = tokio::time::timeout(Duration::from_secs(2), self.encoder.wait()).await;
+        for capture in self.stderr_captures.drain(..) {
+            capture.finish().await;
+        }
+    }
+}
+
+struct FfmpegStderrCapture {
+    label: &'static str,
+    buffer: Arc<StdMutex<Vec<u8>>>,
+    task: JoinHandle<()>,
+}
+
+impl Drop for FfmpegStderrCapture {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+impl FfmpegStderrCapture {
+    /// 返回当前已捕获的 FFmpeg 错误文本，供启动失败诊断使用。
+    fn snapshot(&self) -> String {
+        let bytes = self
+            .buffer
+            .lock()
+            .map(|buffer| buffer.clone())
+            .unwrap_or_default();
+        String::from_utf8_lossy(&bytes).trim().to_owned()
+    }
+
+    /// 等待 stderr 读取完成，并记录仍有价值的运行时警告。
+    async fn finish(mut self) {
+        if tokio::time::timeout(Duration::from_secs(1), &mut self.task)
+            .await
+            .is_err()
+        {
+            self.task.abort();
+        }
+        let message = self.snapshot();
+        if !message.is_empty() {
+            log::debug!("FFmpeg {} stderr={message}", self.label);
+        }
+    }
+
+    /// 中止随媒体进程一起销毁的 stderr 读取任务。
+    fn abort(self) {
+        self.task.abort();
     }
 }
 
@@ -218,6 +285,7 @@ pub struct RemoteMediaSessionService {
     sessions: Mutex<HashMap<String, Arc<SessionRecord>>>,
     rife_runtime: Mutex<Option<Arc<ModelSidecarRuntime>>>,
     realesrgan_runtime: Mutex<Option<Arc<ModelSidecarRuntime>>>,
+    encoder_candidates: Mutex<Option<Vec<(&'static str, &'static str)>>>,
 }
 
 impl RemoteMediaSessionService {
@@ -234,6 +302,7 @@ impl RemoteMediaSessionService {
             sessions: Mutex::new(HashMap::new()),
             rife_runtime: Mutex::new(None),
             realesrgan_runtime: Mutex::new(None),
+            encoder_candidates: Mutex::new(None),
         }
     }
 
@@ -1074,6 +1143,32 @@ impl RemoteMediaSessionService {
         Ok(runtime)
     }
 
+    /// 探测当前 FFmpeg 真正可启动的编码器，并缓存本机稳定候选顺序。
+    async fn available_encoder_candidates(&self) -> Vec<(&'static str, &'static str)> {
+        if let Some(candidates) = self.encoder_candidates.lock().await.as_ref() {
+            return candidates.clone();
+        }
+        let mut candidates = Vec::new();
+        for &(codec, encoder) in ENCODER_CANDIDATES {
+            match probe_video_encoder(&self.tools.ffmpeg_path, codec).await {
+                Ok(()) => {
+                    log::info!("远程视频编码器探测通过 encoder={encoder} codec={codec}");
+                    candidates.push((codec, encoder));
+                }
+                Err(reason) => {
+                    log::warn!(
+                        "远程视频编码器探测失败 encoder={encoder} codec={codec} reason={reason}"
+                    );
+                }
+            }
+        }
+        if candidates.is_empty() {
+            candidates.push(("libx264", "libx264"));
+        }
+        *self.encoder_candidates.lock().await = Some(candidates.clone());
+        candidates
+    }
+
     async fn start_hls_ffmpeg(
         &self,
         source_path: &Path,
@@ -1083,73 +1178,92 @@ impl RemoteMediaSessionService {
         let playlist = output_directory.join("index.m3u8");
         let segments = output_directory.join("segment-%06d.ts");
         let mut last_error = None;
-        for (index, (codec, encoder)) in ENCODER_CANDIDATES.iter().enumerate() {
-            let _ = tokio::fs::remove_file(&playlist).await;
-            let mut command = hidden_command(&self.tools.ffmpeg_path);
-            command
-                .args(["-nostdin", "-hide_banner", "-loglevel", "warning", "-i"])
-                .arg(source_path)
-                .args(["-map", "0:v:0", "-map", "0:a:0?", "-c:v"])
-                .args(encoder_video_args(codec))
-                .args(remote_video_filter_args(enhancement))
-                .args([
-                    "-pix_fmt",
-                    "yuv420p",
-                    "-c:a",
-                    "aac",
-                    "-b:a",
-                    "160k",
-                    "-ac",
-                    "2",
-                    "-f",
-                    "hls",
-                    "-hls_time",
-                    "4",
-                    "-hls_list_size",
-                    "0",
-                    "-hls_playlist_type",
-                    "event",
-                    "-hls_segment_filename",
-                ])
-                .arg(&segments)
-                .arg(&playlist)
-                .kill_on_drop(true);
-            let mut child = match command.spawn() {
-                Ok(child) => child,
-                Err(error) => {
-                    last_error = Some(error.to_string());
-                    continue;
+        let candidates = self.available_encoder_candidates().await;
+        for (profile_index, profile) in hls_enhancement_profiles(enhancement)
+            .into_iter()
+            .enumerate()
+        {
+            for &(codec, encoder) in &candidates {
+                let _ = tokio::fs::remove_file(&playlist).await;
+                let mut command = hidden_command(&self.tools.ffmpeg_path);
+                command
+                    .args(["-nostdin", "-hide_banner", "-loglevel", "warning", "-i"])
+                    .arg(source_path)
+                    .args(["-map", "0:v:0", "-map", "0:a:0?", "-c:v"])
+                    .args(encoder_video_args(codec))
+                    .args(remote_video_filter_args(profile.enhancement))
+                    .args([
+                        "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "160k", "-ac", "2",
+                    ])
+                    .stderr(Stdio::piped());
+                append_hls_output_args(&mut command, &segments, &playlist);
+                command.kill_on_drop(true);
+                let mut child = match command.spawn() {
+                    Ok(child) => child,
+                    Err(error) => {
+                        last_error = Some(error.to_string());
+                        continue;
+                    }
+                };
+                let stderr = child
+                    .stderr
+                    .take()
+                    .map(|stderr| capture_ffmpeg_stderr("encoder", stderr));
+                let started = tokio::time::Instant::now();
+                loop {
+                    if hls_playlist_ready(&playlist).await {
+                        return Ok(HlsStart {
+                            process: MediaProcess {
+                                encoder: child,
+                                decoder: None,
+                                pipeline: None,
+                                pipeline_state: None,
+                                stderr_captures: stderr.into_iter().collect(),
+                            },
+                            encoder,
+                            encoder_degraded: profile_index > 0 || encoder_is_degraded(encoder),
+                            actual_video_enhancement: profile.enhancement.video_enhancement,
+                            actual_interpolation: profile.enhancement.frame_interpolation,
+                            interpolation_capacity: None,
+                            model_backend: None,
+                            degradation_reason: profile.degradation_reason.map(str::to_owned),
+                        });
+                    }
+                    if let Ok(Some(status)) = child.try_wait() {
+                        let detail = stderr
+                            .as_ref()
+                            .map(FfmpegStderrCapture::snapshot)
+                            .unwrap_or_default();
+                        last_error = Some(encoder_failure_message(
+                            encoder,
+                            &format!("提前退出：{status}"),
+                            &detail,
+                        ));
+                        break;
+                    }
+                    if started.elapsed() >= TRANSCODER_START_TIMEOUT {
+                        let _ = child.kill().await;
+                        let _ = tokio::time::timeout(Duration::from_secs(1), child.wait()).await;
+                        let detail = stderr
+                            .as_ref()
+                            .map(FfmpegStderrCapture::snapshot)
+                            .unwrap_or_default();
+                        last_error = Some(encoder_failure_message(encoder, "启动超时", &detail));
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
                 }
-            };
-            let started = tokio::time::Instant::now();
-            loop {
-                if tokio::fs::try_exists(&playlist).await.unwrap_or(false) {
-                    return Ok(HlsStart {
-                        process: MediaProcess {
-                            encoder: child,
-                            decoder: None,
-                            pipeline: None,
-                            pipeline_state: None,
-                        },
-                        encoder,
-                        encoder_degraded: index > 0,
-                        actual_video_enhancement: enhancement.video_enhancement,
-                        actual_interpolation: enhancement.frame_interpolation,
-                        interpolation_capacity: None,
-                        model_backend: None,
-                        degradation_reason: None,
-                    });
+                if let Some(stderr) = stderr {
+                    stderr.finish().await;
                 }
-                if let Ok(Some(status)) = child.try_wait() {
-                    last_error = Some(format!("编码器 {encoder} 提前退出：{status}"));
+                if profile.enhancement.frame_interpolation
+                    == PlayerFrameInterpolation::MotionCompensated
+                    && last_error
+                        .as_deref()
+                        .is_some_and(|message| message.contains("启动超时"))
+                {
                     break;
                 }
-                if started.elapsed() >= TRANSCODER_START_TIMEOUT {
-                    let _ = child.kill().await;
-                    last_error = Some(format!("编码器 {encoder} 启动超时"));
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(100)).await;
             }
         }
         Err(RemoteMediaError::new(
@@ -1197,6 +1311,10 @@ impl RemoteMediaSessionService {
             RemoteMediaError::new(503, "MODEL_OUTPUT_SIZE_INVALID", "模型输出高度溢出")
         })?;
         let dimensions = format!("{output_width}x{output_height}");
+        let candidates = self.available_encoder_candidates().await;
+        let &(encoder_codec, encoder_name) = candidates.first().ok_or_else(|| {
+            RemoteMediaError::new(503, "MODEL_ENCODER_UNAVAILABLE", "没有可用的视频编码器")
+        })?;
         let mut decoder = hidden_command(&self.tools.ffmpeg_path);
         decoder
             .args(["-nostdin", "-hide_banner", "-loglevel", "error", "-i"])
@@ -1206,10 +1324,15 @@ impl RemoteMediaSessionService {
                 "pipe:1",
             ])
             .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
             .kill_on_drop(true);
         let mut decoder = decoder.spawn().map_err(|error| {
             RemoteMediaError::new(503, "MODEL_DECODER_UNAVAILABLE", error.to_string())
         })?;
+        let decoder_stderr = decoder
+            .stderr
+            .take()
+            .map(|stderr| capture_ffmpeg_stderr("model-decoder", stderr));
         let decoder_stdout = decoder.stdout.take().ok_or_else(|| {
             RemoteMediaError::new(
                 503,
@@ -1240,7 +1363,7 @@ impl RemoteMediaSessionService {
             ])
             .arg(source_path)
             .args(["-map", "0:v:0", "-map", "1:a:0?", "-c:v"])
-            .args(encoder_video_args("libx264"))
+            .args(encoder_video_args(encoder_codec))
             .args(remote_video_filter_args(RemotePlaybackEnhancement {
                 video_enhancement: if model_enhancement_active {
                     PlayerVideoEnhancement::Off
@@ -1259,23 +1382,18 @@ impl RemoteMediaSessionService {
                 "-ac",
                 "2",
                 "-shortest",
-                "-f",
-                "hls",
-                "-hls_time",
-                "4",
-                "-hls_list_size",
-                "0",
-                "-hls_playlist_type",
-                "event",
-                "-hls_segment_filename",
             ])
-            .arg(&segments)
-            .arg(&playlist)
             .stdin(Stdio::piped())
-            .kill_on_drop(true);
+            .stderr(Stdio::piped());
+        append_hls_output_args(&mut encoder, &segments, &playlist);
+        encoder.kill_on_drop(true);
         let mut encoder = encoder.spawn().map_err(|error| {
             RemoteMediaError::new(503, "MODEL_ENCODER_UNAVAILABLE", error.to_string())
         })?;
+        let encoder_stderr = encoder
+            .stderr
+            .take()
+            .map(|stderr| capture_ffmpeg_stderr("model-encoder", stderr));
         let encoder_stdin = encoder.stdin.take().ok_or_else(|| {
             RemoteMediaError::new(
                 503,
@@ -1296,7 +1414,7 @@ impl RemoteMediaSessionService {
             degradation_reasons: Vec::new(),
         }));
         let model_backend = pipeline_state.lock().await.model_backend();
-        let pipeline = tokio::spawn(run_model_pipeline(
+        let mut pipeline = tokio::spawn(run_model_pipeline(
             decoder_stdout,
             encoder_stdin,
             ModelPipelineConfig {
@@ -1311,16 +1429,20 @@ impl RemoteMediaSessionService {
         ));
         let started = tokio::time::Instant::now();
         loop {
-            if tokio::fs::try_exists(&playlist).await.unwrap_or(false) {
+            if hls_playlist_ready(&playlist).await {
+                let mut stderr_captures = Vec::new();
+                stderr_captures.extend(decoder_stderr);
+                stderr_captures.extend(encoder_stderr);
                 return Ok(HlsStart {
                     process: MediaProcess {
                         encoder,
                         decoder: Some(decoder),
                         pipeline: Some(pipeline),
                         pipeline_state: Some(pipeline_state),
+                        stderr_captures,
                     },
-                    encoder: "libx264",
-                    encoder_degraded: true,
+                    encoder: encoder_name,
+                    encoder_degraded: encoder_is_degraded(encoder_name),
                     actual_video_enhancement: enhancement.video_enhancement,
                     actual_interpolation: enhancement.frame_interpolation,
                     interpolation_capacity,
@@ -1328,23 +1450,53 @@ impl RemoteMediaSessionService {
                     degradation_reason: None,
                 });
             }
+            if pipeline.is_finished() {
+                let pipeline_error = match (&mut pipeline).await {
+                    Ok(Ok(())) => "模型帧管线在首个 HLS 分片前结束".to_owned(),
+                    Ok(Err(reason)) => reason,
+                    Err(error) => format!("模型帧任务失败：{error}"),
+                };
+                let _ = decoder.kill().await;
+                let _ = encoder.kill().await;
+                return Err(RemoteMediaError::new(
+                    503,
+                    "MODEL_PIPELINE_EXITED",
+                    pipeline_error,
+                ));
+            }
             if let Ok(Some(status)) = encoder.try_wait() {
                 let _ = decoder.kill().await;
                 pipeline.abort();
+                let detail = encoder_stderr
+                    .as_ref()
+                    .map(FfmpegStderrCapture::snapshot)
+                    .unwrap_or_default();
                 return Err(RemoteMediaError::new(
                     503,
                     "MODEL_ENCODER_EXITED",
-                    format!("模型管线编码器提前退出：{status}"),
+                    encoder_failure_message(encoder_name, &format!("提前退出：{status}"), &detail),
                 ));
             }
             if started.elapsed() >= TRANSCODER_START_TIMEOUT {
                 pipeline.abort();
                 let _ = decoder.kill().await;
                 let _ = encoder.kill().await;
+                let encoder_detail = encoder_stderr
+                    .as_ref()
+                    .map(FfmpegStderrCapture::snapshot)
+                    .unwrap_or_default();
+                let decoder_detail = decoder_stderr
+                    .as_ref()
+                    .map(FfmpegStderrCapture::snapshot)
+                    .unwrap_or_default();
+                let detail = [encoder_detail, decoder_detail]
+                    .into_iter()
+                    .find(|value| !value.is_empty())
+                    .unwrap_or_default();
                 return Err(RemoteMediaError::new(
                     503,
                     "MODEL_PIPELINE_START_TIMEOUT",
-                    "模型远程管线启动超时",
+                    encoder_failure_message(encoder_name, "模型远程管线启动超时", &detail),
                 ));
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -1401,6 +1553,12 @@ struct VideoProbe {
     width: u32,
     height: u32,
     frame_rate: f64,
+}
+
+#[derive(Clone, Copy)]
+struct HlsEnhancementProfile {
+    enhancement: RemotePlaybackEnhancement,
+    degradation_reason: Option<&'static str>,
 }
 
 struct ModelHlsConfig {
@@ -1845,23 +2003,184 @@ fn remote_video_filter_args(enhancement: RemotePlaybackEnhancement) -> Vec<Strin
     }
 }
 
+/// 为高成本运动补偿追加无插帧重试，保证远程播放优先可用。
+fn hls_enhancement_profiles(enhancement: RemotePlaybackEnhancement) -> Vec<HlsEnhancementProfile> {
+    let mut profiles = vec![HlsEnhancementProfile {
+        enhancement,
+        degradation_reason: None,
+    }];
+    if enhancement.frame_interpolation == PlayerFrameInterpolation::MotionCompensated {
+        profiles.push(HlsEnhancementProfile {
+            enhancement: RemotePlaybackEnhancement {
+                frame_interpolation: PlayerFrameInterpolation::Off,
+                ..enhancement
+            },
+            degradation_reason: Some("运动补偿未能在实时预算内启动，已关闭远程插帧"),
+        });
+    }
+    profiles
+}
+
 /// 返回各编码器合法的视频参数，避免把 libx264 参数误传给硬件编码器。
 fn encoder_video_args(codec: &str) -> &'static [&'static str] {
     match codec {
+        "h264_videotoolbox" => &[
+            "h264_videotoolbox",
+            "-realtime",
+            "1",
+            "-allow_sw",
+            "1",
+            "-prio_speed",
+            "1",
+            "-b:v",
+            "6M",
+            "-maxrate",
+            "8M",
+            "-bufsize",
+            "12M",
+        ],
         "h264_nvenc" => &["h264_nvenc", "-preset", "p4", "-rc", "vbr", "-cq", "23"],
         "h264_amf" => &[
             "h264_amf", "-quality", "balanced", "-qp_i", "23", "-qp_p", "23",
         ],
         "h264_qsv" => &["h264_qsv", "-global_quality", "23"],
-        _ => &["libx264", "-preset", "veryfast", "-crf", "23"],
+        _ => &[
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-tune",
+            "zerolatency",
+            "-crf",
+            "23",
+        ],
     }
+}
+
+/// 判断当前编码器是否偏离平台首选项，供远程会话准确上报降级状态。
+fn encoder_is_degraded(encoder: &str) -> bool {
+    ENCODER_CANDIDATES
+        .first()
+        .is_some_and(|(_, preferred)| *preferred != encoder)
+}
+
+/// 追加低延迟 HLS 输出参数，确保首段在固定关键帧处及时落盘。
+fn append_hls_output_args(command: &mut Command, segments: &Path, playlist: &Path) {
+    command
+        .args([
+            "-force_key_frames",
+            "expr:gte(t,n_forced*2)",
+            "-f",
+            "hls",
+            "-hls_time",
+            HLS_SEGMENT_SECONDS,
+            "-hls_init_time",
+            "1",
+            "-hls_list_size",
+            "0",
+            "-hls_playlist_type",
+            "event",
+            "-hls_flags",
+            "independent_segments+temp_file",
+            "-hls_segment_filename",
+        ])
+        .arg(segments)
+        .arg(playlist);
+}
+
+/// 确认播放列表已包含可播放分片，而不只判断空文件存在。
+async fn hls_playlist_ready(playlist: &Path) -> bool {
+    tokio::fs::read(playlist).await.ok().is_some_and(|content| {
+        content
+            .windows(b"#EXTINF".len())
+            .any(|item| item == b"#EXTINF")
+    })
+}
+
+/// 有界读取 FFmpeg stderr，避免子进程日志填满管道并保留失败证据。
+fn capture_ffmpeg_stderr(label: &'static str, mut stderr: ChildStderr) -> FfmpegStderrCapture {
+    let buffer = Arc::new(StdMutex::new(Vec::new()));
+    let task_buffer = Arc::clone(&buffer);
+    let task = tokio::spawn(async move {
+        let mut chunk = [0_u8; 4 * 1024];
+        loop {
+            let count = match stderr.read(&mut chunk).await {
+                Ok(0) | Err(_) => break,
+                Ok(count) => count,
+            };
+            let Ok(mut output) = task_buffer.lock() else {
+                break;
+            };
+            let overflow = output
+                .len()
+                .saturating_add(count)
+                .saturating_sub(FFMPEG_STDERR_LIMIT);
+            if overflow > 0 {
+                let drain = overflow.min(output.len());
+                output.drain(..drain);
+            }
+            output.extend_from_slice(&chunk[..count]);
+        }
+    });
+    FfmpegStderrCapture {
+        label,
+        buffer,
+        task,
+    }
+}
+
+/// 使用最小测试帧验证编码器不仅存在于清单中，而且能实际创建会话。
+async fn probe_video_encoder(ffmpeg_path: &Path, codec: &str) -> Result<(), String> {
+    let mut command = hidden_command(ffmpeg_path);
+    command
+        .args([
+            "-nostdin",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=c=black:s=64x64:r=1",
+            "-frames:v",
+            "1",
+            "-an",
+            "-c:v",
+        ])
+        .args(encoder_video_args(codec))
+        .args(["-pix_fmt", "yuv420p", "-f", "null", "-"])
+        .kill_on_drop(true);
+    match tokio::time::timeout(ENCODER_PROBE_TIMEOUT, command.output()).await {
+        Ok(Ok(output)) if output.status.success() => Ok(()),
+        Ok(Ok(output)) => Err(encoder_failure_message(
+            codec,
+            &format!("探测退出：{}", output.status),
+            &String::from_utf8_lossy(&output.stderr),
+        )),
+        Ok(Err(error)) => Err(error.to_string()),
+        Err(_) => Err("编码器探测超时".to_owned()),
+    }
+}
+
+/// 合并稳定错误和 FFmpeg 最后一条有效诊断，避免只返回笼统超时。
+fn encoder_failure_message(encoder: &str, summary: &str, stderr: &str) -> String {
+    let detail = stderr
+        .lines()
+        .rev()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .map(|line| line.chars().take(512).collect::<String>());
+    detail.map_or_else(
+        || format!("编码器 {encoder} {summary}"),
+        |detail| format!("编码器 {encoder} {summary}：{detail}"),
+    )
 }
 
 #[cfg(test)]
 mod encoder_tests {
     use super::{
-        encoder_video_args, remote_video_filter_args, validate_remote_enhancement,
-        ENCODER_CANDIDATES, MODEL_PIPELINE_SAFETY_MARGIN_MS, MODEL_PIPELINE_UTILIZATION_LIMIT,
+        encoder_failure_message, encoder_is_degraded, encoder_video_args, hls_enhancement_profiles,
+        remote_video_filter_args, validate_remote_enhancement, ENCODER_CANDIDATES,
+        MODEL_PIPELINE_SAFETY_MARGIN_MS, MODEL_PIPELINE_UTILIZATION_LIMIT,
         REMOTE_OUTPUT_FRAME_RATE_CAP, RIFE_HARD_MAX_MULTIPLIER,
     };
     use ani_contracts::{
@@ -1871,15 +2190,44 @@ mod encoder_tests {
 
     #[test]
     fn selects_vendor_specific_video_options() {
+        assert_eq!(
+            encoder_video_args("h264_videotoolbox")[0],
+            "h264_videotoolbox"
+        );
+        assert!(encoder_video_args("h264_videotoolbox").contains(&"-realtime"));
+        assert!(encoder_video_args("h264_videotoolbox").contains(&"-allow_sw"));
         assert_eq!(encoder_video_args("h264_nvenc")[0], "h264_nvenc");
         assert!(encoder_video_args("h264_nvenc").contains(&"-cq"));
         assert!(encoder_video_args("h264_amf").contains(&"-qp_i"));
         assert!(encoder_video_args("h264_qsv").contains(&"-global_quality"));
         assert!(encoder_video_args("libx264").contains(&"-crf"));
+        assert!(encoder_video_args("libx264").contains(&"zerolatency"));
     }
 
     #[test]
-    fn tries_nvidia_amd_intel_before_software_fallback() {
+    fn keeps_software_encoder_as_the_last_fallback() {
+        assert_eq!(ENCODER_CANDIDATES.last(), Some(&("libx264", "libx264")));
+        assert!(!encoder_is_degraded(ENCODER_CANDIDATES[0].1));
+        if ENCODER_CANDIDATES.len() > 1 {
+            assert!(encoder_is_degraded("libx264"));
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn prefers_videotoolbox_on_macos() {
+        assert_eq!(
+            ENCODER_CANDIDATES,
+            &[
+                ("h264_videotoolbox", "videotoolbox"),
+                ("libx264", "libx264"),
+            ]
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn tries_nvidia_amd_intel_before_software_on_windows() {
         assert_eq!(
             ENCODER_CANDIDATES,
             &[
@@ -1888,6 +2236,42 @@ mod encoder_tests {
                 ("h264_qsv", "qsv"),
                 ("libx264", "libx264"),
             ]
+        );
+    }
+
+    #[test]
+    fn retries_motion_compensation_without_interpolation() {
+        let profiles = hls_enhancement_profiles(RemotePlaybackEnhancement {
+            video_enhancement: PlayerVideoEnhancement::Clear,
+            frame_interpolation: PlayerFrameInterpolation::MotionCompensated,
+        });
+        assert_eq!(profiles.len(), 2);
+        assert_eq!(
+            profiles[0].enhancement.frame_interpolation,
+            PlayerFrameInterpolation::MotionCompensated
+        );
+        assert_eq!(
+            profiles[1].enhancement.frame_interpolation,
+            PlayerFrameInterpolation::Off
+        );
+        assert!(profiles[1]
+            .degradation_reason
+            .is_some_and(|reason| reason.contains("已关闭远程插帧")));
+    }
+
+    #[test]
+    fn appends_the_last_ffmpeg_diagnostic_to_encoder_errors() {
+        assert_eq!(
+            encoder_failure_message(
+                "videotoolbox",
+                "提前退出",
+                "first diagnostic\nfinal diagnostic\n"
+            ),
+            "编码器 videotoolbox 提前退出：final diagnostic"
+        );
+        assert_eq!(
+            encoder_failure_message("libx264", "启动超时", ""),
+            "编码器 libx264 启动超时"
         );
     }
 
