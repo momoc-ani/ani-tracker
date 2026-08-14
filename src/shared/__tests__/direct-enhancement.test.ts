@@ -8,6 +8,7 @@ test("F5 只有 WebCodecs、WebGPU、画布和 codec 全部通过才可用", () 
     videoFrameAvailable: true,
     audioDecoderAvailable: true,
     audioDataAvailable: true,
+    audioContextAvailable: true,
     shaderAvailable: true,
     webGpuAvailable: true,
     gpuDeviceAvailable: true,
@@ -30,6 +31,7 @@ test("缺少 WebGPU 或 codec 时必须保持增强关闭并返回原因", () =>
     videoFrameAvailable: true,
     audioDecoderAvailable: true,
     audioDataAvailable: true,
+    audioContextAvailable: true,
     shaderAvailable: true,
     webGpuAvailable: true,
     gpuDeviceAvailable: false,
@@ -51,6 +53,7 @@ test("没有 WebCodecs 时不允许误报终端增强", () => {
     videoFrameAvailable: false,
     audioDecoderAvailable: true,
     audioDataAvailable: true,
+    audioContextAvailable: true,
     shaderAvailable: true,
     webGpuAvailable: true,
     gpuDeviceAvailable: true,
@@ -72,6 +75,7 @@ test("WebCodecs 支持但媒体能力不流畅时保持关闭", () => {
     videoFrameAvailable: true,
     audioDecoderAvailable: true,
     audioDataAvailable: true,
+    audioContextAvailable: true,
     shaderAvailable: true,
     webGpuAvailable: true,
     gpuDeviceAvailable: true,
@@ -92,6 +96,7 @@ test("缺少音频 WebCodecs 时不能进入音视频时钟阶段", () => {
     videoFrameAvailable: true,
     audioDecoderAvailable: false,
     audioDataAvailable: false,
+    audioContextAvailable: true,
     shaderAvailable: true,
     webGpuAvailable: true,
     gpuDeviceAvailable: true,
@@ -105,4 +110,26 @@ test("缺少音频 WebCodecs 时不能进入音视频时钟阶段", () => {
   assert.equal(result.supported, false);
   assert.equal(result.audioWebCodecs, false);
   assert.match(result.reason ?? "", /AudioDecoder/);
+});
+
+test("缺少 AudioContext 时不能启用独立音频主时钟", () => {
+  const result = evaluateDirectEnhancementCapabilities({
+    videoDecoderAvailable: true,
+    videoFrameAvailable: true,
+    audioDecoderAvailable: true,
+    audioDataAvailable: true,
+    audioContextAvailable: false,
+    shaderAvailable: true,
+    webGpuAvailable: true,
+    gpuDeviceAvailable: true,
+    offscreenCanvasAvailable: true,
+    mediaCapabilitiesAvailable: true,
+    supportedCodecs: ["avc1.640028"],
+    smoothCodecs: ["avc1.640028"],
+    powerEfficientCodecs: ["avc1.640028"]
+  });
+
+  assert.equal(result.supported, false);
+  assert.equal(result.audioContext, false);
+  assert.match(result.reason ?? "", /AudioContext/);
 });

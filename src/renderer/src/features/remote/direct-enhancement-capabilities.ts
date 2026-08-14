@@ -54,6 +54,7 @@ interface BrowserCapabilityGlobals {
   VideoFrame?: unknown;
   AudioDecoder?: BrowserAudioDecoder;
   AudioData?: unknown;
+  AudioContext?: unknown;
   OffscreenCanvas?: unknown;
   navigator?: Navigator & { gpu?: BrowserGpu; mediaCapabilities?: BrowserMediaCapabilities };
 }
@@ -70,6 +71,7 @@ export async function probeDirectEnhancementCapabilities(
     videoFrameAvailable: globals.VideoFrame !== undefined,
     audioDecoderAvailable: Boolean(globals.AudioDecoder?.isConfigSupported),
     audioDataAvailable: globals.AudioData !== undefined,
+    audioContextAvailable: globals.AudioContext !== undefined,
     shaderAvailable: false,
     webGpuAvailable: Boolean(webGpu?.requestAdapter),
     gpuDeviceAvailable: false,

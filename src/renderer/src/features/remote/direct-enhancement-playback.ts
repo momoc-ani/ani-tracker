@@ -9,6 +9,10 @@ import {
   type DirectEnhancementRangeTelemetry
 } from "./direct-enhancement-demuxer";
 import {
+  createDirectEnhancementAudioPlayback,
+  type DirectEnhancementAudioPlayback
+} from "./direct-enhancement-audio";
+import {
   createDirectEnhancementWebGpuRenderer,
   type DirectEnhancementWebGpuRenderer
 } from "./direct-enhancement-webgpu";
@@ -26,6 +30,8 @@ interface QueuedVideoFrame {
 
 export interface DirectEnhancementPlaybackDiagnostics {
   active: boolean;
+  audioClock: "audio-context";
+  hasAudioTrack: boolean;
   renderedFrames: number;
   droppedFrames: number;
   decoderQueueSize: number;
@@ -41,6 +47,15 @@ export interface DirectEnhancementPlaybackDiagnostics {
   degradationReason?: string;
 }
 
+export interface DirectEnhancementPlaybackState {
+  ended: boolean;
+  muted: boolean;
+  playbackRate: number;
+  positionSeconds: number;
+  running: boolean;
+  volume: number;
+}
+
 export interface DirectEnhancementPlaybackOptions {
   canvas: HTMLCanvasElement;
   mediaElement: HTMLVideoElement;
@@ -54,21 +69,34 @@ export interface DirectEnhancementPlaybackOptions {
 }
 
 export interface DirectEnhancementPlaybackController {
+  subscribe(listener: (state: DirectEnhancementPlaybackState) => void): () => void;
+  play(): Promise<void>;
+  pause(): void;
+  seek(positionSeconds: number): Promise<void>;
+  setVolume(volume: number): void;
+  setMuted(muted: boolean): void;
+  setPlaybackRate(rate: number): void;
   setPreset(preset: "balanced" | "clear"): void;
   getDiagnostics(): DirectEnhancementPlaybackDiagnostics;
   dispose(): Promise<void>;
 }
 
-/** 创建由现有媒体元素提供音频主时钟的 WebCodecs/WebGPU 视频增强循环。 */
+/** 创建由独立 AudioContext 提供主时钟的 WebCodecs/WebGPU 音视频增强循环。 */
 export async function createDirectEnhancementPlayback(
   options: DirectEnhancementPlaybackOptions
 ): Promise<DirectEnhancementPlaybackController> {
+  const restoreNativePlayback = !options.mediaElement.paused;
   const playback = new DirectEnhancementPlayback(options);
   try {
     await playback.initialize();
     return playback;
   } catch (error) {
     await playback.dispose();
+    if (restoreNativePlayback && !options.signal?.aborted && options.mediaElement.isConnected) {
+      void options.mediaElement.play().catch((restoreError) => {
+        console.warn("[remote] F5-F 初始化失败后恢复原视频播放失败", restoreError);
+      });
+    }
     throw error;
   }
 }
@@ -76,11 +104,13 @@ export async function createDirectEnhancementPlayback(
 class DirectEnhancementPlayback implements DirectEnhancementPlaybackController {
   private readonly frameQueue = new DirectEnhancementFrameQueue<QueuedVideoFrame>(8);
   private readonly performanceMonitor = new DirectEnhancementPerformanceMonitor();
+  private readonly stateListeners = new Set<(state: DirectEnhancementPlaybackState) => void>();
   private readonly mediaInput;
   private readonly telemetry: DirectEnhancementRangeTelemetry;
   private decoder?: VideoDecoder;
   private decoderConfig?: VideoDecoderConfig;
   private renderer?: DirectEnhancementWebGpuRenderer;
+  private audioPlayback?: DirectEnhancementAudioPlayback;
   private packetSink?: EncodedPacketSink;
   private nextPacket: EncodedPacket | null | undefined;
   private decodePump?: Promise<void>;
@@ -98,6 +128,11 @@ class DirectEnhancementPlayback implements DirectEnhancementPlaybackController {
   private lastPresentedAtMs?: number;
   private lastPresentedMediaTimeSeconds?: number;
   private gpuQueueSamplePending = false;
+  private suppressMediaPlaybackEvent = false;
+  private initiallyRunning = false;
+  private volume = 0.7;
+  private muted = false;
+  private playbackRate = 1;
   private readySettled = false;
   private failureError?: Error;
   private automaticDegradationReason?: string;
@@ -127,9 +162,10 @@ class DirectEnhancementPlayback implements DirectEnhancementPlaybackController {
     }
     this.options.signal?.addEventListener("abort", this.handleAbort, { once: true });
     const input = this.mediaInput;
-    const [format, videoTrack, durationSeconds] = await Promise.all([
+    const [format, videoTrack, audioTrack, durationSeconds] = await Promise.all([
       input.getFormat(),
       input.getPrimaryVideoTrack(),
+      input.getPrimaryAudioTrack(),
       input.getDurationFromMetadata()
     ]);
     this.throwIfStopped();
@@ -172,14 +208,104 @@ class DirectEnhancementPlayback implements DirectEnhancementPlaybackController {
     });
     this.packetSink = new EncodedPacketSink(videoTrack);
     this.decoderConfig = config;
+    this.audioPlayback = await createDirectEnhancementAudioPlayback(audioTrack, {
+      durationSeconds: durationSeconds ?? 0,
+      initialPositionSeconds: this.options.startPositionSeconds ?? this.options.mediaElement.currentTime ?? 0,
+      signal: this.options.signal,
+      onError: (error) => this.fail(error),
+      onPosition: (positionSeconds, running, ended) => {
+        this.publishPlaybackState(positionSeconds, running, ended);
+        this.scheduleAnimationFrame();
+      }
+    });
+    this.volume = this.options.mediaElement.volume;
+    this.muted = this.options.mediaElement.muted;
+    this.playbackRate = this.options.mediaElement.playbackRate;
+    this.audioPlayback.setVolume(this.volume);
+    this.audioPlayback.setMuted(this.muted);
+    this.audioPlayback.setPlaybackRate(this.playbackRate);
+    this.initiallyRunning = !this.options.mediaElement.paused;
+    this.suppressMediaPlaybackEvent = true;
+    this.options.mediaElement.pause();
+    this.suppressMediaPlaybackEvent = false;
     this.decoder = this.createDecoder(config);
     this.bindMediaEvents();
     await this.restartAt(this.options.startPositionSeconds ?? this.options.mediaElement.currentTime ?? 0);
     this.scheduleAnimationFrame();
+    if (this.initiallyRunning) await this.play();
     await this.waitForFirstFrame();
     if (this.failureError) throw this.failureError;
     if (this.disposed) throw new DOMException("F5-D 视频增强初始化已取消", "AbortError");
     this.publishDiagnostics(undefined, true);
+  }
+
+  subscribe(listener: (state: DirectEnhancementPlaybackState) => void): () => void {
+    this.stateListeners.add(listener);
+    listener({
+      ended: this.hasEnded(),
+      muted: this.muted,
+      playbackRate: this.playbackRate,
+      positionSeconds: this.getPositionSeconds(),
+      running: this.isRunning(),
+      volume: this.volume
+    });
+    return () => this.stateListeners.delete(listener);
+  }
+
+  async play(): Promise<void> {
+    this.throwIfStopped();
+    if (this.audioPlayback) {
+      this.suppressMediaPlaybackEvent = true;
+      this.options.mediaElement.pause();
+      this.suppressMediaPlaybackEvent = false;
+      await this.audioPlayback.play();
+      this.scheduleAnimationFrame();
+      this.publishPlaybackState(this.getPositionSeconds(), true, false);
+      return;
+    }
+    await this.options.mediaElement.play();
+  }
+
+  pause(): void {
+    if (this.audioPlayback) {
+      this.audioPlayback.pause();
+      this.publishPlaybackState(this.getPositionSeconds(), false, this.hasEnded());
+      return;
+    }
+    this.options.mediaElement.pause();
+  }
+
+  async seek(positionSeconds: number): Promise<void> {
+    if (this.audioPlayback) {
+      await this.audioPlayback.seek(positionSeconds);
+      await this.restartAt(positionSeconds);
+      this.publishPlaybackState(this.getPositionSeconds(), this.isRunning(), this.hasEnded());
+      this.scheduleAnimationFrame();
+      return;
+    }
+    this.options.mediaElement.currentTime = positionSeconds;
+  }
+
+  setVolume(volume: number): void {
+    this.volume = volume;
+    this.audioPlayback?.setVolume(volume);
+    if (!this.audioPlayback) this.options.mediaElement.volume = volume;
+    this.publishPlaybackState(this.getPositionSeconds(), this.isRunning(), this.hasEnded());
+  }
+
+  setMuted(muted: boolean): void {
+    this.muted = muted;
+    this.audioPlayback?.setMuted(muted);
+    if (!this.audioPlayback) this.options.mediaElement.muted = muted;
+    this.publishPlaybackState(this.getPositionSeconds(), this.isRunning(), this.hasEnded());
+  }
+
+  setPlaybackRate(rate: number): void {
+    this.playbackRate = rate;
+    this.audioPlayback?.setPlaybackRate(rate);
+    if (!this.audioPlayback) this.options.mediaElement.playbackRate = rate;
+    this.scheduleAnimationFrame();
+    this.publishPlaybackState(this.getPositionSeconds(), this.isRunning(), this.hasEnded());
   }
 
   setPreset(preset: "balanced" | "clear"): void {
@@ -194,6 +320,8 @@ class DirectEnhancementPlayback implements DirectEnhancementPlaybackController {
     const performanceSnapshot = this.performanceMonitor.snapshot(this.effectivePreset);
     return {
       active: !this.disposed && !this.failed,
+      audioClock: "audio-context",
+      hasAudioTrack: this.audioPlayback?.hasAudioTrack ?? false,
       renderedFrames: this.renderedFrames,
       droppedFrames: this.droppedFrames,
       decoderQueueSize: this.decoder?.decodeQueueSize ?? 0,
@@ -224,6 +352,8 @@ class DirectEnhancementPlayback implements DirectEnhancementPlaybackController {
     this.options.signal?.removeEventListener("abort", this.handleAbort);
     this.closeQueuedFrames();
     this.settleReady();
+    await this.audioPlayback?.dispose();
+    this.audioPlayback = undefined;
     try {
       await this.decoder?.flush();
     } catch {
@@ -233,6 +363,7 @@ class DirectEnhancementPlayback implements DirectEnhancementPlaybackController {
     this.renderer?.dispose();
     this.mediaInput.dispose();
     this.publishDiagnostics(undefined, true);
+    this.stateListeners.clear();
   }
 
   private createDecoder(config: VideoDecoderConfig): VideoDecoder {
@@ -256,9 +387,24 @@ class DirectEnhancementPlayback implements DirectEnhancementPlaybackController {
     return decoder;
   }
 
-  private readonly handlePlay = (): void => this.scheduleAnimationFrame();
+  private readonly handlePlay = (): void => {
+    if (this.audioPlayback) {
+      void this.play().catch((error) => this.fail(error));
+      return;
+    }
+    this.scheduleAnimationFrame();
+  };
+  private readonly handlePause = (): void => {
+    if (this.suppressMediaPlaybackEvent) return;
+    this.audioPlayback?.pause();
+    this.publishPlaybackState(this.getPositionSeconds(), false, this.hasEnded());
+  };
   private readonly handleSeeking = (): void => {
-    void this.restartAt(this.options.mediaElement.currentTime)
+    const positionSeconds = Math.max(0, this.options.mediaElement.currentTime || 0);
+    void (this.audioPlayback
+      ? this.audioPlayback.seek(positionSeconds)
+      : Promise.resolve())
+      .then(() => this.restartAt(positionSeconds))
       .then(() => this.scheduleAnimationFrame())
       .catch((error) => this.fail(error));
   };
@@ -273,6 +419,7 @@ class DirectEnhancementPlayback implements DirectEnhancementPlaybackController {
   private bindMediaEvents(): void {
     const media = this.options.mediaElement;
     media.addEventListener("play", this.handlePlay);
+    media.addEventListener("pause", this.handlePause);
     media.addEventListener("seeking", this.handleSeeking);
     media.addEventListener("ended", this.handleEnded);
   }
@@ -280,6 +427,7 @@ class DirectEnhancementPlayback implements DirectEnhancementPlaybackController {
   private unbindMediaEvents(): void {
     const media = this.options.mediaElement;
     media.removeEventListener("play", this.handlePlay);
+    media.removeEventListener("pause", this.handlePause);
     media.removeEventListener("seeking", this.handleSeeking);
     media.removeEventListener("ended", this.handleEnded);
   }
@@ -311,7 +459,7 @@ class DirectEnhancementPlayback implements DirectEnhancementPlaybackController {
   private readonly handleAnimationFrame = (): void => {
     this.animationFrame = undefined;
     if (this.disposed || this.failed) return;
-    const positionSeconds = Math.max(0, this.options.mediaElement.currentTime || 0);
+    const positionSeconds = this.getPositionSeconds();
     const selection = this.frameQueue.take(positionSeconds);
     this.droppedFrames += selection.discarded.length;
     if (!this.awaitingPresentedFrame) {
@@ -364,7 +512,7 @@ class DirectEnhancementPlayback implements DirectEnhancementPlaybackController {
     this.publishDiagnostics();
     if (
       this.awaitingPresentedFrame
-      || (!this.options.mediaElement.paused && !this.options.mediaElement.ended)
+      || this.isRunning()
     ) {
       this.scheduleAnimationFrame();
     }
@@ -374,7 +522,7 @@ class DirectEnhancementPlayback implements DirectEnhancementPlaybackController {
     if (this.decodePump || this.disposed || this.failed || !this.decoder || !this.packetSink) return;
     const pump = async (): Promise<void> => {
       let packet = this.nextPacket;
-      const target = Math.max(0, this.options.mediaElement.currentTime || 0) + DECODE_AHEAD_SECONDS;
+      const target = this.getPositionSeconds() + DECODE_AHEAD_SECONDS;
       while (
         packet
         && generation === this.generation
@@ -451,6 +599,34 @@ class DirectEnhancementPlayback implements DirectEnhancementPlaybackController {
     ) {
       this.fail(new Error("媒体时钟持续前进但增强画面超过 2 秒没有更新"));
     }
+  }
+
+  private getPositionSeconds(): number {
+    return this.audioPlayback?.getPositionSeconds()
+      ?? Math.max(0, this.options.mediaElement.currentTime || 0);
+  }
+
+  private isRunning(): boolean {
+    return this.audioPlayback?.isRunning() ?? !this.options.mediaElement.paused;
+  }
+
+  private hasEnded(): boolean {
+    const durationSeconds = this.audioPlayback?.durationSeconds ?? this.options.mediaElement.duration;
+    return Number.isFinite(durationSeconds)
+      && durationSeconds > 0
+      && this.getPositionSeconds() >= durationSeconds;
+  }
+
+  private publishPlaybackState(positionSeconds: number, running: boolean, ended: boolean): void {
+    const state = {
+      ended,
+      muted: this.muted,
+      playbackRate: this.playbackRate,
+      positionSeconds,
+      running,
+      volume: this.volume
+    };
+    for (const listener of this.stateListeners) listener(state);
   }
 
   private fail(caught: unknown): void {

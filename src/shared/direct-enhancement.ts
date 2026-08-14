@@ -10,6 +10,7 @@ export interface DirectEnhancementCapabilityInput {
   videoFrameAvailable: boolean;
   audioDecoderAvailable: boolean;
   audioDataAvailable: boolean;
+  audioContextAvailable: boolean;
   shaderAvailable: boolean;
   webGpuAvailable: boolean;
   gpuDeviceAvailable: boolean;
@@ -24,6 +25,7 @@ export interface DirectEnhancementCapabilities {
   supported: boolean;
   webCodecs: boolean;
   audioWebCodecs: boolean;
+  audioContext: boolean;
   shader: boolean;
   webGpu: boolean;
   offscreenCanvas: boolean;
@@ -40,12 +42,14 @@ export function evaluateDirectEnhancementCapabilities(
 ): DirectEnhancementCapabilities {
   const videoWebCodecs = input.videoDecoderAvailable && input.videoFrameAvailable;
   const audioWebCodecs = input.audioDecoderAvailable && input.audioDataAvailable;
+  const audioContext = input.audioContextAvailable;
   const webCodecs = videoWebCodecs && audioWebCodecs;
   const webGpu = input.webGpuAvailable && input.gpuDeviceAvailable;
   const supportedCodecs = [...new Set(input.supportedCodecs)];
   const smoothCodecs = [...new Set(input.smoothCodecs)];
   const powerEfficientCodecs = [...new Set(input.powerEfficientCodecs)];
   const supported = webCodecs
+    && audioContext
     && webGpu
     && input.offscreenCanvasAvailable
     && input.mediaCapabilitiesAvailable
@@ -57,6 +61,8 @@ export function evaluateDirectEnhancementCapabilities(
     reason = "当前浏览器未提供可用的 WebCodecs VideoDecoder/VideoFrame";
   } else if (!audioWebCodecs) {
     reason = "当前浏览器未提供可用的 WebCodecs AudioDecoder/AudioData";
+  } else if (!audioContext) {
+    reason = "当前浏览器未提供 AudioContext 音频输出";
   } else if (!webGpu) {
     reason = "当前浏览器未提供可用的 WebGPU adapter/device";
   } else if (!input.offscreenCanvasAvailable) {
@@ -75,6 +81,7 @@ export function evaluateDirectEnhancementCapabilities(
     supported,
     webCodecs,
     audioWebCodecs,
+    audioContext,
     shader: input.shaderAvailable,
     webGpu,
     offscreenCanvas: input.offscreenCanvasAvailable,

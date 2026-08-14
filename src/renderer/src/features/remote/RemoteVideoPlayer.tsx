@@ -451,7 +451,18 @@ export function RemoteVideoPlayer({
     if (!eligible || !directEnhancementPreset) {
       const previous = directEnhancementControllerRef.current;
       directEnhancementControllerRef.current = null;
-      if (previous) void previous.dispose();
+      if (previous) {
+        const adapter = playerAdapterRef.current;
+        const snapshot = adapter?.getSnapshot();
+        void previous.dispose().then(() => {
+          if (adapter && snapshot && playerAdapterRef.current === adapter) {
+            return adapter.deactivateDirectEnhancement(
+              snapshot.positionSeconds,
+              snapshot.status === "playing" || snapshot.status === "buffering"
+            );
+          }
+        }).catch((error) => console.warn("[remote] F5-F 关闭直传增强失败", error));
+      }
       setDirectEnhancementStatus("idle");
       setDirectEnhancementDiagnostics(undefined);
       setDirectEnhancementDegradationReason(undefined);
@@ -460,6 +471,7 @@ export function RemoteVideoPlayer({
 
     let cancelled = false;
     let playbackController: DirectEnhancementPlaybackController | undefined;
+    let unsubscribePlaybackState: (() => void) | undefined;
     const abortController = new AbortController();
     const streamUrl = new URL(session.streamUrl, window.location.href).toString();
     const startPositionSeconds = Math.max(
@@ -506,7 +518,18 @@ export function RemoteVideoPlayer({
           setDirectEnhancementDegradationReason(error.message);
           const failedController = directEnhancementControllerRef.current;
           directEnhancementControllerRef.current = null;
-          if (failedController) void failedController.dispose();
+          const fallbackAdapter = playerAdapterRef.current;
+          const snapshot = fallbackAdapter?.getSnapshot();
+          void (failedController?.dispose() ?? Promise.resolve()).then(() => {
+            if (fallbackAdapter && snapshot && playerAdapterRef.current === fallbackAdapter) {
+              return fallbackAdapter.deactivateDirectEnhancement(
+                snapshot.positionSeconds,
+                snapshot.status === "playing" || snapshot.status === "buffering"
+              );
+            }
+          }).catch((fallbackError) => {
+            console.warn("[remote] F5-F 直传增强失败后恢复原视频失败", fallbackError);
+          });
           console.warn("[remote] F5-D 直传终端增强运行失败，已恢复原视频", { error });
         }
       });
@@ -515,7 +538,24 @@ export function RemoteVideoPlayer({
         return;
       }
       playbackController = created;
+      const adapter = playerAdapterRef.current;
+      if (!adapter) {
+        await created.dispose();
+        return;
+      }
+      await adapter.activateDirectEnhancement(startPositionSeconds);
+      if (cancelled || directEnhancementRunRef.current !== runId || playerAdapterRef.current !== adapter) {
+        await created.dispose();
+        if (playerAdapterRef.current === adapter) {
+          await adapter.deactivateDirectEnhancement(startPositionSeconds, false);
+        }
+        return;
+      }
       directEnhancementControllerRef.current = created;
+      unsubscribePlaybackState = created.subscribe((state) => {
+        if (cancelled || directEnhancementRunRef.current !== runId) return;
+        playerAdapterRef.current?.updateDirectEnhancementState(state);
+      });
       setDirectEnhancementDiagnostics(created.getDiagnostics());
       setDirectEnhancementStatus("active");
       console.info("[remote] F5-D 可见 WebGPU 画布已接管视频帧");
@@ -535,7 +575,19 @@ export function RemoteVideoPlayer({
       if (directEnhancementControllerRef.current === playbackController) {
         directEnhancementControllerRef.current = null;
       }
-      if (playbackController) void playbackController.dispose();
+      unsubscribePlaybackState?.();
+      if (playbackController) {
+        const adapter = playerAdapterRef.current;
+        const snapshot = adapter?.getSnapshot();
+        void playbackController.dispose().then(() => {
+          if (adapter && snapshot && playerAdapterRef.current === adapter) {
+            return adapter.deactivateDirectEnhancement(
+              snapshot.positionSeconds,
+              snapshot.status === "playing" || snapshot.status === "buffering"
+            );
+          }
+        }).catch((error) => console.warn("[remote] F5-F 清理直传增强失败", error));
+      }
     };
   }, [
     directEnhancementAvailable,
@@ -585,11 +637,41 @@ export function RemoteVideoPlayer({
   const dispatchPlayerCommand = useCallback(async (command: PlayerCommand): Promise<boolean> => {
     const adapter = playerAdapterRef.current;
     if (!adapter) return false;
+    const direct = directEnhancementControllerRef.current;
+    if (direct && session?.mode === "direct") {
+      try {
+        switch (command.type) {
+          case "play":
+            await direct.play();
+            return true;
+          case "pause":
+            direct.pause();
+            return true;
+          case "seek":
+            await direct.seek(command.positionSeconds);
+            return true;
+          case "set-volume":
+            direct.setVolume(command.volume);
+            return true;
+          case "set-muted":
+            direct.setMuted(command.muted);
+            return true;
+          case "set-rate":
+            direct.setPlaybackRate(command.rate);
+            return true;
+          default:
+            break;
+        }
+      } catch (caught) {
+        setPlaybackError(caught instanceof Error ? caught.message : "直传增强播放器命令失败");
+        return false;
+      }
+    }
     const result = await adapter.dispatch(command);
     if (result.accepted) return true;
     setPlaybackError(result.error.message);
     return false;
-  }, []);
+  }, [session?.mode]);
 
   const createPlayerCommand = useCallback(<T extends PlayerCommand>(
     command: Omit<T, "commandId" | "sessionId">
@@ -904,6 +986,8 @@ export function RemoteVideoPlayer({
         className="player-video-stage"
         aria-label={`${animeTitle} ${episodeLabel} 视频播放器`}
         data-direct-enhancement-active={directEnhancementStatus === "active" ? "true" : undefined}
+        data-direct-enhancement-audio-clock={directEnhancementDiagnostics?.audioClock}
+        data-direct-enhancement-audio-track={directEnhancementDiagnostics?.hasAudioTrack ? "true" : undefined}
         data-direct-enhancement-av-drift-ms={directEnhancementDiagnostics?.currentAvDriftMs}
         data-direct-enhancement-degradation={
           directEnhancementDegradationReason ?? directEnhancementDiagnostics?.degradationReason

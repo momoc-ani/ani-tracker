@@ -1,5 +1,10 @@
 import Artplayer from "artplayer";
 import Hls from "hls.js";
+import type { DirectEnhancementPlaybackState } from "./direct-enhancement-playback";
+import {
+  parseDirectEnhancementSubtitleCues,
+  type DirectEnhancementSubtitleCue
+} from "@shared/direct-enhancement-media";
 import {
   createInitialPlayerSnapshot,
   PLAYER_SUBTITLE_SCALES,
@@ -57,6 +62,9 @@ export class ArtPlayerAdapter implements UnifiedPlayerAdapter {
   private player?: Artplayer;
   private hls?: Hls;
   private source?: PlayerMediaSource;
+  private directEnhancementActive = false;
+  private directSubtitleCues: DirectEnhancementSubtitleCue[] = [];
+  private directSubtitleRequest = 0;
   private sequence = 0;
   private disposed = false;
 
@@ -83,6 +91,56 @@ export class ArtPlayerAdapter implements UnifiedPlayerAdapter {
   /** 仅供直传增强控制器读取 ArtPlayer 管理的媒体时钟与音频主轨。 */
   getMediaElement(): HTMLVideoElement | undefined {
     return this.player?.template.$video;
+  }
+
+  /** 暂停并卸载原媒体源，由独立 AudioContext/WebGPU 链接管连续播放。 */
+  async activateDirectEnhancement(positionSeconds: number): Promise<void> {
+    const player = this.player;
+    if (!player || this.directEnhancementActive) return;
+    this.directEnhancementActive = true;
+    player.pause();
+    const selectedSubtitleId = this.snapshot.subtitleTracks.find((track) => track.selected)?.id;
+    const selectedSubtitle = this.source?.subtitles.find((item) => item.id === selectedSubtitleId);
+    if (selectedSubtitle) {
+      void this.loadDirectSubtitle(selectedSubtitle).catch((error) => {
+        if (!this.directEnhancementActive) return;
+        this.directSubtitleCues = [];
+        player.template.$subtitle.replaceChildren();
+        console.warn("[remote] F5-F 独立字幕加载失败，继续播放增强画面", {
+          subtitleId: selectedSubtitle.id,
+          error
+        });
+      });
+    }
+    const video = player.template.$video;
+    video.removeAttribute("src");
+    video.load();
+    this.patch({ positionSeconds, status: "paused", bufferedSeconds: positionSeconds });
+  }
+
+  /** 用独立音频主时钟刷新进度和 DOM 字幕，不再驱动原视频 seek。 */
+  updateDirectEnhancementState(state: DirectEnhancementPlaybackState): void {
+    if (!this.directEnhancementActive) return;
+    this.renderDirectSubtitle(state.positionSeconds);
+    this.patch({
+      positionSeconds: state.positionSeconds,
+      status: state.ended ? "ended" : state.running ? "playing" : "paused",
+      volume: state.volume,
+      muted: state.muted,
+      playbackRate: state.playbackRate,
+      bufferedSeconds: Math.min(this.resolveDurationSeconds(), state.positionSeconds + 1.5),
+      error: undefined
+    });
+  }
+
+  /** 重新加载原文件并从独立时钟位置恢复，用于关闭增强或运行时降级。 */
+  async deactivateDirectEnhancement(positionSeconds: number, resume: boolean): Promise<void> {
+    if (!this.directEnhancementActive || !this.source) return;
+    const source = this.source;
+    this.directEnhancementActive = false;
+    this.directSubtitleCues = [];
+    this.directSubtitleRequest += 1;
+    await this.load(source, positionSeconds, resume);
   }
 
   /** 判断绝对媒体时间是否位于当前浏览器可跳转范围。 */
@@ -221,7 +279,11 @@ export class ArtPlayerAdapter implements UnifiedPlayerAdapter {
   }
 
   /** 创建 ArtPlayer，并把媒体事件转换为统一快照。 */
-  private async load(source: PlayerMediaSource, startPositionSeconds?: number): Promise<void> {
+  private async load(
+    source: PlayerMediaSource,
+    startPositionSeconds?: number,
+    autoplay = true
+  ): Promise<void> {
     if (!isValidSource(source)) throw new Error("远程媒体资源参数无效");
     this.disposePlayer();
     this.source = source;
@@ -256,7 +318,7 @@ export class ArtPlayerAdapter implements UnifiedPlayerAdapter {
       url: streamUrl,
       ...(source.mode === "hls" ? { type: "m3u8" as const } : {}),
       lang: "zh-cn",
-      autoplay: true,
+      autoplay,
       volume: this.snapshot.volume,
       muted: this.snapshot.muted,
       setting: false,
@@ -354,8 +416,9 @@ export class ArtPlayerAdapter implements UnifiedPlayerAdapter {
   /** 监听 ArtPlayer 的 video/fullscreen/pip 事件。 */
   private bindPlayerEvents(player: Artplayer): void {
     const active = () => this.player === player && !this.disposed;
+    const nativePlaybackActive = () => active() && !this.directEnhancementActive;
     player.on("video:error", () => {
-      if (!active()) return;
+      if (!nativePlaybackActive()) return;
       const video = player.template.$video;
       console.error("[remote] 浏览器媒体元素播放失败", {
         code: video.error?.code,
@@ -372,32 +435,32 @@ export class ArtPlayerAdapter implements UnifiedPlayerAdapter {
           : "浏览器无法播放当前转码视频流，请重试"
       );
     });
-    player.on("video:play", () => active() && this.patch({ status: "playing" }));
-    player.on("video:pause", () => active() && this.patch({ status: "paused" }));
-    player.on("video:playing", () => active() && this.patch({ status: "playing", error: undefined }));
-    player.on("video:waiting", () => active() && this.patch({ status: "buffering" }));
-    player.on("video:stalled", () => active() && this.patch({ status: "buffering" }));
-    player.on("video:loadedmetadata", () => active() && this.patch({
+    player.on("video:play", () => nativePlaybackActive() && this.patch({ status: "playing" }));
+    player.on("video:pause", () => nativePlaybackActive() && this.patch({ status: "paused" }));
+    player.on("video:playing", () => nativePlaybackActive() && this.patch({ status: "playing", error: undefined }));
+    player.on("video:waiting", () => nativePlaybackActive() && this.patch({ status: "buffering" }));
+    player.on("video:stalled", () => nativePlaybackActive() && this.patch({ status: "buffering" }));
+    player.on("video:loadedmetadata", () => nativePlaybackActive() && this.patch({
       positionSeconds: this.toAbsolutePosition(player.currentTime),
       durationSeconds: this.resolveDurationSeconds()
     }));
-    player.on("video:progress", () => active() && this.patch({
+    player.on("video:progress", () => nativePlaybackActive() && this.patch({
       bufferedSeconds: this.toAbsolutePosition(player.loadedTime || 0)
     }));
-    player.on("video:volumechange", () => active() && this.patch({
+    player.on("video:volumechange", () => nativePlaybackActive() && this.patch({
       volume: player.volume,
       muted: player.muted
     }));
-    player.on("video:ratechange", () => active() && this.patch({ playbackRate: player.playbackRate }));
+    player.on("video:ratechange", () => nativePlaybackActive() && this.patch({ playbackRate: player.playbackRate }));
     player.on("fullscreen", (fullscreen: boolean) => active() && this.patch({ fullscreen }));
     player.on("fullscreenWeb", (fullscreen: boolean) => active() && this.patch({ fullscreen }));
     player.on("pip", (pictureInPicture: boolean) => active() && this.patch({ pictureInPicture }));
-    player.on("video:timeupdate", () => active() && this.patch({
+    player.on("video:timeupdate", () => nativePlaybackActive() && this.patch({
       positionSeconds: this.toAbsolutePosition(player.currentTime || 0),
       durationSeconds: this.resolveDurationSeconds(),
       bufferedSeconds: this.toAbsolutePosition(player.loadedTime || 0)
     }));
-    player.on("video:ended", () => active() && this.patch({
+    player.on("video:ended", () => nativePlaybackActive() && this.patch({
       status: "ended",
       positionSeconds: this.resolveDurationSeconds()
     }));
@@ -410,7 +473,13 @@ export class ArtPlayerAdapter implements UnifiedPlayerAdapter {
     const player = this.player!;
     const subtitle = this.source?.subtitles.find((item) => item.id === subtitleId);
     if (!subtitle) {
-      player.subtitle.show = false;
+      if (this.directEnhancementActive) {
+        this.directSubtitleCues = [];
+        this.directSubtitleRequest += 1;
+        player.template.$subtitle.replaceChildren();
+      } else {
+        player.subtitle.show = false;
+      }
       this.markSelectedSubtitle(undefined);
       return;
     }
@@ -419,6 +488,10 @@ export class ArtPlayerAdapter implements UnifiedPlayerAdapter {
   }
 
   private async switchSubtitle(player: Artplayer, subtitle: PlayerMediaSource["subtitles"][number]): Promise<void> {
+    if (this.directEnhancementActive) {
+      await this.loadDirectSubtitle(subtitle);
+      return;
+    }
     const subtitleUrl = new URL(subtitle.uri, this.options.baseUrl ?? window.location.origin).toString();
     await player.subtitle.switch(subtitleUrl, {
       name: subtitle.label,
@@ -426,6 +499,46 @@ export class ArtPlayerAdapter implements UnifiedPlayerAdapter {
       encoding: "utf-8"
     });
     player.subtitle.show = true;
+  }
+
+  private async loadDirectSubtitle(subtitle: PlayerMediaSource["subtitles"][number]): Promise<void> {
+    const player = this.player;
+    if (!player) return;
+    const request = ++this.directSubtitleRequest;
+    const subtitleUrl = new URL(subtitle.uri, this.options.baseUrl ?? window.location.origin).toString();
+    const response = await fetch(subtitleUrl, { cache: "no-store", credentials: "same-origin" });
+    if (!response.ok) throw new Error(`字幕请求失败：HTTP ${response.status}`);
+    const rawText = await response.text();
+    if (request !== this.directSubtitleRequest || !this.directEnhancementActive) return;
+    const vttText = subtitle.type === "ass"
+      ? Artplayer.utils.assToVtt(rawText)
+      : rawText;
+    this.directSubtitleCues = parseDirectEnhancementSubtitleCues(vttText);
+    player.subtitle.show = true;
+    this.renderDirectSubtitle(this.snapshot.positionSeconds);
+    console.info("[remote] F5-F 独立字幕 cue 已加载", {
+      subtitleId: subtitle.id,
+      cueCount: this.directSubtitleCues.length
+    });
+  }
+
+  private renderDirectSubtitle(positionSeconds: number): void {
+    const container = this.player?.template.$subtitle;
+    if (!container) return;
+    const active = this.directSubtitleCues.filter(
+      (cue) => positionSeconds >= cue.startSeconds && positionSeconds < cue.endSeconds
+    );
+    const fragment = document.createDocumentFragment();
+    active.forEach((cue, groupIndex) => {
+      for (const line of cue.text.split(/\r?\n/).filter((item) => item.trim())) {
+        const element = document.createElement("div");
+        element.className = "art-subtitle-line";
+        element.dataset.group = String(groupIndex);
+        element.textContent = line;
+        fragment.appendChild(element);
+      }
+    });
+    container.replaceChildren(fragment);
   }
 
   private markSelectedSubtitle(subtitleId?: string): void {
@@ -520,6 +633,9 @@ export class ArtPlayerAdapter implements UnifiedPlayerAdapter {
   }
 
   private disposePlayer(): void {
+    this.directSubtitleRequest += 1;
+    this.directSubtitleCues = [];
+    this.directEnhancementActive = false;
     this.hls?.destroy();
     this.hls = undefined;
     const player = this.player;

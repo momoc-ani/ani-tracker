@@ -5,7 +5,8 @@ import {
   DirectEnhancementMediaClock,
   DirectEnhancementPerformanceMonitor,
   evaluateDirectEnhancementMediaCandidate,
-  normalizeDirectEnhancementVideoCodec
+  normalizeDirectEnhancementVideoCodec,
+  parseDirectEnhancementSubtitleCues
 } from "../direct-enhancement-media";
 
 test("F5-B 识别 MP4/WebM 首批 codec string", () => {
@@ -96,6 +97,24 @@ test("F5-E 帧预算随源帧率收紧且不按 GPU 品牌硬编码", () => {
   assert.equal(source60Fps.snapshot("balanced").action, "fallback");
   assert.equal(Math.round(source24Fps.snapshot("balanced").frameBudgetMs * 10) / 10, 33.3);
   assert.equal(Math.round(source60Fps.snapshot("balanced").frameBudgetMs * 10) / 10, 13.3);
+});
+
+test("F5-F 独立字幕时钟解析 VTT 标识、设置和多行文本", () => {
+  const cues = parseDirectEnhancementSubtitleCues(`WEBVTT
+
+intro
+00:00:01.250 --> 00:00:03.500 line:90%
+第一行
+第二行
+
+00:04.000 --> 00:05.250
+下一句
+`);
+
+  assert.deepEqual(cues, [
+    { startSeconds: 1.25, endSeconds: 3.5, text: "第一行\n第二行" },
+    { startSeconds: 4, endSeconds: 5.25, text: "下一句" }
+  ]);
 });
 
 test("F5-B 拒绝 MKV、H.265 和 WebM/H.264", () => {

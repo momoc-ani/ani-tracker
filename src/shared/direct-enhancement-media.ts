@@ -32,6 +32,12 @@ export interface DirectEnhancementFrameSelection<T extends DirectEnhancementQueu
   discarded: T[];
 }
 
+export interface DirectEnhancementSubtitleCue {
+  startSeconds: number;
+  endSeconds: number;
+  text: string;
+}
+
 export type DirectEnhancementPerformanceAction = "keep" | "degrade" | "fallback";
 
 export interface DirectEnhancementPerformanceSnapshot {
@@ -239,6 +245,26 @@ export class DirectEnhancementFrameQueue<T extends DirectEnhancementQueuedFrame>
   }
 }
 
+/** 解析受控 ASS 转换结果或原生 WebVTT，供独立音频时钟驱动 DOM 字幕。 */
+export function parseDirectEnhancementSubtitleCues(
+  vttText: string
+): DirectEnhancementSubtitleCue[] {
+  const blocks = vttText.replace(/^\uFEFF/, "").split(/\r?\n\s*\r?\n/);
+  const cues: DirectEnhancementSubtitleCue[] = [];
+  for (const block of blocks) {
+    const lines = block.split(/\r?\n/).map((line) => line.trimEnd());
+    const timingIndex = lines.findIndex((line) => line.includes("-->"));
+    if (timingIndex < 0) continue;
+    const [rawStart, rawEnd] = lines[timingIndex].split("-->").map((value) => value.trim());
+    const startSeconds = parseSubtitleTimestamp(rawStart);
+    const endSeconds = parseSubtitleTimestamp(rawEnd.split(/\s+/)[0]);
+    const text = lines.slice(timingIndex + 1).join("\n").trim();
+    if (startSeconds === undefined || endSeconds === undefined || endSeconds <= startSeconds || !text) continue;
+    cues.push({ startSeconds, endSeconds, text });
+  }
+  return cues.sort((left, right) => left.startSeconds - right.startSeconds);
+}
+
 function trimOldest<T>(values: T[], maximumLength: number): void {
   const overflow = values.length - maximumLength;
   if (overflow > 0) values.splice(0, overflow);
@@ -249,6 +275,16 @@ function percentile(values: number[], fraction: number): number | undefined {
   const sorted = [...values].sort((left, right) => left - right);
   const index = Math.max(0, Math.ceil(sorted.length * fraction) - 1);
   return sorted[index];
+}
+
+function parseSubtitleTimestamp(value: string): number | undefined {
+  const parts = value.replace(",", ".").split(":");
+  if (parts.length < 2 || parts.length > 3) return undefined;
+  const seconds = Number(parts.pop());
+  const minutes = Number(parts.pop());
+  const hours = parts.length === 1 ? Number(parts[0]) : 0;
+  if (![hours, minutes, seconds].every(Number.isFinite)) return undefined;
+  return hours * 3_600 + minutes * 60 + seconds;
 }
 
 /** 将容器返回的 codec string 约束到首批 WebCodecs 视频编码。 */
