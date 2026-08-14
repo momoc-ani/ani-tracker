@@ -46,6 +46,7 @@ import { resolvePlayerShortcut } from "@shared/player-shortcuts";
 import { readStoredSubtitleScale, storeSubtitleScale } from "@/features/player/subtitle-scale";
 import { ArtPlayerAdapter } from "./art-player-adapter";
 import { probeDirectEnhancementCapabilities } from "./direct-enhancement-capabilities";
+import type { DirectEnhancementCapabilities } from "@shared/direct-enhancement";
 import {
   buildExternalPlayerProtocolUrl,
   detectExternalPlayer
@@ -131,17 +132,49 @@ export function RemoteVideoPlayer({
   const [panelOpen, setPanelOpen] = useState(false);
   const [externalPlayerOpening, setExternalPlayerOpening] = useState(false);
   const [playerSnapshot, setPlayerSnapshot] = useState<PlayerSnapshot>();
+  const [directEnhancementCapabilities, setDirectEnhancementCapabilities] = useState<
+    DirectEnhancementCapabilities
+  >();
 
   useEffect(() => {
     let active = true;
     void probeDirectEnhancementCapabilities().then((capabilities) => {
       if (!active) return;
+      setDirectEnhancementCapabilities(capabilities);
       console.info("[remote] F5 直传终端增强能力探测完成", capabilities);
     });
     return () => {
       active = false;
     };
   }, []);
+
+  useEffect(() => {
+    if (
+      environment !== "remote"
+      || !directEnhancementCapabilities?.supported
+      || session?.mode !== "direct"
+    ) {
+      return;
+    }
+    const controller = new AbortController();
+    void import("./direct-enhancement-demuxer")
+      .then(({ probeDirectEnhancementMediaSource }) => probeDirectEnhancementMediaSource(
+        new URL(session.streamUrl, window.location.href).toString(),
+        {
+          signal: controller.signal,
+          startPositionSeconds: session.startPositionSeconds
+        }
+      ))
+      .then((diagnostics) => {
+        if (controller.signal.aborted) return;
+        console.info("[remote] F5-B 直传媒体源探测完成", diagnostics);
+      })
+      .catch((error) => {
+        if (controller.signal.aborted) return;
+        console.info("[remote] F5-B 直传媒体源探测失败，保持现有播放路径", { error });
+      });
+    return () => controller.abort();
+  }, [directEnhancementCapabilities, environment, session]);
 
   const externalPlayer = useMemo(
     () => allowExternalPlayback

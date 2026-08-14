@@ -8,6 +8,8 @@ export const DIRECT_ENHANCEMENT_CODEC_CANDIDATES = [
 export interface DirectEnhancementCapabilityInput {
   videoDecoderAvailable: boolean;
   videoFrameAvailable: boolean;
+  audioDecoderAvailable: boolean;
+  audioDataAvailable: boolean;
   webGpuAvailable: boolean;
   gpuDeviceAvailable: boolean;
   offscreenCanvasAvailable: boolean;
@@ -20,6 +22,7 @@ export interface DirectEnhancementCapabilityInput {
 export interface DirectEnhancementCapabilities {
   supported: boolean;
   webCodecs: boolean;
+  audioWebCodecs: boolean;
   webGpu: boolean;
   offscreenCanvas: boolean;
   mediaCapabilities: boolean;
@@ -33,7 +36,9 @@ export interface DirectEnhancementCapabilities {
 export function evaluateDirectEnhancementCapabilities(
   input: DirectEnhancementCapabilityInput
 ): DirectEnhancementCapabilities {
-  const webCodecs = input.videoDecoderAvailable && input.videoFrameAvailable;
+  const videoWebCodecs = input.videoDecoderAvailable && input.videoFrameAvailable;
+  const audioWebCodecs = input.audioDecoderAvailable && input.audioDataAvailable;
+  const webCodecs = videoWebCodecs && audioWebCodecs;
   const webGpu = input.webGpuAvailable && input.gpuDeviceAvailable;
   const supportedCodecs = [...new Set(input.supportedCodecs)];
   const smoothCodecs = [...new Set(input.smoothCodecs)];
@@ -45,8 +50,10 @@ export function evaluateDirectEnhancementCapabilities(
     && supportedCodecs.some((codec) => smoothCodecs.includes(codec));
 
   let reason: string | undefined;
-  if (!webCodecs) {
+  if (!videoWebCodecs) {
     reason = "当前浏览器未提供可用的 WebCodecs VideoDecoder/VideoFrame";
+  } else if (!audioWebCodecs) {
+    reason = "当前浏览器未提供可用的 WebCodecs AudioDecoder/AudioData";
   } else if (!webGpu) {
     reason = "当前浏览器未提供可用的 WebGPU adapter/device";
   } else if (!input.offscreenCanvasAvailable) {
@@ -62,6 +69,7 @@ export function evaluateDirectEnhancementCapabilities(
   return {
     supported,
     webCodecs,
+    audioWebCodecs,
     webGpu,
     offscreenCanvas: input.offscreenCanvasAvailable,
     mediaCapabilities: input.mediaCapabilitiesAvailable,

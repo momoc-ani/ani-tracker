@@ -15,6 +15,14 @@ interface BrowserVideoDecoder {
   }>;
 }
 
+interface BrowserAudioDecoder {
+  isConfigSupported(config: {
+    codec: string;
+    sampleRate: number;
+    numberOfChannels: number;
+  }): Promise<{ supported?: boolean }>;
+}
+
 interface BrowserMediaCapabilities {
   decodingInfo(config: {
     type: "file";
@@ -43,6 +51,8 @@ interface BrowserGpu {
 interface BrowserCapabilityGlobals {
   VideoDecoder?: BrowserVideoDecoder;
   VideoFrame?: unknown;
+  AudioDecoder?: BrowserAudioDecoder;
+  AudioData?: unknown;
   OffscreenCanvas?: unknown;
   navigator?: Navigator & { gpu?: BrowserGpu; mediaCapabilities?: BrowserMediaCapabilities };
 }
@@ -57,6 +67,8 @@ export async function probeDirectEnhancementCapabilities(
   const input = {
     videoDecoderAvailable: Boolean(videoDecoder?.isConfigSupported),
     videoFrameAvailable: globals.VideoFrame !== undefined,
+    audioDecoderAvailable: Boolean(globals.AudioDecoder?.isConfigSupported),
+    audioDataAvailable: globals.AudioData !== undefined,
     webGpuAvailable: Boolean(webGpu?.requestAdapter),
     gpuDeviceAvailable: false,
     offscreenCanvasAvailable: globals.OffscreenCanvas !== undefined,

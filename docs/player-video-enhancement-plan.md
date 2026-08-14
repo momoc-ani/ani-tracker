@@ -1,6 +1,6 @@
 # PC 内置播放器与画质增强执行计划
 
-> 当前实现边界（2026-08-14）：桌面 Windows/Linux/macOS 已统一使用 libmpv，接入 gpu-next/Render API、平台硬解路径、Anime4K Shader、字幕后合成、掉帧自动降级和双窗口同步；PC 播放路径不再保留 libVLC。远程 HLS 已按 NVENC/AMF/QSV/libx264 探测普通转码编码器；模型链已接入 RIFE 插帧和 Real-ESRGAN 2x 动画超分，采用 `FFmpeg RGB24 解码 -> 可选 RIFE -> 可选 Real-ESRGAN -> FFmpeg 编码`，并通过受认证会话诊断报告实际模型与降级原因。RIFE 已增加按源帧率、模型滚动 P95、显存、60 FPS 输出上限、80% 利用率和 5 ms 链路余量计算的容量门禁，当前协议因 timestep 固定为 `0.5` 而硬限制为 2x；运行时超预算会关闭模型并维持既定时间轴。macOS Intel + AMD RX 6750 XT + MoltenVK 已完成真实 sidecar 握手：Real-ESRGAN 最新 warmup `24.46 ms`；RIFE 最新 warmup `25.99 ms`。这些低分辨率 warmup 只可作为启动样本，真实分辨率滚动 P95 和完整播放矩阵未通过前不能标记为实时插帧验收通过。F5-A WebCodecs/WebGPU 能力探测已接入但仍只记录诊断；本地 libmpv 模型链、HDR 原生输出、跨 GPU 真机证据和远端直传 shader 管线仍未完成。
+> 当前实现边界（2026-08-14）：桌面 Windows/Linux/macOS 已统一使用 libmpv，接入 gpu-next/Render API、平台硬解路径、Anime4K Shader、字幕后合成、掉帧自动降级和双窗口同步；PC 播放路径不再保留 libVLC。远程 HLS 已按 NVENC/AMF/QSV/libx264 探测普通转码编码器；模型链已接入 RIFE 插帧和 Real-ESRGAN 2x 动画超分，采用 `FFmpeg RGB24 解码 -> 可选 RIFE -> 可选 Real-ESRGAN -> FFmpeg 编码`，并通过受认证会话诊断报告实际模型与降级原因。RIFE 已增加按源帧率、模型滚动 P95、显存、60 FPS 输出上限、80% 利用率和 5 ms 链路余量计算的容量门禁，当前协议因 timestep 固定为 `0.5` 而硬限制为 2x；运行时超预算会关闭模型并维持既定时间轴。macOS Intel + AMD RX 6750 XT + MoltenVK 已完成真实 sidecar 握手：Real-ESRGAN 最新 warmup `24.46 ms`；RIFE 最新 warmup `25.99 ms`。这些低分辨率 warmup 只可作为启动样本，真实分辨率滚动 P95 和完整播放矩阵未通过前不能标记为实时插帧验收通过。F5-A 已探测视频/音频 WebCodecs、WebGPU 与 codec；F5-B 已加入受控 MP4/WebM Range demux 诊断、实际解码配置检查、关键帧定位和独立绝对媒体时钟，但仍不接管播放器。本地 libmpv 模型链、HDR 原生输出、跨 GPU 真机证据、音频样本调度和远端直传 shader 管线仍未完成。
 
 正式模型包、HDR、远程输出和真实 GPU 的逐项执行与证据要求见 [播放器终版发布验收清单](./player-video-enhancement-acceptance.md)。
 
@@ -166,7 +166,7 @@ cost(m) = (m - 1) * rife_p95_ms
 - 解码、模型 rawvideo 编码的独立 P95，显示刷新率/终端 FPS 上限探测，以及按分辨率和 GPU 缓存的容量基线；当前远程门禁使用 80% 利用率和 5 ms 固定余量保守覆盖未拆分成本。
 - RIFE 任意 timestep 协议、场景切换检测和 3x 质量矩阵；完成前实时 AI 硬上限保持 2x，4x 及以上只评估离线转码。
 - 模型 rawvideo 链的跨厂商真机证据、逐候选编码器重试、终端字幕能力探测、自适应码率和断线恢复。
-- WebGPU/WebCodecs 直传增强：F5-A 能力探测已完成；容器解复用、音频时钟、关键帧跳转、浏览器能力矩阵和 GPU 资源回收仍待实现。
+- WebGPU/WebCodecs 直传增强：F5-A 能力探测已完成；F5-B 已完成 MP4/WebM demux 选型、受控 Range 元数据/关键帧探测和绝对时钟语义。音频样本调度、时钟接管、连续拖动/断线恢复、浏览器能力矩阵和 GPU 资源回收仍待实现。
 - 浏览器端 RIFE/Real-ESRGAN 模型推理和端侧显存/帧预算调度。
 - HDR 源元数据、渲染器、显示器能力探测和原生输出。
 - Windows NVIDIA/AMD/Intel、macOS、Linux 真机矩阵与两个正式版本稳定期。
@@ -181,7 +181,7 @@ cost(m) = (m - 1) * rife_p95_ms
 | 终版 F2 | 已完成 RIFE 与 Real-ESRGAN 端口、长驻 sidecar、内存帧协议、2x 固定尺寸回退、双倍帧率时间轴保护和运行时 P95 降级；固定提交和子模块校验已接入 | macOS 两个模型的低分辨率 warmup 已通过；真实分辨率完整链路尚未达到发布验收，本地播放器模型链、HDR 原生输出待完成 |
 | 终版 F3 | 已完成普通 HLS 编码器回退、远程 RIFE + Real-ESRGAN rawvideo 管线、独立音轨/软字幕和受认证诊断刷新 | 模型链硬件编码、终端字幕探测、断线恢复和跨厂商证据待完成 |
 | 终版 F4 | PC libVLC 已从播放器、安装包和工作流移除 | 仍需两个正式版本完成跨平台真机矩阵，确认 libmpv 发布稳定性 |
-| 终版 F5 | F5-A 能力探测、codec 去重和失败原因已实现；不修改原文件和服务端直传协议 | F5-B 容器解复用、时钟、shader、字幕和浏览器矩阵待完成 |
+| 终版 F5 | F5-A 已完成；F5-B 已加入 `mediabunny` MP4/WebM Range demux 诊断、源 codec/AudioDecoder/VideoDecoder 校验、关键帧定位和绝对时钟基础；不修改原文件且不接管播放器 | F5-B 音频样本调度与时钟接管未完成；F5-C 至 F5-E 的 shader、控制层、降级和浏览器矩阵待完成 |
 
 ### F1：能力调度层
 
@@ -216,8 +216,8 @@ PC libVLC 已不再属于播放器、安装包或桌面工作流。剩余发布�
 
 ### F5：WebCodecs/WebGPU 直传终端增强
 
-1. **F5-A 能力与安全边界**：探测 `VideoDecoder`、`VideoFrame`、`GPUAdapter`、`MediaCapabilities` 和 `OffscreenCanvas`；shader 使用应用内置且带摘要的 WGSL，禁止远端下发任意代码。能力不足时保持原始 `<video>` 直传，不自动伪装成增强。
-2. **F5-B 容器与媒体时钟**：引入受控 demuxer 适配器，先覆盖可验证的 MP4/WebM + H.264/VP9/AV1 组合；通过 HTTP Range 获取关键帧和音频样本，建立绝对时间轴、拖动和断线恢复。MKV、H.265 及浏览器不支持的组合先回退直传或 HLS。
+1. **F5-A 能力与安全边界**：探测 `VideoDecoder`、`VideoFrame`、`AudioDecoder`、`AudioData`、`GPUAdapter`、`MediaCapabilities` 和 `OffscreenCanvas`；shader 使用应用内置且带摘要的 WGSL，禁止远端下发任意代码。能力不足时保持原始 `<video>` 直传，不自动伪装成增强。
+2. **F5-B 容器与媒体时钟**：已选用 `mediabunny 1.53.1` 作为纯 TypeScript、动态加载的受控 demuxer，首批只接受 MP4/WebM + H.264/VP9/AV1，并限制为 32 MiB 缓存、2 个并发、24 次 Range、64 MiB 累计响应和 8 秒探测窗口。当前已通过 HTTP Range 验证源 codec、实际 Audio/Video decoder config、媒体时长和目标位置之前的关键帧，建立可测试的绝对时间轴；音频样本队列、AudioContext 主时钟、连续拖动和断线恢复仍待接入。MKV、H.265 及浏览器不支持的组合继续使用现有直传或 HLS。
 3. **F5-C WebGPU shader 链**：`EncodedVideoChunk -> VideoDecoder -> VideoFrame -> WebGPU/WGSL -> Canvas`；优先实现 Anime4K 等零重编码 shader，避免把字幕和 OSD 写入模型/shader 输入。
 4. **F5-D 控制层接入**：扩展现有 `UnifiedPlayerAdapter`，保留播放/暂停、音量、倍速、拖动、全屏、进度上报和默认字幕；字幕在增强画布之后通过 DOM/独立字幕层合成。
 5. **F5-E 降级与验收**：WebGPU 初始化失败、解码器不支持、帧预算超限、音画漂移或 GPU 资源回收失败时，按“终端原画直传 -> 服务端 HLS 转码”顺序降级，并在快照中报告实际路径和原因。
