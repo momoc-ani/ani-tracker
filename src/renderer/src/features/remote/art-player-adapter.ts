@@ -53,6 +53,12 @@ export interface ArtPlayerAdapterOptions {
   sessionId: string;
   baseUrl?: string;
   subtitleScale?: PlayerSubtitleScale;
+  onHlsFatalError?(event: HlsFatalErrorEvent): void;
+}
+
+export interface HlsFatalErrorEvent {
+  positionSeconds: number;
+  reason: string;
 }
 
 /** 将 ArtPlayer/HLS 映射为跨平台统一播放器契约。 */
@@ -400,14 +406,16 @@ export class ArtPlayerAdapter implements UnifiedPlayerAdapter {
     art.hls = hls;
     hls.on(Hls.Events.ERROR, (_event, data) => {
       if (!data.fatal) return;
+      const reason = data.reason ?? data.error.message;
       console.error("[remote] HLS 播放发生致命错误", {
         type: data.type,
         details: data.details,
-        reason: data.reason ?? data.error.message,
+        reason,
         responseCode: data.response?.code,
         url: data.url
       });
       this.fail("network", "实时转码视频流中断，请重试");
+      this.reportHlsFatalError(reason);
     });
     hls.attachMedia(video);
     hls.loadSource(url);
@@ -428,12 +436,13 @@ export class ArtPlayerAdapter implements UnifiedPlayerAdapter {
         networkState: video.networkState,
         mode: this.source?.mode
       });
-      this.fail(
-        this.source?.mode === "direct" ? "decoder" : "network",
-        this.source?.mode === "direct"
-          ? "浏览器无法解码当前原文件"
-          : "浏览器无法播放当前转码视频流，请重试"
-      );
+      if (this.source?.mode === "hls") {
+        const reason = video.error?.message || `HTMLMediaElement error ${video.error?.code ?? "unknown"}`;
+        this.fail("network", "浏览器无法播放当前转码视频流，请重试");
+        this.reportHlsFatalError(reason);
+      } else {
+        this.fail("decoder", "浏览器无法解码当前原文件");
+      }
     });
     player.on("video:play", () => nativePlaybackActive() && this.patch({ status: "playing" }));
     player.on("video:pause", () => nativePlaybackActive() && this.patch({ status: "paused" }));
@@ -614,6 +623,13 @@ export class ArtPlayerAdapter implements UnifiedPlayerAdapter {
     this.patch({
       status: "error",
       error: createPlayerError(code, message, true, ["retry", "transcode", "close"])
+    });
+  }
+
+  private reportHlsFatalError(reason: string): void {
+    this.options.onHlsFatalError?.({
+      positionSeconds: this.snapshot.positionSeconds,
+      reason
     });
   }
 

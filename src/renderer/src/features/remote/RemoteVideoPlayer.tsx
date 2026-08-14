@@ -53,6 +53,10 @@ import type {
   DirectEnhancementPlaybackDiagnostics
 } from "./direct-enhancement-playback";
 import {
+  MAX_AUTOMATIC_HLS_SESSION_RECOVERIES,
+  planHlsSessionRecovery
+} from "@shared/hls-session-recovery";
+import {
   buildExternalPlayerProtocolUrl,
   detectExternalPlayer
 } from "./external-player-launch";
@@ -127,6 +131,8 @@ export function RemoteVideoPlayer({
   const commandSequenceRef = useRef(0);
   const sessionStartRequestCounterRef = useRef(0);
   const sessionStartRequestRef = useRef<{ id: number; itemId: string; positionSeconds: number }>();
+  const hlsRecoveryAttemptsRef = useRef(0);
+  const hlsRecoveryPendingRef = useRef(false);
   const [subtitleScale, setSubtitleScale] = useState<PlayerSubtitleScale>(readStoredSubtitleScale);
   const subtitleScaleRef = useRef(subtitleScale);
   const [requestedMode, setRequestedMode] = useState<RemotePlaybackRequestMode>(readRemotePlaybackMode);
@@ -229,6 +235,16 @@ export function RemoteVideoPlayer({
     snapshot: playerSnapshot
   });
 
+  useEffect(() => {
+    hlsRecoveryAttemptsRef.current = 0;
+    hlsRecoveryPendingRef.current = false;
+  }, [
+    activeItem?.id,
+    enhancement.frameInterpolation,
+    enhancement.videoEnhancement,
+    requestedMode
+  ]);
+
   /** 清理并重新安排控制层的自动隐藏计时。 */
   const scheduleToolbarHide = useCallback((): void => {
     window.clearTimeout(toolbarTimerRef.current);
@@ -319,6 +335,7 @@ export function RemoteVideoPlayer({
         .then((result) => {
           createdSession = result;
           if (!active) return sessionClient.close(result.id);
+          hlsRecoveryPendingRef.current = false;
           if (sessionStartRequestRef.current?.id === startRequest?.id) {
             sessionStartRequestRef.current = undefined;
           }
@@ -332,6 +349,7 @@ export function RemoteVideoPlayer({
         })
         .catch((caught) => {
           if (!active) return;
+          hlsRecoveryPendingRef.current = false;
           console.error("[remote] 播放会话创建失败", {
             taskId: activeItem.task.id,
             fileIndex: activeItem.fileIndex,
@@ -382,6 +400,54 @@ export function RemoteVideoPlayer({
     });
   }, [activeItem, requestedMode]);
 
+  /** HLS 致命错误时从当前绝对时间创建新会话，连续失败达到上限后交给用户处理。 */
+  const startAutomaticHlsRecovery = useCallback((
+    failedSessionId: string,
+    positionSeconds: number,
+    reason: string
+  ): void => {
+    if (
+      environment !== "remote"
+      || session?.mode !== "hls"
+      || hlsRecoveryPendingRef.current
+    ) return;
+    const plan = planHlsSessionRecovery({
+      activeSessionId: session.id,
+      failedSessionId,
+      positionSeconds,
+      durationSeconds,
+      attempts: hlsRecoveryAttemptsRef.current
+    });
+    if (!plan) {
+      console.warn("[remote] HLS 自动恢复次数已用尽", {
+        sessionId: failedSessionId,
+        attempts: hlsRecoveryAttemptsRef.current,
+        reason
+      });
+      return;
+    }
+    hlsRecoveryAttemptsRef.current = plan.nextAttempts;
+    hlsRecoveryPendingRef.current = true;
+    sessionStartRequestCounterRef.current += 1;
+    const request = {
+      id: sessionStartRequestCounterRef.current,
+      itemId: activeItem?.id ?? session.taskId,
+      positionSeconds: plan.positionSeconds
+    };
+    sessionStartRequestRef.current = request;
+    setPlaybackError(null);
+    setSessionStartRequestId(request.id);
+    toast.info(
+      `视频流中断，正在自动恢复 ${plan.nextAttempts}/${MAX_AUTOMATIC_HLS_SESSION_RECOVERIES}`
+    );
+    console.warn("[remote] HLS 中断，正在重建播放会话", {
+      sessionId: failedSessionId,
+      positionSeconds: plan.positionSeconds,
+      attempt: plan.nextAttempts,
+      reason
+    });
+  }, [activeItem?.id, durationSeconds, environment, session?.id, session?.mode, session?.taskId]);
+
   useEffect(() => {
     const container = playerContainerRef.current;
     if (!container || !session || !activeItem) return;
@@ -389,7 +455,10 @@ export function RemoteVideoPlayer({
     const adapter = new ArtPlayerAdapter({
       container,
       sessionId: session.id,
-      subtitleScale: subtitleScaleRef.current
+      subtitleScale: subtitleScaleRef.current,
+      onHlsFatalError: ({ positionSeconds, reason }) => {
+        startAutomaticHlsRecovery(session.id, positionSeconds, reason);
+      }
     });
     playerAdapterRef.current = adapter;
     const unsubscribe = adapter.subscribe((nextSnapshot) => {
@@ -449,7 +518,7 @@ export function RemoteVideoPlayer({
       }
       void adapter.dispose();
     };
-  }, [activeItem, session, startAutomaticTranscode]);
+  }, [activeItem, session, startAutomaticHlsRecovery, startAutomaticTranscode]);
 
   useEffect(() => {
     const runId = ++directEnhancementRunRef.current;
@@ -745,6 +814,13 @@ export function RemoteVideoPlayer({
     const command = createPlayerCommand<PlayerCommand>({ type } as Omit<PlayerCommand, "commandId" | "sessionId">);
     if (command) void dispatchPlayerCommand(command);
   }, [createPlayerCommand, dispatchPlayerCommand]);
+
+  /** 用户手动重试时开启一条新的自动恢复预算。 */
+  const retryPlaybackSession = (): void => {
+    hlsRecoveryAttemptsRef.current = 0;
+    hlsRecoveryPendingRef.current = false;
+    setRetryNonce((value) => value + 1);
+  };
 
   /** 创建外部拉流会话并调用远程设备本机播放器。 */
   const handleExternalPlayback = async (): Promise<void> => {
@@ -1085,7 +1161,7 @@ export function RemoteVideoPlayer({
           <PlayerErrorState
             message={loadError ?? playbackError ?? "未知播放错误"}
             onClose={() => closeAfterFlush(onClose)}
-            onRetry={playbackError ? () => setRetryNonce((value) => value + 1) : undefined}
+            onRetry={playbackError ? retryPlaybackSession : undefined}
             onTranscode={playbackError && requestedMode === "direct" ? startAutomaticTranscode : undefined}
             title={loadError ? "播放器无法打开" : "播放失败"}
           />
