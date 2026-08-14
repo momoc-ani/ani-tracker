@@ -116,7 +116,7 @@ Real-ESRGAN 模型归档固定为 `v0.2.5.0/realesrgan-ncnn-vulkan-20220424-wind
 - 候选代码：`f467f52`；macOS `26.4.1 (25E253)`、`x86_64`、AMD Radeon RX 6750 XT 12 GB（Metal 3）、Google Chrome `151.0.7922.138`。
 - 已配对浏览器通过 `http://127.0.0.1:18083` 创建真实直传会话，样本为 1080p H.264/AAC MKV，包含 15 条内封 ASS 字幕。
 - 修复前原生 `Window.fetch` 作为裸函数调用会抛出 `Illegal invocation`，并被 Range 恢复逻辑重试两次；`f467f52` 将底层 fetch 绑定到 `globalThis`，重建远程 Renderer 后同一路径不再产生该错误或伪网络重试。
-- MKV 按 F5 首批容器边界返回 `Input has an unsupported or unrecognizable format.`，页面保持 `data-remote-playback-path="direct"` 并显示“终端增强已回退”；原画播放推进到 `01:42`，暂停控制有效，默认中文 ASS 轨道保持选中且字幕实际显示，字幕缩放保持 `150%`。
+- MKV 按 F5 首批容器边界返回 `Input has an unsupported or unrecognizable format.`，页面保持 `data-remote-playback-path="direct"` 并显示“浏览器增强不可用，已使用原画”；原画播放推进到 `01:42`，暂停控制有效，默认中文 ASS 轨道保持选中且字幕实际显示，字幕缩放保持 `150%`。
 - 本记录只证明浏览器原生 fetch 修复和不支持容器的安全回退，不标记为 `device-passed`。仍需 MP4/WebM 正向样本验证 `direct-enhanced`、WebGPU 指标、30 分钟音画同步、拖动、Range 断流恢复和资源释放；完成前 `supportsDirectEnhancement` 继续保持 `false`。
 
 ## 7. 证据状态规则

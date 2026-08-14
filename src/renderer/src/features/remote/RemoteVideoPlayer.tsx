@@ -991,7 +991,7 @@ export function RemoteVideoPlayer({
       : directEnhancementStatus === "probing" || directEnhancementStatus === "starting"
         ? "终端增强准备中"
         : directEnhancementStatus === "degraded"
-          ? "终端增强已回退"
+          ? "浏览器增强不可用，已使用原画"
           : undefined,
     sessionDiagnostics?.encoder ? `编码 ${sessionDiagnostics.encoder}` : undefined,
     sessionDiagnostics?.encoderDegraded ? "编码器已降级" : undefined,
