@@ -17,6 +17,7 @@ test("返回 Windows 分架构编译资源目录", () => {
 test("返回 macOS 通用编译资源目录", () => {
   assert.deepEqual(compileOnlyResourceDirectories("darwin", "arm64"), [
     "out/ffmpeg",
+    "out/libmpv",
     "out/model-sidecar",
     "out/realesrgan-model-sidecar",
     "out/qbittorrent",

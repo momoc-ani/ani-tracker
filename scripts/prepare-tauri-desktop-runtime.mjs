@@ -5,9 +5,9 @@ import { resolve } from "node:path";
 import process from "node:process";
 
 const platformScript = {
-  win32: "prepare:tauri:win-libvlc",
-  darwin: "prepare:tauri:mac-libvlc",
-  linux: "prepare:tauri:linux-libvlc"
+  win32: "prepare:tauri:win-libmpv",
+  darwin: "prepare:tauri:mac-libmpv",
+  linux: "prepare:tauri:linux-deps"
 }[process.platform];
 
 if (!platformScript) {
@@ -23,7 +23,6 @@ if (process.platform === "linux") {
 } else {
   runPnpm("build:tauri:remote-renderer");
   runPnpm(platformScript);
-  if (process.platform === "win32") runPnpm("prepare:tauri:win-libmpv");
 }
 console.log(`[tauri-runtime] 桌面运行资源已准备：${process.platform}-${process.arch}`);
 

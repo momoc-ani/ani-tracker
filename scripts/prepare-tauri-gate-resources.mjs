@@ -35,6 +35,7 @@ export function compileOnlyResourceDirectories(platform, arch) {
   if (platform === "darwin") {
     return [
       "out/ffmpeg",
+      "out/libmpv",
       "out/model-sidecar",
       "out/realesrgan-model-sidecar",
       "out/qbittorrent",

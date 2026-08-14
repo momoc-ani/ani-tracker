@@ -22,7 +22,6 @@ const REQUIRED_PACKAGES = Object.freeze([
   "patchelf",
   "pax-utils",
   "pkg-config",
-  "vlc",
   "wget"
 ]);
 

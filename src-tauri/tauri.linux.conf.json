@@ -8,20 +8,19 @@
       "../.tauri-remote-pwa/": "remote-pwa/",
       "../LICENSE": "licenses/ani-tracker-LICENSE.txt",
       "../NOTICE": "licenses/ani-tracker-NOTICE.txt",
-      "../out/libvlc/linux-x64/": "libvlc/linux-x64/",
       "../out/model-sidecar/linux-x64/": "model-sidecar/linux-x64/",
       "../out/realesrgan-model-sidecar/linux-x64/": "realesrgan-model-sidecar/linux-x64/",
       "../out/qbittorrent/linux-x64/": "qbittorrent/linux-x64/",
       "../out/torrent-core/linux-x64/": "torrent-core/linux-x64/",
-      "../resources/licenses/vlc/": "licenses/vlc/",
+      "../resources/licenses/mpv/": "licenses/mpv/",
       "../resources/shaders/anime4k/": "shaders/anime4k/"
     },
     "linux": {
       "deb": {
-        "depends": ["ffmpeg", "libmpv1", "vlc (>= 3.0.0)"]
+        "depends": ["ffmpeg", "libmpv1"]
       },
       "rpm": {
-        "depends": ["ffmpeg", "mpv-libs", "vlc >= 3.0.0"]
+        "depends": ["ffmpeg", "mpv-libs"]
       }
     }
   }
