@@ -1423,9 +1423,69 @@ impl RemoteMediaSessionService {
         })?;
         let dimensions = format!("{output_width}x{output_height}");
         let candidates = self.available_encoder_candidates().await;
-        let &(encoder_codec, encoder_name) = candidates.first().ok_or_else(|| {
-            RemoteMediaError::new(503, "MODEL_ENCODER_UNAVAILABLE", "没有可用的视频编码器")
-        })?;
+        if candidates.is_empty() {
+            return Err(RemoteMediaError::new(
+                503,
+                "MODEL_ENCODER_UNAVAILABLE",
+                "没有可用的视频编码器",
+            ));
+        }
+        let mut last_error = None;
+        for &(encoder_codec, encoder_name) in &candidates {
+            clear_hls_output(output_directory, &playlist).await;
+            match self
+                .start_model_hls_with_encoder(
+                    source_path,
+                    &playlist,
+                    &segments,
+                    enhancement,
+                    rife.clone(),
+                    realesrgan.clone(),
+                    video,
+                    interpolation_capacity.clone(),
+                    stream_start_position_seconds,
+                    output_fps,
+                    model_enhancement_active,
+                    &dimensions,
+                    encoder_codec,
+                    encoder_name,
+                )
+                .await
+            {
+                Ok(started) => return Ok(started),
+                Err(error) => {
+                    let message =
+                        model_encoder_attempt_failure_message(encoder_name, &error.message);
+                    log::warn!("{message} code={}", error.code);
+                    last_error = Some(message);
+                }
+            }
+        }
+        Err(RemoteMediaError::new(
+            503,
+            "MODEL_ENCODER_UNAVAILABLE",
+            last_error.unwrap_or_else(|| "没有可用的视频编码器".to_owned()),
+        ))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn start_model_hls_with_encoder(
+        &self,
+        source_path: &Path,
+        playlist: &Path,
+        segments: &Path,
+        enhancement: RemotePlaybackEnhancement,
+        rife: Option<Arc<ModelSidecarRuntime>>,
+        realesrgan: Option<Arc<ModelSidecarRuntime>>,
+        video: VideoProbe,
+        interpolation_capacity: Option<RemoteInterpolationCapacity>,
+        stream_start_position_seconds: f64,
+        output_fps: f64,
+        model_enhancement_active: bool,
+        dimensions: &str,
+        encoder_codec: &str,
+        encoder_name: &'static str,
+    ) -> Result<HlsStart, RemoteMediaError> {
         let mut decoder = hidden_command(&self.tools.ffmpeg_path);
         decoder.args(["-nostdin", "-hide_banner", "-loglevel", "error"]);
         append_input_seek_args(&mut decoder, stream_start_position_seconds);
@@ -1446,13 +1506,23 @@ impl RemoteMediaSessionService {
             .stderr
             .take()
             .map(|stderr| capture_ffmpeg_stderr("model-decoder", stderr));
-        let decoder_stdout = decoder.stdout.take().ok_or_else(|| {
-            RemoteMediaError::new(
-                503,
-                "MODEL_DECODER_OUTPUT_UNAVAILABLE",
-                "FFmpeg RGB 输出不可用",
-            )
-        })?;
+        let decoder_stdout = match decoder.stdout.take() {
+            Some(stdout) => stdout,
+            None => {
+                stop_model_startup_process(
+                    decoder,
+                    None,
+                    None,
+                    decoder_stderr.into_iter().collect(),
+                )
+                .await;
+                return Err(RemoteMediaError::new(
+                    503,
+                    "MODEL_DECODER_OUTPUT_UNAVAILABLE",
+                    "FFmpeg RGB 输出不可用",
+                ));
+            }
+        };
 
         let mut encoder = hidden_command(&self.tools.ffmpeg_path);
         let fps_arg = format!("{output_fps:.6}");
@@ -1466,7 +1536,7 @@ impl RemoteMediaSessionService {
             "-pix_fmt",
             "rgb24",
             "-s",
-            &dimensions,
+            dimensions,
             "-r",
             &fps_arg,
             "-i",
@@ -1499,22 +1569,42 @@ impl RemoteMediaSessionService {
             ])
             .stdin(Stdio::piped())
             .stderr(Stdio::piped());
-        append_hls_output_args(&mut encoder, &segments, &playlist);
+        append_hls_output_args(&mut encoder, segments, playlist);
         encoder.kill_on_drop(true);
-        let mut encoder = encoder.spawn().map_err(|error| {
-            RemoteMediaError::new(503, "MODEL_ENCODER_UNAVAILABLE", error.to_string())
-        })?;
+        let mut encoder = match encoder.spawn() {
+            Ok(encoder) => encoder,
+            Err(error) => {
+                stop_model_startup_process(
+                    decoder,
+                    None,
+                    None,
+                    decoder_stderr.into_iter().collect(),
+                )
+                .await;
+                return Err(RemoteMediaError::new(
+                    503,
+                    "MODEL_ENCODER_UNAVAILABLE",
+                    error.to_string(),
+                ));
+            }
+        };
         let encoder_stderr = encoder
             .stderr
             .take()
             .map(|stderr| capture_ffmpeg_stderr("model-encoder", stderr));
-        let encoder_stdin = encoder.stdin.take().ok_or_else(|| {
-            RemoteMediaError::new(
-                503,
-                "MODEL_ENCODER_INPUT_UNAVAILABLE",
-                "FFmpeg rawvideo 输入不可用",
-            )
-        })?;
+        let encoder_stdin = match encoder.stdin.take() {
+            Some(stdin) => stdin,
+            None => {
+                let mut stderr_captures: Vec<_> = decoder_stderr.into_iter().collect();
+                stderr_captures.extend(encoder_stderr);
+                stop_model_startup_process(decoder, Some(encoder), None, stderr_captures).await;
+                return Err(RemoteMediaError::new(
+                    503,
+                    "MODEL_ENCODER_INPUT_UNAVAILABLE",
+                    "FFmpeg rawvideo 输入不可用",
+                ));
+            }
+        };
         let pipeline_state = Arc::new(Mutex::new(ModelPipelineState {
             actual_video_enhancement: enhancement.video_enhancement,
             actual_interpolation: enhancement.frame_interpolation,
@@ -1543,7 +1633,7 @@ impl RemoteMediaSessionService {
         ));
         let started = tokio::time::Instant::now();
         loop {
-            if hls_playlist_ready(&playlist).await {
+            if hls_playlist_ready(playlist).await {
                 let mut stderr_captures = Vec::new();
                 stderr_captures.extend(decoder_stderr);
                 stderr_captures.extend(encoder_stderr);
@@ -1570,8 +1660,9 @@ impl RemoteMediaSessionService {
                     Ok(Err(reason)) => reason,
                     Err(error) => format!("模型帧任务失败：{error}"),
                 };
-                let _ = decoder.kill().await;
-                let _ = encoder.kill().await;
+                let mut stderr_captures: Vec<_> = decoder_stderr.into_iter().collect();
+                stderr_captures.extend(encoder_stderr);
+                stop_model_startup_process(decoder, Some(encoder), None, stderr_captures).await;
                 return Err(RemoteMediaError::new(
                     503,
                     "MODEL_PIPELINE_EXITED",
@@ -1579,12 +1670,14 @@ impl RemoteMediaSessionService {
                 ));
             }
             if let Ok(Some(status)) = encoder.try_wait() {
-                let _ = decoder.kill().await;
-                pipeline.abort();
                 let detail = encoder_stderr
                     .as_ref()
                     .map(FfmpegStderrCapture::snapshot)
                     .unwrap_or_default();
+                let mut stderr_captures: Vec<_> = decoder_stderr.into_iter().collect();
+                stderr_captures.extend(encoder_stderr);
+                stop_model_startup_process(decoder, Some(encoder), Some(pipeline), stderr_captures)
+                    .await;
                 return Err(RemoteMediaError::new(
                     503,
                     "MODEL_ENCODER_EXITED",
@@ -1592,9 +1685,6 @@ impl RemoteMediaSessionService {
                 ));
             }
             if started.elapsed() >= TRANSCODER_START_TIMEOUT {
-                pipeline.abort();
-                let _ = decoder.kill().await;
-                let _ = encoder.kill().await;
                 let encoder_detail = encoder_stderr
                     .as_ref()
                     .map(FfmpegStderrCapture::snapshot)
@@ -1607,6 +1697,10 @@ impl RemoteMediaSessionService {
                     .into_iter()
                     .find(|value| !value.is_empty())
                     .unwrap_or_default();
+                let mut stderr_captures: Vec<_> = decoder_stderr.into_iter().collect();
+                stderr_captures.extend(encoder_stderr);
+                stop_model_startup_process(decoder, Some(encoder), Some(pipeline), stderr_captures)
+                    .await;
                 return Err(RemoteMediaError::new(
                     503,
                     "MODEL_PIPELINE_START_TIMEOUT",
@@ -2349,6 +2443,45 @@ async fn hls_playlist_ready(playlist: &Path) -> bool {
     })
 }
 
+/// 每次模型链重试前移除上次候选留下的输出，避免把旧分片当作本轮启动成功。
+async fn clear_hls_output(output_directory: &Path, playlist: &Path) {
+    let _ = tokio::fs::remove_file(playlist).await;
+    let Ok(mut entries) = tokio::fs::read_dir(output_directory).await else {
+        return;
+    };
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let is_hls_segment = entry
+            .file_name()
+            .to_str()
+            .is_some_and(|name| name.starts_with("segment-"));
+        if is_hls_segment {
+            let _ = tokio::fs::remove_file(entry.path()).await;
+        }
+    }
+}
+
+/// 等待启动失败的模型子进程彻底结束，防止下一编码器尝试复用失效管道。
+async fn stop_model_startup_process(
+    mut decoder: Child,
+    encoder: Option<Child>,
+    pipeline: Option<JoinHandle<Result<(), String>>>,
+    mut stderr_captures: Vec<FfmpegStderrCapture>,
+) {
+    if let Some(pipeline) = pipeline {
+        pipeline.abort();
+        let _ = pipeline.await;
+    }
+    let _ = decoder.kill().await;
+    let _ = tokio::time::timeout(Duration::from_secs(1), decoder.wait()).await;
+    if let Some(mut encoder) = encoder {
+        let _ = encoder.kill().await;
+        let _ = tokio::time::timeout(Duration::from_secs(1), encoder.wait()).await;
+    }
+    for capture in stderr_captures.drain(..) {
+        capture.finish().await;
+    }
+}
+
 /// 有界读取 FFmpeg stderr，避免子进程日志填满管道并保留失败证据。
 fn capture_ffmpeg_stderr(label: &'static str, mut stderr: ChildStderr) -> FfmpegStderrCapture {
     let buffer = Arc::new(StdMutex::new(Vec::new()));
@@ -2428,13 +2561,18 @@ fn encoder_failure_message(encoder: &str, summary: &str, stderr: &str) -> String
     )
 }
 
+/// 每轮失败保留实际候选名，使最终的结构化错误能定位最后一次启动原因。
+fn model_encoder_attempt_failure_message(encoder: &str, reason: &str) -> String {
+    format!("模型 HLS 编码器 {encoder} 启动失败：{reason}")
+}
+
 #[cfg(test)]
 mod encoder_tests {
     use super::{
         encoder_failure_message, encoder_is_degraded, encoder_video_args, hls_enhancement_profiles,
-        remote_video_filter_args, validate_remote_enhancement, ENCODER_CANDIDATES,
-        MODEL_PIPELINE_SAFETY_MARGIN_MS, MODEL_PIPELINE_UTILIZATION_LIMIT,
-        REMOTE_OUTPUT_FRAME_RATE_CAP, RIFE_HARD_MAX_MULTIPLIER,
+        model_encoder_attempt_failure_message, remote_video_filter_args,
+        validate_remote_enhancement, ENCODER_CANDIDATES, MODEL_PIPELINE_SAFETY_MARGIN_MS,
+        MODEL_PIPELINE_UTILIZATION_LIMIT, REMOTE_OUTPUT_FRAME_RATE_CAP, RIFE_HARD_MAX_MULTIPLIER,
     };
     use ani_contracts::{
         PlayerFrameInterpolation, PlayerVideoEnhancement, RemotePlaybackEnhancement,
@@ -2525,6 +2663,14 @@ mod encoder_tests {
         assert_eq!(
             encoder_failure_message("libx264", "启动超时", ""),
             "编码器 libx264 启动超时"
+        );
+    }
+
+    #[test]
+    fn keeps_the_last_model_encoder_failure_actionable() {
+        assert_eq!(
+            model_encoder_attempt_failure_message("libx264", "编码器 libx264 模型远程管线启动超时"),
+            "模型 HLS 编码器 libx264 启动失败：编码器 libx264 模型远程管线启动超时"
         );
     }
 
