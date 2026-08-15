@@ -831,35 +831,61 @@ export function RemoteVideoPlayer({
     setExternalPlayerOpening(true);
     const toastId = toast.loading(`正在准备 ${externalPlayer.label} 播放地址`);
     let externalSession: RemotePlaybackSession | undefined;
-    const externalPlan = planExternalPlayback(
+    const requestedExternalPlan = planExternalPlayback(
       requestedMode,
       sessionEnhancement,
       selectedSubtitleId
     );
+    let effectiveExternalPlan = requestedExternalPlan;
+    let subtitleBurnDegraded = false;
     try {
-      externalSession = await createRemoteExternalPlaybackSession(
-        activeItem.task.id,
-        externalPlan.mode,
-        activeItem.fileIndex,
-        externalPlan.enhancement,
-        currentTimeSeconds,
-        externalPlan.subtitleId
-      );
+      try {
+        externalSession = await createRemoteExternalPlaybackSession(
+          activeItem.task.id,
+          requestedExternalPlan.mode,
+          activeItem.fileIndex,
+          requestedExternalPlan.enhancement,
+          currentTimeSeconds,
+          requestedExternalPlan.subtitleId
+        );
+      } catch (subtitleError) {
+        if (requestedExternalPlan.subtitleMode !== "burned") throw subtitleError;
+        effectiveExternalPlan = planExternalPlayback(
+          requestedMode,
+          sessionEnhancement
+        );
+        subtitleBurnDegraded = true;
+        console.warn("[remote] 字幕烧录会话创建失败，改用不烧录字幕的外部播放", {
+          player: externalPlayer.kind,
+          taskId: activeItem.task.id,
+          error: subtitleError
+        });
+        externalSession = await createRemoteExternalPlaybackSession(
+          activeItem.task.id,
+          effectiveExternalPlan.mode,
+          activeItem.fileIndex,
+          effectiveExternalPlan.enhancement,
+          currentTimeSeconds
+        );
+      }
       const mediaUrl = new URL(externalSession.streamUrl, window.location.origin).toString();
       window.location.assign(buildExternalPlayerProtocolUrl(externalPlayer.kind, mediaUrl));
       toast.info(`已请求打开 ${externalPlayer.label}`, {
         id: toastId,
-        description: externalPlan.subtitleMode === "burned"
-          ? "当前字幕将在画质增强后合成到视频流。"
-          : "若播放器未启动，请确认已安装并允许浏览器打开外部应用。"
+        description: subtitleBurnDegraded
+          ? "字幕烧录不可用，已改用不烧录字幕的播放地址。"
+          : effectiveExternalPlan.subtitleMode === "burned"
+            ? "当前字幕将在画质增强后合成到视频流。"
+            : "若播放器未启动，请确认已安装并允许浏览器打开外部应用。"
       });
       console.info("[remote] 已下发本地播放器拉流请求", {
         player: externalPlayer.kind,
         taskId: activeItem.task.id,
         fileIndex: activeItem.fileIndex,
-        mode: externalPlan.mode,
-        subtitleMode: externalPlan.subtitleMode,
-        subtitleId: externalPlan.subtitleId
+        mode: effectiveExternalPlan.mode,
+        subtitleMode: effectiveExternalPlan.subtitleMode,
+        subtitleId: effectiveExternalPlan.subtitleId,
+        subtitleBurnDegraded
       });
     } catch (caught) {
       if (externalSession) void closeRemotePlaybackSession(externalSession.id);

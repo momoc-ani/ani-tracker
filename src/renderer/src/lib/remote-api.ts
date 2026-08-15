@@ -6,6 +6,7 @@ import type {
   RemotePlaybackSession
 } from "@shared/contracts";
 import type { AppClient } from "@shared/app-client";
+import { buildRemoteMediaSessionRequest } from "@shared/remote-media-session-request";
 import { createRemoteClient } from "@/lib/clients/remote-client";
 
 interface RemoteRpcResponse {
@@ -135,8 +136,7 @@ export async function createRemotePlaybackSession(
     mode,
     fileIndex,
     enhancement,
-    startPositionSeconds,
-    "soft"
+    startPositionSeconds
   );
 }
 
@@ -156,7 +156,7 @@ export async function createRemoteExternalPlaybackSession(
     fileIndex,
     enhancement,
     startPositionSeconds,
-    subtitleId ? "burned" : "off",
+    subtitleId ? "burned" : undefined,
     subtitleId
   );
 }
@@ -169,7 +169,7 @@ async function createRemoteMediaSession(
   fileIndex: number | undefined,
   enhancement: RemotePlaybackEnhancement,
   startPositionSeconds?: number,
-  subtitleMode: "soft" | "burned" | "off" = "soft",
+  subtitleMode?: "soft" | "burned" | "off",
   subtitleId?: string
 ): Promise<RemotePlaybackSession> {
   const baseUrl = getRemoteBaseUrl();
@@ -182,15 +182,15 @@ async function createRemoteMediaSession(
       "Content-Type": "application/json",
       Authorization: `Bearer ${accessToken}`
     },
-    body: JSON.stringify({
+    body: JSON.stringify(buildRemoteMediaSessionRequest({
       taskId,
       mode,
       enhancement,
+      fileIndex,
+      startPositionSeconds,
       subtitleMode,
-      ...(fileIndex === undefined ? {} : { fileIndex }),
-      ...(startPositionSeconds === undefined ? {} : { startPositionSeconds }),
-      ...(subtitleId === undefined ? {} : { subtitleId })
-    })
+      subtitleId
+    }))
   });
   const payload = (await response.json().catch(() => ({}))) as RemotePlaybackSession & { error?: string };
   if (!response.ok || !payload.id) {

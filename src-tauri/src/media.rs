@@ -98,6 +98,13 @@ impl AppMediaState {
             roots.push(resource_directory.join("ffmpeg"));
         }
         roots.extend([current.join("out/ffmpeg"), current.join("resources/ffmpeg")]);
+        #[cfg(debug_assertions)]
+        if let Some(repository_root) = Path::new(env!("CARGO_MANIFEST_DIR")).parent() {
+            roots.extend([
+                repository_root.join("out/ffmpeg"),
+                repository_root.join("resources/ffmpeg"),
+            ]);
+        }
         roots.dedup();
         Self {
             app: app.clone(),
