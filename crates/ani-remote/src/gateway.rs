@@ -39,7 +39,8 @@ use crate::tls::{RemoteTlsBundle, RemoteTlsCertificateStore};
 
 const DEFAULT_PORT: u16 = 18_083;
 const MAX_BODY_BYTES: usize = 64 * 1024;
-const MEDIA_STREAM_BUFFER_BYTES: usize = 1024 * 1024;
+const DIRECT_MEDIA_STREAM_BUFFER_BYTES: usize = 64 * 1024;
+const ASSET_STREAM_BUFFER_BYTES: usize = 1024 * 1024;
 
 /// 设置中的远程网关监听选项。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -520,6 +521,7 @@ async fn handle_request(
                     (CACHE_CONTROL, "private, max-age=86400, immutable"),
                     (ETAG, &etag),
                 ],
+                ASSET_STREAM_BUFFER_BYTES,
             )
             .await;
         }
@@ -837,6 +839,11 @@ async fn stream_media(
         &asset.content_type,
         range,
         &extra_headers,
+        if asset.direct {
+            DIRECT_MEDIA_STREAM_BUFFER_BYTES
+        } else {
+            ASSET_STREAM_BUFFER_BYTES
+        },
     )
     .await
 }
@@ -847,6 +854,7 @@ async fn stream_file(
     content_type: &str,
     range: Option<ByteRange>,
     extra_headers: &[(axum::http::HeaderName, &str)],
+    stream_buffer_bytes: usize,
 ) -> Result<Response<Body>, GatewayHttpError> {
     let metadata = tokio::fs::metadata(path)
         .await
@@ -887,7 +895,7 @@ async fn stream_file(
     file.seek(std::io::SeekFrom::Start(start))
         .await
         .map_err(|_| GatewayHttpError::internal())?;
-    let stream = ReaderStream::with_capacity(file.take(length), MEDIA_STREAM_BUFFER_BYTES);
+    let stream = ReaderStream::with_capacity(file.take(length), stream_buffer_bytes);
     response
         .body(Body::from_stream(stream))
         .map_err(|_| GatewayHttpError::internal())
@@ -1559,9 +1567,10 @@ mod tests {
         )
         .await
         .expect("write renderer service worker");
-        let media_bytes = b"0123456789";
+        let mut media_bytes = vec![b'x'; DIRECT_MEDIA_STREAM_BUFFER_BYTES * 4];
+        media_bytes[..10].copy_from_slice(b"0123456789");
         let media_file_name = "测试 [01] #100%.mkv";
-        tokio::fs::write(download.join(media_file_name), media_bytes)
+        tokio::fs::write(download.join(media_file_name), &media_bytes)
             .await
             .expect("write media");
 
@@ -2025,7 +2034,7 @@ mod tests {
                 .headers()
                 .get(reqwest::header::CONTENT_RANGE)
                 .and_then(|value| value.to_str().ok()),
-            Some("bytes 2-5/10")
+            Some(format!("bytes 2-5/{}", media_bytes.len()).as_str())
         );
         assert_eq!(
             range_response
@@ -2093,7 +2102,7 @@ mod tests {
                 .headers()
                 .get(reqwest::header::CONTENT_LENGTH)
                 .and_then(|value| value.to_str().ok()),
-            Some("10")
+            Some(media_bytes.len().to_string().as_str())
         );
         assert_eq!(
             external_head
@@ -2101,6 +2110,50 @@ mod tests {
                 .get(reqwest::header::CONTENT_DISPOSITION)
                 .and_then(|value| value.to_str().ok()),
             Some("inline; filename*=UTF-8''%E6%B5%8B%E8%AF%95%20%5B01%5D%20%23100%25%2Emkv")
+        );
+
+        let mut interrupted_range = client
+            .get(format!("{base_url}{external_stream_url}"))
+            .header(reqwest::header::RANGE, "bytes=0-")
+            .send()
+            .await
+            .expect("open-ended range request");
+        assert_eq!(
+            interrupted_range.status(),
+            reqwest::StatusCode::PARTIAL_CONTENT
+        );
+        let first_chunk = interrupted_range
+            .chunk()
+            .await
+            .expect("first range chunk")
+            .expect("range body chunk");
+        assert!(
+            first_chunk.len() <= DIRECT_MEDIA_STREAM_BUFFER_BYTES,
+            "direct media chunk should be interruptible within {} bytes, got {}",
+            DIRECT_MEDIA_STREAM_BUFFER_BYTES,
+            first_chunk.len()
+        );
+        drop(interrupted_range);
+
+        let resume_start = media_bytes.len() - 4;
+        let resumed_range = tokio::time::timeout(
+            Duration::from_secs(2),
+            client
+                .get(format!("{base_url}{external_stream_url}"))
+                .header(reqwest::header::RANGE, format!("bytes={resume_start}-"))
+                .send(),
+        )
+        .await
+        .expect("range after interrupted transfer")
+        .expect("resume range request");
+        assert_eq!(resumed_range.status(), reqwest::StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            resumed_range
+                .bytes()
+                .await
+                .expect("resumed range body")
+                .as_ref(),
+            b"xxxx"
         );
 
         gateway.stop().await;
