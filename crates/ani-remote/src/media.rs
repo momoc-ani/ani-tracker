@@ -3322,6 +3322,15 @@ mod tests {
         assert!(!is_subtitle_asset("subtitle-1.ass"));
     }
 
+    /// 验证 URL 末段保留扩展名并编码路径、查询字符串保留字符。
+    #[test]
+    fn encodes_direct_media_file_name_segment() {
+        assert_eq!(
+            utf8_percent_encode("测试 [01] #100%?.mkv", MEDIA_FILE_SEGMENT_ENCODE_SET).to_string(),
+            "%E6%B5%8B%E8%AF%95%20%5B01%5D%20%23100%25%3F.mkv"
+        );
+    }
+
     /// 验证已完成或临近片尾的检查点不会恢复。
     #[test]
     fn guards_resume_position() {

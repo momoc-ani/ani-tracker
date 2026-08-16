@@ -1560,7 +1560,7 @@ mod tests {
         .await
         .expect("write renderer service worker");
         let media_bytes = b"0123456789";
-        let media_file_name = "测试 [01] #100%?.mkv";
+        let media_file_name = "测试 [01] #100%.mkv";
         tokio::fs::write(download.join(media_file_name), media_bytes)
             .await
             .expect("write media");
@@ -2039,7 +2039,7 @@ mod tests {
                 .headers()
                 .get(reqwest::header::CONTENT_DISPOSITION)
                 .and_then(|value| value.to_str().ok()),
-            Some("inline; filename*=UTF-8''%E6%B5%8B%E8%AF%95%20%5B01%5D%20%23100%25%3F%2Emkv")
+            Some("inline; filename*=UTF-8''%E6%B5%8B%E8%AF%95%20%5B01%5D%20%23100%25%2Emkv")
         );
         assert_eq!(
             range_response.bytes().await.expect("range body").as_ref(),
@@ -2074,7 +2074,7 @@ mod tests {
             .expect("external stream url");
         assert_eq!(external_session["mode"], "direct");
         assert!(external_session["startPositionSeconds"].is_null());
-        assert!(external_stream_url.ends_with("/%E6%B5%8B%E8%AF%95%20%5B01%5D%20%23100%25%3F.mkv"));
+        assert!(external_stream_url.ends_with("/%E6%B5%8B%E8%AF%95%20%5B01%5D%20%23100%25.mkv"));
         let external_head = client
             .head(format!("{base_url}{external_stream_url}"))
             .send()
@@ -2100,7 +2100,7 @@ mod tests {
                 .headers()
                 .get(reqwest::header::CONTENT_DISPOSITION)
                 .and_then(|value| value.to_str().ok()),
-            Some("inline; filename*=UTF-8''%E6%B5%8B%E8%AF%95%20%5B01%5D%20%23100%25%3F%2Emkv")
+            Some("inline; filename*=UTF-8''%E6%B5%8B%E8%AF%95%20%5B01%5D%20%23100%25%2Emkv")
         );
 
         gateway.stop().await;
