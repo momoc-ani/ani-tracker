@@ -62,7 +62,10 @@ import {
 } from "./external-player-launch";
 import type { PlaybackSessionClient } from "./playback-session-client";
 import { startPlaybackSessionRefresh } from "@shared/playback-session-refresh";
-import { planExternalPlayback } from "@shared/external-playback-plan";
+import {
+  planExternalPlayback,
+  resolveExternalPlaybackStartPosition
+} from "@shared/external-playback-plan";
 import {
   playlistItemLabel,
   resolveAdjacentPlaylistItem,
@@ -845,7 +848,10 @@ export function RemoteVideoPlayer({
           requestedExternalPlan.mode,
           activeItem.fileIndex,
           requestedExternalPlan.enhancement,
-          currentTimeSeconds,
+          resolveExternalPlaybackStartPosition(
+            requestedExternalPlan.mode,
+            currentTimeSeconds
+          ),
           requestedExternalPlan.subtitleId
         );
       } catch (subtitleError) {
@@ -865,7 +871,10 @@ export function RemoteVideoPlayer({
           effectiveExternalPlan.mode,
           activeItem.fileIndex,
           effectiveExternalPlan.enhancement,
-          currentTimeSeconds
+          resolveExternalPlaybackStartPosition(
+            effectiveExternalPlan.mode,
+            currentTimeSeconds
+          )
         );
       }
       const mediaUrl = new URL(externalSession.streamUrl, window.location.origin).toString();

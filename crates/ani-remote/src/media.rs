@@ -454,11 +454,17 @@ impl RemoteMediaSessionService {
         } else {
             "direct"
         };
-        let start_position_seconds = resolve_session_start_position(
+        let resolved_start_position_seconds = resolve_session_start_position(
             requested_start_position_seconds,
             checkpoint.as_ref(),
             media.duration_seconds,
         )?;
+        // 外部原文件 URL 必须保留完整媒体时间轴，由播放器自行读取和跳转。
+        let start_position_seconds = if access == SessionAccess::External && mode == "direct" {
+            None
+        } else {
+            resolved_start_position_seconds
+        };
         let stream_start_position_seconds = if mode == "hls" {
             start_position_seconds
                 .map(|position| (position - HLS_SEEK_PREROLL_SECONDS).max(0.0))
@@ -959,16 +965,7 @@ impl RemoteMediaSessionService {
                 .iter()
                 .find(|file| file.index == index)
                 .expect("file index checked");
-            candidates.push((
-                task_file_path(task, &file.name),
-                Path::new(&file.name)
-                    .file_name()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .into_owned(),
-                Some(file.index),
-                None,
-            ));
+            candidates.push((task_file_path(task, &file.name), Some(file.index), None));
         } else {
             let mut registered = media_files
                 .into_iter()
@@ -978,7 +975,6 @@ impl RemoteMediaSessionService {
             candidates.extend(registered.into_iter().map(|media| {
                 (
                     PathBuf::from(&media.file_path),
-                    media.file_name.clone(),
                     task.files.iter().find_map(|file| {
                         (task_file_path(task, &file.name).as_path() == Path::new(&media.file_path))
                             .then_some(file.index)
@@ -986,22 +982,21 @@ impl RemoteMediaSessionService {
                     Some(media),
                 )
             }));
-            candidates.extend(task_files.into_iter().map(|file| {
-                (
-                    task_file_path(task, &file.name),
-                    Path::new(&file.name)
-                        .file_name()
-                        .unwrap_or_default()
-                        .to_string_lossy()
-                        .into_owned(),
-                    Some(file.index),
-                    None,
-                )
-            }));
+            candidates.extend(
+                task_files
+                    .into_iter()
+                    .map(|file| (task_file_path(task, &file.name), Some(file.index), None)),
+            );
         }
 
-        for (path, file_name, file_index, media) in candidates {
-            let Some(path) = validate_media_path(Path::new(&task.save_path), &path).await else {
+        for (candidate_path, file_index, media) in candidates {
+            let file_name = candidate_path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned();
+            let Some(path) = validate_media_path(Path::new(&task.save_path), &candidate_path).await
+            else {
                 continue;
             };
             if !extensions.contains(&extension(&path.to_string_lossy())) {

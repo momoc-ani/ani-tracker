@@ -2,10 +2,6 @@ import Artplayer from "artplayer";
 import Hls from "hls.js";
 import type { DirectEnhancementPlaybackState } from "./direct-enhancement-playback";
 import {
-  DIRECT_VIDEO_FRAME_TIMEOUT_MS,
-  shouldFallbackDirectVideo
-} from "@shared/direct-video-fallback";
-import {
   parseDirectEnhancementSubtitleCues,
   type DirectEnhancementSubtitleCue
 } from "@shared/direct-enhancement-media";
@@ -75,7 +71,6 @@ export class ArtPlayerAdapter implements UnifiedPlayerAdapter {
   private directEnhancementActive = false;
   private directSubtitleCues: DirectEnhancementSubtitleCue[] = [];
   private directSubtitleRequest = 0;
-  private directVideoWatchdog?: number;
   private sequence = 0;
   private disposed = false;
 
@@ -109,7 +104,6 @@ export class ArtPlayerAdapter implements UnifiedPlayerAdapter {
     const player = this.player;
     if (!player || this.directEnhancementActive) return;
     this.directEnhancementActive = true;
-    this.clearDirectVideoWatchdog();
     player.pause();
     const selectedSubtitleId = this.snapshot.subtitleTracks.find((track) => track.selected)?.id;
     const selectedSubtitle = this.source?.subtitles.find((item) => item.id === selectedSubtitleId);
@@ -452,11 +446,7 @@ export class ArtPlayerAdapter implements UnifiedPlayerAdapter {
     });
     player.on("video:play", () => nativePlaybackActive() && this.patch({ status: "playing" }));
     player.on("video:pause", () => nativePlaybackActive() && this.patch({ status: "paused" }));
-    player.on("video:playing", () => {
-      if (!nativePlaybackActive()) return;
-      this.patch({ status: "playing", error: undefined });
-      this.scheduleDirectVideoWatchdog(player);
-    });
+    player.on("video:playing", () => nativePlaybackActive() && this.patch({ status: "playing", error: undefined }));
     player.on("video:waiting", () => nativePlaybackActive() && this.patch({ status: "buffering" }));
     player.on("video:stalled", () => nativePlaybackActive() && this.patch({ status: "buffering" }));
     player.on("video:loadedmetadata", () => nativePlaybackActive() && this.patch({
@@ -476,9 +466,6 @@ export class ArtPlayerAdapter implements UnifiedPlayerAdapter {
     player.on("pip", (pictureInPicture: boolean) => active() && this.patch({ pictureInPicture }));
     player.on("video:timeupdate", () => {
       if (!nativePlaybackActive()) return;
-      if (player.template.$video.videoWidth > 0 && player.template.$video.videoHeight > 0) {
-        this.clearDirectVideoWatchdog();
-      }
       this.patch({
         positionSeconds: this.toAbsolutePosition(player.currentTime || 0),
         durationSeconds: this.resolveDurationSeconds(),
@@ -636,7 +623,6 @@ export class ArtPlayerAdapter implements UnifiedPlayerAdapter {
   }
 
   private fail(code: PlayerError["code"], message: string): void {
-    this.clearDirectVideoWatchdog();
     this.patch({
       status: "error",
       error: createPlayerError(code, message, true, ["retry", "transcode", "close"])
@@ -665,46 +651,7 @@ export class ArtPlayerAdapter implements UnifiedPlayerAdapter {
     for (const listener of this.listeners) listener(this.snapshot);
   }
 
-  /** 检测浏览器只播放音频但不报告视频解码错误的直传黑屏。 */
-  private scheduleDirectVideoWatchdog(player: Artplayer): void {
-    if (
-      this.directVideoWatchdog !== undefined
-      || this.source?.mode !== "direct"
-      || this.directEnhancementActive
-    ) return;
-    const video = player.template.$video;
-    if (video.videoWidth > 0 && video.videoHeight > 0) return;
-    const startedAt = performance.now();
-    const startedMediaTime = video.currentTime;
-    this.directVideoWatchdog = window.setTimeout(() => {
-      this.directVideoWatchdog = undefined;
-      if (this.player !== player || this.disposed) return;
-      if (!shouldFallbackDirectVideo({
-        mode: this.source?.mode ?? "hls",
-        directEnhancementActive: this.directEnhancementActive,
-        playing: !video.paused && !video.ended,
-        elapsedMs: performance.now() - startedAt,
-        mediaTimeProgressSeconds: Math.max(0, video.currentTime - startedMediaTime),
-        videoWidth: video.videoWidth,
-        videoHeight: video.videoHeight
-      })) return;
-      console.error("[remote] 浏览器直传只有音频且未输出视频帧", {
-        currentTime: video.currentTime,
-        readyState: video.readyState,
-        networkState: video.networkState
-      });
-      this.fail("decoder", "浏览器无法解码当前原文件的视频轨道");
-    }, DIRECT_VIDEO_FRAME_TIMEOUT_MS);
-  }
-
-  private clearDirectVideoWatchdog(): void {
-    if (this.directVideoWatchdog === undefined) return;
-    window.clearTimeout(this.directVideoWatchdog);
-    this.directVideoWatchdog = undefined;
-  }
-
   private disposePlayer(): void {
-    this.clearDirectVideoWatchdog();
     this.directSubtitleRequest += 1;
     this.directSubtitleCues = [];
     this.directEnhancementActive = false;

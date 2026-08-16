@@ -1410,6 +1410,7 @@ mod tests {
 
     struct TestMediaRepository {
         task: DownloadTask,
+        media_files: Vec<MediaFile>,
     }
 
     #[async_trait]
@@ -1419,7 +1420,7 @@ mod tests {
         }
 
         async fn list_media_files(&self) -> Result<Vec<MediaFile>, String> {
-            Ok(Vec::new())
+            Ok(self.media_files.clone())
         }
 
         async fn get_settings(&self) -> Result<AppSettings, String> {
@@ -1472,10 +1473,10 @@ mod tests {
         ))
         .is_some());
         let named = parse_external_media_route(&format!(
-            "/api/media/external/{token}/sessions/{session}/%E6%B5%8B%E8%AF%95%20SP01.mkv"
+            "/api/media/external/{token}/sessions/{session}/%E6%B5%8B%E8%AF%95%20%5B01%5D%20%23100%25%3F.mkv"
         ))
         .expect("named media route");
-        assert_eq!(named.asset_name, "测试 SP01.mkv");
+        assert_eq!(named.asset_name, "测试 [01] #100%?.mkv");
         assert_eq!(
             parse_browser_media_diagnostics_route(&format!(
                 "/api/media/sessions/{session}/diagnostics"
@@ -1559,7 +1560,8 @@ mod tests {
         .await
         .expect("write renderer service worker");
         let media_bytes = b"0123456789";
-        tokio::fs::write(download.join("episode-01.mkv"), media_bytes)
+        let media_file_name = "测试 [01] #100%?.mkv";
+        tokio::fs::write(download.join(media_file_name), media_bytes)
             .await
             .expect("write media");
 
@@ -1591,7 +1593,7 @@ mod tests {
             files: vec![TorrentFile {
                 id: "file-0".to_owned(),
                 index: 0,
-                name: "episode-01.mkv".to_owned(),
+                name: media_file_name.to_owned(),
                 episode_id: Some("episode-1".to_owned()),
                 episode_no: Some(1.0),
                 size: media_bytes.len() as i64,
@@ -1602,11 +1604,27 @@ mod tests {
             created_at: "2026-07-25T12:00:00.000Z".to_owned(),
             completed_at: Some("2026-07-25T12:10:00.000Z".to_owned()),
         };
+        let registered_media: MediaFile = serde_json::from_value(json!({
+            "id": "media-1",
+            "animeId": "anime-1",
+            "episodeId": "episode-1",
+            "downloadTaskId": "task-1",
+            "filePath": download.join(media_file_name).to_string_lossy(),
+            "fileName": "stale-database-name.mkv",
+            "size": media_bytes.len(),
+            "normalizedVideoCodec": "Unknown",
+            "audioCodecs": [],
+            "subtitleTracks": []
+        }))
+        .expect("registered media fixture");
         let secret_store: Arc<dyn RemoteSecretStore> = Arc::new(MemorySecretStore::default());
         let auth = Arc::new(RemoteDeviceAuth::new(Arc::clone(&secret_store)));
         let rpc = Arc::new(RemoteRpcService::new(Arc::new(TestRpcHandler)));
         let media = Arc::new(RemoteMediaSessionService::new(
-            Arc::new(TestMediaRepository { task }),
+            Arc::new(TestMediaRepository {
+                task,
+                media_files: vec![registered_media],
+            }),
             RemoteMediaTools {
                 ffprobe_paths: Vec::new(),
                 ffmpeg_path: PathBuf::from("ffmpeg"),
@@ -2021,7 +2039,7 @@ mod tests {
                 .headers()
                 .get(reqwest::header::CONTENT_DISPOSITION)
                 .and_then(|value| value.to_str().ok()),
-            Some("inline; filename*=UTF-8''episode%2D01%2Emkv")
+            Some("inline; filename*=UTF-8''%E6%B5%8B%E8%AF%95%20%5B01%5D%20%23100%25%3F%2Emkv")
         );
         assert_eq!(
             range_response.bytes().await.expect("range body").as_ref(),
@@ -2032,7 +2050,14 @@ mod tests {
             .post(format!("{base_url}/api/media/external-sessions"))
             .bearer_auth(token)
             .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .body(json!({ "taskId": "task-1", "mode": "direct", "fileIndex": 0 }).to_string())
+            .body(
+                json!({
+                    "taskId": "task-1",
+                    "mode": "direct",
+                    "startPositionSeconds": 321.5
+                })
+                .to_string(),
+            )
             .send()
             .await
             .expect("external media session request");
@@ -2047,7 +2072,9 @@ mod tests {
         let external_stream_url = external_session["streamUrl"]
             .as_str()
             .expect("external stream url");
-        assert!(external_stream_url.ends_with("/episode-01.mkv"));
+        assert_eq!(external_session["mode"], "direct");
+        assert!(external_session["startPositionSeconds"].is_null());
+        assert!(external_stream_url.ends_with("/%E6%B5%8B%E8%AF%95%20%5B01%5D%20%23100%25%3F.mkv"));
         let external_head = client
             .head(format!("{base_url}{external_stream_url}"))
             .send()
@@ -2060,6 +2087,20 @@ mod tests {
                 .get(reqwest::header::ACCEPT_RANGES)
                 .and_then(|value| value.to_str().ok()),
             Some("bytes")
+        );
+        assert_eq!(
+            external_head
+                .headers()
+                .get(reqwest::header::CONTENT_LENGTH)
+                .and_then(|value| value.to_str().ok()),
+            Some("10")
+        );
+        assert_eq!(
+            external_head
+                .headers()
+                .get(reqwest::header::CONTENT_DISPOSITION)
+                .and_then(|value| value.to_str().ok()),
+            Some("inline; filename*=UTF-8''%E6%B5%8B%E8%AF%95%20%5B01%5D%20%23100%25%3F%2Emkv")
         );
 
         gateway.stop().await;
