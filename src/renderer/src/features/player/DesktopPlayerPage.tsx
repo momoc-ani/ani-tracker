@@ -46,6 +46,8 @@ import { readStoredSubtitleScale, storeSubtitleScale } from "./subtitle-scale";
 import { readStoredVideoEnhancement, storeVideoEnhancement } from "./video-enhancement";
 
 const TOOLBAR_HIDE_DELAY_MS = 3_000;
+const FULLSCREEN_TRANSITION_SETTLE_MS = 220;
+const FULLSCREEN_TRANSITION_MAX_MS = 700;
 
 interface DesktopPlayerPageProps {
   taskId: string;
@@ -186,6 +188,11 @@ function DesktopMpvControls({
   const [toolbarVisible, setToolbarVisible] = useState(true);
   const [playlistOpen, setPlaylistOpen] = useState(false);
   const [panelOpen, setPanelOpen] = useState(false);
+  const [fullscreenTransition, setFullscreenTransition] = useState(false);
+  const [fullscreenTransitionSequence, setFullscreenTransitionSequence] = useState(0);
+  const fullscreenTargetRef = useRef<boolean>();
+  const fullscreenTransitionTimerRef = useRef<number>();
+  const fullscreenTransitionStartedAtRef = useRef<number>();
   const windowDrag = useDesktopWindowDrag();
 
   const previousItem = useMemo(
@@ -204,6 +211,8 @@ function DesktopMpvControls({
     ? capabilities.unavailableReason ?? "原生播放器运行时不可用"
     : null;
   const currentError = loadError ?? playbackError ?? snapshot?.error?.message ?? runtimeError;
+  // 全屏命令提交后先乐观更新控制层，避免等待下一次原生快照才切换图标和布局。
+  const effectiveFullscreen = fullscreenTargetRef.current ?? snapshot?.fullscreen ?? false;
   const episodeItems = useMemo(() => buildPlayerEpisodeItems({
     activeItem,
     currentTimeSeconds: snapshot?.positionSeconds ?? 0,
@@ -397,6 +406,51 @@ function DesktopMpvControls({
     return () => window.clearTimeout(toolbarTimerRef.current);
   }, [buffering, currentError, panelOpen, playing, playlistOpen, scheduleToolbarHide, session]);
 
+  const clearFullscreenTransition = useCallback((): void => {
+    window.clearTimeout(fullscreenTransitionTimerRef.current);
+    const startedAt = fullscreenTransitionStartedAtRef.current;
+    if (startedAt !== undefined) {
+      console.info("[player] 桌面播放器全屏过渡结束", {
+        elapsedMs: Math.round(performance.now() - startedAt)
+      });
+    }
+    fullscreenTransitionStartedAtRef.current = undefined;
+    fullscreenTargetRef.current = undefined;
+    setFullscreenTransition(false);
+  }, []);
+
+  const beginFullscreenTransition = useCallback((target: boolean): void => {
+    window.clearTimeout(fullscreenTransitionTimerRef.current);
+    fullscreenTransitionStartedAtRef.current = performance.now();
+    fullscreenTargetRef.current = target;
+    setFullscreenTransitionSequence((value) => value + 1);
+    setFullscreenTransition(true);
+    console.info("[player] 桌面播放器全屏切换开始", { target });
+    fullscreenTransitionTimerRef.current = window.setTimeout(
+      clearFullscreenTransition,
+      FULLSCREEN_TRANSITION_MAX_MS
+    );
+  }, [clearFullscreenTransition]);
+
+  useEffect(() => {
+    const target = fullscreenTargetRef.current;
+    if (target === undefined || snapshot?.fullscreen !== target) return;
+    const startedAt = fullscreenTransitionStartedAtRef.current;
+    console.info("[player] 桌面播放器全屏快照已确认", {
+      target,
+      elapsedMs: startedAt === undefined ? undefined : Math.round(performance.now() - startedAt)
+    });
+    window.clearTimeout(fullscreenTransitionTimerRef.current);
+    fullscreenTransitionTimerRef.current = window.setTimeout(
+      clearFullscreenTransition,
+      FULLSCREEN_TRANSITION_SETTLE_MS
+    );
+  }, [clearFullscreenTransition, snapshot?.fullscreen]);
+
+  useEffect(() => () => {
+    window.clearTimeout(fullscreenTransitionTimerRef.current);
+  }, []);
+
   const togglePlayback = (): void => sendSimpleCommand(playing ? "pause" : "play");
   const seekTo = (positionSeconds: number): void => {
     const command = createCommand<Extract<PlayerCommand, { type: "seek" }>>({
@@ -477,18 +531,31 @@ function DesktopMpvControls({
     if (command) void dispatchCommand(command);
   };
   const toggleFullscreen = (): void => {
+    if (fullscreenTargetRef.current !== undefined) return;
+    const fullscreen = !effectiveFullscreen;
     const command = createCommand<Extract<PlayerCommand, { type: "set-fullscreen" }>>({
       type: "set-fullscreen",
-      fullscreen: !(snapshot?.fullscreen ?? false)
+      fullscreen
     });
-    if (command) void dispatchCommand(command);
+    if (!command) return;
+    beginFullscreenTransition(fullscreen);
+    const startedAt = performance.now();
+    void dispatchCommand(command).then((accepted) => {
+      console.info("[player] 桌面播放器全屏命令已返回", {
+        accepted,
+        elapsedMs: Math.round(performance.now() - startedAt)
+      });
+      if (!accepted) clearFullscreenTransition();
+    });
   };
 
   /** 在播放器非编辑态处理空格和既有播放快捷键。 */
   const handleKeyDown = (event: ReactKeyboardEvent<HTMLElement>): void => {
     const key = resolvePlayerShortcut(event);
     if (!key) return;
-    if (["space", "arrowleft", "arrowright", "arrowup", "arrowdown"].includes(key)) event.preventDefault();
+    if (["space", "arrowleft", "arrowright", "arrowup", "arrowdown", "escape"].includes(key)) {
+      event.preventDefault();
+    }
     if (key === "space") togglePlayback();
     if (key === "arrowleft") seekTo((snapshot?.positionSeconds ?? 0) - 10);
     if (key === "arrowright") seekTo((snapshot?.positionSeconds ?? 0) + 10);
@@ -496,6 +563,7 @@ function DesktopMpvControls({
     if (key === "arrowdown") setVolume(Math.max(0, (snapshot?.volume ?? 0.7) - 0.05));
     if (key === "m") toggleMute();
     if (key === "f") toggleFullscreen();
+    if (key === "escape" && effectiveFullscreen) toggleFullscreen();
     if (key === "l") setPlaylistOpen(true);
     if (key === "p" && previousItem) selectItemAfterFlush(previousItem);
     if (key === "n" && nextItem) selectItemAfterFlush(nextItem);
@@ -551,6 +619,13 @@ function DesktopMpvControls({
       onPointerMove={revealToolbar}
       tabIndex={0}
     >
+      {fullscreenTransition && (
+        <div
+          key={fullscreenTransitionSequence}
+          aria-hidden="true"
+          className="player-fullscreen-transition"
+        />
+      )}
       <section className="player-video-stage" aria-label={`${animeTitle} ${episodeLabel} 视频播放器`}>
         {(loading || (activeItem && !session && !currentError)) && (
           <div className="absolute inset-0 z-10 flex items-center justify-center text-white">
@@ -585,7 +660,7 @@ function DesktopMpvControls({
           currentTimeSeconds={snapshot?.positionSeconds ?? 0}
           durationSeconds={snapshot?.durationSeconds ?? session?.durationSeconds ?? 0}
           episodeLabel={episodeLabel}
-          fullscreen={snapshot?.fullscreen ?? false}
+          fullscreen={effectiveFullscreen}
           muted={snapshot?.muted ?? false}
           nativeWindowDrag={windowDrag.nativeWindowDrag}
           onActivity={revealToolbar}

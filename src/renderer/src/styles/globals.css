@@ -219,10 +219,42 @@ html.desktop-player-overlay-root #root {
 
 /* 播放器页面使用稳定的视频表面，ArtPlayer 只负责媒体与字幕渲染。 */
 .player-page {
+  position: relative;
   width: 100%;
   min-width: 0;
   background: #000;
   outline: none;
+}
+
+/* 全屏切换时遮住原生窗口重排产生的短暂黑帧，切换完成后自动淡出。 */
+.player-fullscreen-transition {
+  position: absolute;
+  inset: 0;
+  z-index: 40;
+  pointer-events: none;
+  background: #000;
+  animation: player-fullscreen-transition-cover 320ms ease-out both;
+}
+
+@keyframes player-fullscreen-transition-cover {
+  0% {
+    opacity: 0;
+  }
+
+  12%,
+  72% {
+    opacity: 0.94;
+  }
+
+  100% {
+    opacity: 0;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .player-fullscreen-transition {
+    animation-duration: 120ms;
+  }
 }
 
 .player-page-remote:focus-visible {

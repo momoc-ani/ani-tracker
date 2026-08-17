@@ -49,6 +49,7 @@ const PLAYER_WINDOW_HEIGHT: f64 = 630.0;
 const SESSION_TTL_HOURS: i64 = 4;
 const PLAYER_SERVICE_READY_TIMEOUT: Duration = Duration::from_secs(15);
 const PLAYER_SERVICE_READY_POLL_INTERVAL: Duration = Duration::from_millis(25);
+const PLAYER_BOUNDS_SYNC_DELAY: Duration = Duration::from_millis(16);
 
 #[derive(Clone)]
 struct ResolvedPlaybackSession {
@@ -65,6 +66,13 @@ struct DesktopWindowDragState {
     pointer_start_y: f64,
     window_start_x: f64,
     window_start_y: f64,
+}
+
+#[cfg(desktop)]
+#[derive(Debug, Clone, Copy)]
+enum PlayerBoundsSyncSide {
+    Video,
+    Controls,
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -110,10 +118,16 @@ pub(crate) struct AppPlayerState {
     poll_generation: Arc<AtomicU64>,
     #[cfg(desktop)]
     fullscreen: Arc<AtomicBool>,
+    #[cfg(desktop)]
+    bounds_sync_pending: Arc<AtomicBool>,
+    #[cfg(desktop)]
+    bounds_sync_side: Arc<Mutex<Option<PlayerBoundsSyncSide>>>,
     #[cfg(target_os = "macos")]
     window_maximized: Arc<AtomicBool>,
     #[cfg(target_os = "macos")]
     window_restore_frame: Arc<Mutex<Option<MacOSWindowFrame>>>,
+    #[cfg(target_os = "macos")]
+    fullscreen_restore_frame: Arc<Mutex<Option<MacOSWindowFrame>>>,
     #[cfg(target_os = "macos")]
     drag_state: Arc<Mutex<Option<DesktopWindowDragState>>>,
 }
@@ -134,13 +148,95 @@ impl AppPlayerState {
             poll_generation: Arc::new(AtomicU64::new(0)),
             #[cfg(desktop)]
             fullscreen: Arc::new(AtomicBool::new(false)),
+            #[cfg(desktop)]
+            bounds_sync_pending: Arc::new(AtomicBool::new(false)),
+            #[cfg(desktop)]
+            bounds_sync_side: Arc::new(Mutex::new(None)),
             #[cfg(target_os = "macos")]
             window_maximized: Arc::new(AtomicBool::new(false)),
             #[cfg(target_os = "macos")]
             window_restore_frame: Arc::new(Mutex::new(None)),
             #[cfg(target_os = "macos")]
+            fullscreen_restore_frame: Arc::new(Mutex::new(None)),
+            #[cfg(target_os = "macos")]
             drag_state: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// 合并连续窗口事件，避免全屏过渡期间重复调整两个原生窗口。
+    #[cfg(desktop)]
+    fn schedule_bounds_sync(&self, side: PlayerBoundsSyncSide) {
+        self.schedule_bounds_sync_after(side, PLAYER_BOUNDS_SYNC_DELAY);
+    }
+
+    /// 延迟全屏后的窗口边界同步，避开 AppKit 原生切换动画中的阻塞查询。
+    #[cfg(desktop)]
+    fn schedule_bounds_sync_after(&self, side: PlayerBoundsSyncSide, delay: Duration) {
+        if let Ok(mut pending_side) = self.bounds_sync_side.lock() {
+            *pending_side = Some(side);
+        }
+        if self.bounds_sync_pending.swap(true, Ordering::AcqRel) {
+            return;
+        }
+
+        let app = self.app.clone();
+        let pending = self.bounds_sync_pending.clone();
+        let pending_side = self.bounds_sync_side.clone();
+        let generation = self.poll_generation.load(Ordering::Acquire);
+        tauri::async_runtime::spawn(async move {
+            tokio::time::sleep(delay).await;
+            let side = pending_side
+                .lock()
+                .ok()
+                .and_then(|mut value| value.take())
+                .unwrap_or(PlayerBoundsSyncSide::Video);
+            pending.store(false, Ordering::Release);
+
+            let Some(state) = app.try_state::<AppPlayerState>() else {
+                return;
+            };
+            if state.poll_generation.load(Ordering::Acquire) != generation {
+                return;
+            }
+            if state.fullscreen.load(Ordering::Acquire) {
+                return;
+            }
+            let Some(video) = app.get_window(PLAYER_VIDEO_WINDOW_LABEL) else {
+                return;
+            };
+            let Some(controls) = app.get_webview_window(PLAYER_CONTROL_WINDOW_LABEL) else {
+                return;
+            };
+            let started = Instant::now();
+            let result = match side {
+                PlayerBoundsSyncSide::Video => {
+                    #[cfg(target_os = "macos")]
+                    {
+                        sync_macos_player_window_bounds(&video, &controls.as_ref().window())
+                    }
+                    #[cfg(not(target_os = "macos"))]
+                    sync_controls_window_bounds(&video, &controls.as_ref().window())
+                }
+                PlayerBoundsSyncSide::Controls => {
+                    #[cfg(target_os = "macos")]
+                    {
+                        sync_macos_player_window_bounds(&video, &controls.as_ref().window())
+                    }
+                    #[cfg(not(target_os = "macos"))]
+                    sync_video_window_bounds(&controls.as_ref().window(), &video)
+                }
+            };
+            match result {
+                Ok(()) => log::debug!(
+                    "播放器窗口边界同步已合并 side={side:?} elapsed_ms={:.2}",
+                    started.elapsed().as_secs_f64() * 1_000.0
+                ),
+                Err(error) => log::warn!(
+                    "播放器窗口边界同步失败 side={side:?} elapsed_ms={:.2} error={error}",
+                    started.elapsed().as_secs_f64() * 1_000.0
+                ),
+            }
+        });
     }
 
     /// 在移动端创建受控会话并启动平台原生 libVLC 页面。
@@ -258,6 +354,8 @@ impl AppPlayerState {
             .title("Ani Tracker Player Video")
             .inner_size(PLAYER_WINDOW_WIDTH, PLAYER_WINDOW_HEIGHT)
             .min_inner_size(640.0, 360.0)
+            // 透明控制层是用户实际拖动和缩放的唯一权威窗口，避免双窗口互相调整尺寸。
+            .resizable(false)
             .decorations(false)
             .focusable(false)
             .shadow(false)
@@ -317,6 +415,9 @@ impl AppPlayerState {
             .set_position(initial_position)
             .map_err(|error| format!("定位 MPV 控制层失败：{error}"))?;
         let controls_window = controls.as_ref().window();
+        #[cfg(target_os = "macos")]
+        sync_macos_player_window_bounds(&video, &controls_window)?;
+        #[cfg(not(target_os = "macos"))]
         sync_video_window_bounds(&controls_window, &video)?;
 
         let target = resolve_video_target(&video)?;
@@ -335,6 +436,8 @@ impl AppPlayerState {
         let controller = Arc::new(TauriPlayerWindowController {
             app: self.app.clone(),
             fullscreen: self.fullscreen.clone(),
+            #[cfg(target_os = "macos")]
+            fullscreen_restore_frame: self.fullscreen_restore_frame.clone(),
         });
         let transport = self
             .app
@@ -362,6 +465,9 @@ impl AppPlayerState {
         {
             self.window_maximized.store(false, Ordering::Release);
             if let Ok(mut restore_frame) = self.window_restore_frame.lock() {
+                *restore_frame = None;
+            }
+            if let Ok(mut restore_frame) = self.fullscreen_restore_frame.lock() {
                 *restore_frame = None;
             }
             if let Ok(mut drag_state) = self.drag_state.lock() {
@@ -611,11 +717,15 @@ impl AppPlayerState {
 struct TauriPlayerWindowController {
     app: AppHandle,
     fullscreen: Arc<AtomicBool>,
+    #[cfg(target_os = "macos")]
+    fullscreen_restore_frame: Arc<Mutex<Option<MacOSWindowFrame>>>,
 }
 
 #[cfg(desktop)]
 impl DesktopWindowController for TauriPlayerWindowController {
     fn set_fullscreen(&self, fullscreen: bool) -> Result<bool, String> {
+        let started = Instant::now();
+        let lookup_started = Instant::now();
         let video = self
             .app
             .get_window(PLAYER_VIDEO_WINDOW_LABEL)
@@ -624,36 +734,83 @@ impl DesktopWindowController for TauriPlayerWindowController {
             .app
             .get_webview_window(PLAYER_CONTROL_WINDOW_LABEL)
             .ok_or_else(|| "播放器控制层不存在".to_owned())?;
+        let lookup_elapsed_ms = lookup_started.elapsed().as_secs_f64() * 1_000.0;
+        let maximized_started = Instant::now();
         let controls_maximized = controls
             .is_maximized()
             .map_err(|error| format!("读取播放器控制层最大化状态失败：{error}"))?;
+        let maximized_elapsed_ms = maximized_started.elapsed().as_secs_f64() * 1_000.0;
+        #[cfg(not(target_os = "macos"))]
         let controls_window = controls.as_ref().window();
+        log::info!("播放器全屏切换开始 fullscreen={fullscreen}");
+        let native_started = Instant::now();
         #[cfg(target_os = "macos")]
         {
             controls
                 .set_resizable(!fullscreen)
                 .map_err(|error| format!("切换控制层缩放能力失败：{error}"))?;
+            let fullscreen_restore_frame = self.fullscreen_restore_frame.clone();
+            let video_for_update = video.clone();
+            let controls_for_update = controls.as_ref().window().clone();
             video
-                .set_simple_fullscreen(fullscreen)
-                .map_err(|error| format!("切换视频父窗口全屏失败：{error}"))?;
-            sync_controls_window_bounds(&video, &controls_window)?;
+                .run_on_main_thread(move || {
+                    match apply_macos_fullscreen_window_mode(
+                        &video_for_update,
+                        &controls_for_update,
+                        fullscreen,
+                        &fullscreen_restore_frame,
+                    ) {
+                        Ok(target) => {
+                            log::debug!(
+                                "macOS 播放器无动画全屏边界已同步 fullscreen={} x={} y={} width={} height={}",
+                                fullscreen,
+                                target.x,
+                                target.y,
+                                target.width,
+                                target.height
+                            );
+                        }
+                        Err(error) => {
+                            log::error!("macOS 播放器无动画全屏边界失败 error={error}");
+                        }
+                    }
+                })
+                .map_err(|error| format!("提交 macOS 播放器全屏边界失败：{error}"))?;
         }
         #[cfg(not(target_os = "macos"))]
         {
             controls
                 .set_fullscreen(fullscreen)
                 .map_err(|error| format!("切换控制层全屏失败：{error}"))?;
-            sync_video_window_bounds(&controls_window, &video)?;
         }
+        let native_elapsed_ms = native_started.elapsed().as_secs_f64() * 1_000.0;
+        #[cfg(target_os = "macos")]
+        let sync_elapsed_ms: f64 = 0.0;
+        #[cfg(not(target_os = "macos"))]
+        let sync_elapsed_ms = {
+            let sync_started = Instant::now();
+            sync_video_window_bounds(&controls_window, &video)?;
+            sync_started.elapsed().as_secs_f64() * 1_000.0
+        };
         self.fullscreen.store(fullscreen, Ordering::Release);
         log::info!(
-            "Tauri 播放器窗口模式已同步 fullscreen={} controls_maximized={} driver={}",
+            "Tauri 播放器窗口模式已同步 fullscreen={} controls_maximized={} driver={} lookup_ms={:.2} maximized_ms={:.2} native_ms={:.2} sync_ms={:.2} total_ms={:.2} sync_mode={}",
             fullscreen,
             controls_maximized,
             if cfg!(target_os = "macos") {
-                "video-parent"
+                "video-parent-frame"
             } else {
                 "controls"
+            },
+            lookup_elapsed_ms,
+            maximized_elapsed_ms,
+            native_elapsed_ms,
+            sync_elapsed_ms.max(0.0),
+            started.elapsed().as_secs_f64() * 1_000.0,
+            if cfg!(target_os = "macos") {
+                "appkit-transaction"
+            } else {
+                "immediate"
             }
         );
         Ok(fullscreen)
@@ -899,8 +1056,53 @@ fn apply_macos_window_mode<R: Runtime>(
     }
 }
 
+/// 在 AppKit 单次事务内切换无动画全屏，并保存还原边界。
+#[cfg(target_os = "macos")]
+fn apply_macos_fullscreen_window_mode<R: Runtime>(
+    video: &Window<R>,
+    controls: &Window<R>,
+    fullscreen: bool,
+    restore_frame: &Mutex<Option<MacOSWindowFrame>>,
+) -> Result<MacOSWindowFrame, String> {
+    let video_pointer = video
+        .ns_window()
+        .map_err(|error| format!("读取播放器视频父窗失败：{error}"))?
+        .cast::<NSWindow>();
+    let controls_pointer = controls
+        .ns_window()
+        .map_err(|error| format!("读取播放器控制子窗失败：{error}"))?
+        .cast::<NSWindow>();
+    if video_pointer.is_null() || controls_pointer.is_null() {
+        return Err("播放器原生窗口指针无效".to_owned());
+    }
+
+    // SAFETY: 两个指针由仍存活的 Tauri Window 持有，且调用发生在 AppKit 主线程。
+    unsafe {
+        let video_window = &*video_pointer;
+        let controls_window = &*controls_pointer;
+        let current_frame = MacOSWindowFrame::from(NSWindow::frame(video_window));
+        let screen_frame =
+            NSWindow::screen(video_window).map(|screen| MacOSWindowFrame::from(screen.frame()));
+        let target = {
+            let mut restore_frame = restore_frame
+                .lock()
+                .map_err(|error| format!("读取播放器全屏还原边界失败：{error}"))?;
+            resolve_macos_window_mode_frame(
+                fullscreen,
+                current_frame,
+                screen_frame,
+                &mut restore_frame,
+            )?
+        };
+        let target_rect = target.into_ns_rect();
+        NSWindow::setFrame_display_animate(video_window, target_rect, true, false);
+        NSWindow::setFrame_display_animate(controls_window, target_rect, true, false);
+        Ok(target)
+    }
+}
+
 /// 按透明控制层的物理边界同步视频窗口。
-#[cfg(desktop)]
+#[cfg(all(desktop, not(target_os = "macos")))]
 fn sync_video_window_bounds<R: Runtime>(
     controls: &Window<R>,
     video: &Window<R>,
@@ -935,8 +1137,65 @@ fn sync_video_window_bounds<R: Runtime>(
     Ok(())
 }
 
+/// 在 AppKit 主线程按控制层绝对 frame 同步双窗口，避免左上角缩放产生坐标漂移。
+#[cfg(target_os = "macos")]
+fn sync_macos_player_window_bounds<R: Runtime>(
+    video: &Window<R>,
+    controls: &Window<R>,
+) -> Result<(), String> {
+    let video_pointer = video
+        .ns_window()
+        .map_err(|error| format!("读取播放器视频父窗失败：{error}"))?
+        .cast::<NSWindow>();
+    let controls_pointer = controls
+        .ns_window()
+        .map_err(|error| format!("读取播放器控制层失败：{error}"))?
+        .cast::<NSWindow>();
+    if video_pointer.is_null() || controls_pointer.is_null() {
+        return Err("播放器原生窗口指针无效".to_owned());
+    }
+    let video_address = video_pointer as usize;
+    let controls_address = controls_pointer as usize;
+    video
+        .run_on_main_thread(move || {
+            // SAFETY: 两个窗口指针由仍存活的 Tauri Window 持有，闭包在 AppKit 主线程执行。
+            unsafe {
+                let video_window = &*(video_address as *mut NSWindow);
+                let controls_window = &*(controls_address as *mut NSWindow);
+                let target = NSWindow::frame(controls_window);
+                let video_frame = NSWindow::frame(video_window);
+                if !macos_ns_rects_close(video_frame, target) {
+                    NSWindow::setFrame_display_animate(video_window, target, true, false);
+                }
+                let controls_frame = NSWindow::frame(controls_window);
+                if !macos_ns_rects_close(controls_frame, target) {
+                    NSWindow::setFrame_display_animate(controls_window, target, true, false);
+                }
+                log::debug!(
+                    "macOS 播放器缩放边界已按绝对 frame 同步 x={} y={} width={} height={}",
+                    target.origin.x,
+                    target.origin.y,
+                    target.size.width,
+                    target.size.height
+                );
+            }
+        })
+        .map_err(|error| format!("提交 macOS 播放器缩放边界失败：{error}"))?;
+    Ok(())
+}
+
+/// 判断两个 AppKit 窗口边界是否已足够接近，避免重复 setFrame 触发 resize 事件。
+#[cfg(target_os = "macos")]
+fn macos_ns_rects_close(left: NSRect, right: NSRect) -> bool {
+    const EPSILON: f64 = 0.5;
+    (left.origin.x - right.origin.x).abs() <= EPSILON
+        && (left.origin.y - right.origin.y).abs() <= EPSILON
+        && (left.size.width - right.size.width).abs() <= EPSILON
+        && (left.size.height - right.size.height).abs() <= EPSILON
+}
+
 /// 按视频宿主的物理边界同步透明控制层。
-#[cfg(desktop)]
+#[cfg(all(desktop, not(target_os = "macos")))]
 fn sync_controls_window_bounds<R: Runtime>(
     video: &Window<R>,
     controls: &Window<R>,
@@ -1031,6 +1290,7 @@ fn ensure_macos_player_window_layering<R: Runtime>(
 
 /// 扣除视频窗原生边框，使其物理外框与透明控制层完全重合。
 #[cfg(desktop)]
+#[allow(dead_code)]
 fn inner_size_for_outer_bounds(
     target_outer_size: PhysicalSize<u32>,
     current_outer_size: PhysicalSize<u32>,
@@ -1284,10 +1544,16 @@ impl AppPlayerState {
                     VideoWindowEventAction::RestoreControlFocus => {
                         if let Some(controls) = controls {
                             #[cfg(target_os = "macos")]
-                            if let Err(error) =
-                                ensure_macos_player_window_layering(window, &controls)
+                            if window
+                                .app_handle()
+                                .try_state::<AppPlayerState>()
+                                .is_none_or(|state| !state.fullscreen.load(Ordering::Acquire))
                             {
-                                log::warn!("恢复 macOS 播放器控制层焦点失败 error={error}");
+                                if let Err(error) =
+                                    ensure_macos_player_window_layering(window, &controls)
+                                {
+                                    log::warn!("恢复 macOS 播放器控制层焦点失败 error={error}");
+                                }
                             }
                             #[cfg(not(target_os = "macos"))]
                             if let Err(error) = controls.set_focus() {
@@ -1296,13 +1562,8 @@ impl AppPlayerState {
                         }
                     }
                     VideoWindowEventAction::SyncControlBounds => {
-                        if let Some(controls) = controls {
-                            if let Err(error) =
-                                sync_controls_window_bounds(window, &controls.as_ref().window())
-                            {
-                                log::warn!("同步播放器控制层物理边界失败 error={error}");
-                            }
-                        }
+                        // 视频父窗不接受手动缩放；全屏、最大化和初始布局都在同一处同步，
+                        // 因此这里不再反向调整控制层，避免两个窗口形成 resize 反馈链。
                     }
                     VideoWindowEventAction::CloseControlWindow => {
                         if let Some(controls) = controls {
@@ -1322,9 +1583,15 @@ impl AppPlayerState {
                 WindowEvent::Moved(_)
                 | WindowEvent::Resized(_)
                 | WindowEvent::ScaleFactorChanged { .. } => {
-                    if let Some(video) = window.app_handle().get_window(PLAYER_VIDEO_WINDOW_LABEL) {
-                        if let Err(error) = sync_video_window_bounds(window, &video) {
-                            log::warn!("同步 MPV 视频窗口物理边界失败 error={error}");
+                    if window
+                        .app_handle()
+                        .get_window(PLAYER_VIDEO_WINDOW_LABEL)
+                        .is_some()
+                    {
+                        if let Some(state) = window.app_handle().try_state::<AppPlayerState>() {
+                            if !state.fullscreen.load(Ordering::Acquire) {
+                                state.schedule_bounds_sync(PlayerBoundsSyncSide::Controls);
+                            }
                         }
                     }
                 }

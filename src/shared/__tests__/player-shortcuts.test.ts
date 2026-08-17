@@ -16,6 +16,9 @@ test("输入控件和组合键保留自身的键盘行为", () => {
 
 test("播放器其他既有快捷键仍可被统一解析", () => {
   assert.equal(resolvePlayerShortcut({ key: "ArrowLeft" }), "arrowleft");
+  assert.equal(resolvePlayerShortcut({ key: "Escape" }), "escape");
+  assert.equal(resolvePlayerShortcut({ key: "Escape", target: { closest: () => null } }), "escape");
+  assert.equal(resolvePlayerShortcut({ key: "Escape", target: { closest: (selector: string) => selector.includes("[role='dialog']") ? {} : null } }), undefined);
   assert.equal(resolvePlayerShortcut({ key: "M" }), "m");
   assert.equal(resolvePlayerShortcut({ key: "Enter" }), undefined);
 });
