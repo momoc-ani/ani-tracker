@@ -2,6 +2,7 @@ use std::ffi::{c_char, c_int, c_void};
 use std::ptr;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
 use ani_media::player::PlayerTransportError;
 
@@ -30,6 +31,7 @@ const MPV_RENDER_PARAM_OPENGL_FBO: c_int = 3;
 const MPV_RENDER_PARAM_FLIP_Y: c_int = 4;
 const MPV_RENDER_UPDATE_FRAME: u64 = 1;
 const GL_COLOR_BUFFER_BIT: u32 = 0x0000_4000;
+const RESIZE_RENDER_INTERVAL: Duration = Duration::from_millis(50);
 
 #[repr(C)]
 pub(super) struct MpvRenderParam {
@@ -323,6 +325,9 @@ fn render_loop(
     let cgl_context = cgl_context as *mut CglContext;
     let surface = surface as *mut c_void;
     let mut drawable_update_warned = false;
+    let mut last_drawable_size: Option<(c_int, c_int)> = None;
+    let mut last_render_size: Option<(c_int, c_int)> = None;
+    let mut next_resize_render_at: Option<Instant> = None;
     loop {
         let mut state = match signal.state.lock() {
             Ok(state) => state,
@@ -346,6 +351,27 @@ fn render_loop(
         state.pending = false;
         drop(state);
 
+        // 缩放期间限制重渲染频率，保留上一帧，让窗口跟手而不反复触发 Anime4K。
+        let mut resize_size = [0_i32; 2];
+        let resize_status = unsafe {
+            ani_mpv_macos_surface_backing_size(surface, &mut resize_size[0], &mut resize_size[1])
+        };
+        if resize_status == 0 && resize_size[0] > 0 && resize_size[1] > 0 {
+            let size = (resize_size[0], resize_size[1]);
+            let size_changed = Some(size) != last_render_size;
+            let first_render_size = last_render_size.is_none();
+            if size_changed && !first_render_size {
+                let now = Instant::now();
+                if next_resize_render_at.is_some_and(|deadline| now < deadline) {
+                    continue;
+                }
+                next_resize_render_at = Some(now + RESIZE_RENDER_INTERVAL);
+            }
+            if size_changed {
+                last_render_size = Some(size);
+            }
+        }
+
         unsafe {
             if CGLLockContext(cgl_context) != 0 {
                 record_render_error(&health, "锁定 CGLContext 失败".to_owned());
@@ -356,15 +382,33 @@ fn render_loop(
                 record_render_error(&health, "激活 CGLContext 失败".to_owned());
                 break;
             }
-            let drawable_update_status = CGLUpdateContext(cgl_context);
-            if drawable_update_status != 0 && !drawable_update_warned {
-                log::warn!(
-                    "macOS MPV 更新 CGLContext drawable 失败，将继续消费渲染回调 status={drawable_update_status}"
-                );
-                drawable_update_warned = true;
-            } else if drawable_update_status == 0 && drawable_update_warned {
-                log::info!("macOS MPV CGLContext drawable 已恢复");
-                drawable_update_warned = false;
+            let mut backing_width = 0;
+            let mut backing_height = 0;
+            let backing_status = ani_mpv_macos_surface_backing_size(
+                surface,
+                &mut backing_width,
+                &mut backing_height,
+            );
+            let backing_size = (backing_width, backing_height);
+            let drawable_needs_update = backing_status != 0
+                || Some(backing_size) != last_drawable_size
+                || drawable_update_warned;
+            if drawable_needs_update {
+                let drawable_update_status = CGLUpdateContext(cgl_context);
+                if drawable_update_status != 0 && !drawable_update_warned {
+                    log::warn!(
+                        "macOS MPV 更新 CGLContext drawable 失败，将继续消费渲染回调 status={drawable_update_status}"
+                    );
+                    drawable_update_warned = true;
+                } else if drawable_update_status == 0 {
+                    if drawable_update_warned {
+                        log::info!("macOS MPV CGLContext drawable 已恢复");
+                    }
+                    drawable_update_warned = false;
+                    if backing_status == 0 && backing_width > 0 && backing_height > 0 {
+                        last_drawable_size = Some(backing_size);
+                    }
+                }
             }
             let update = (api.render_context_update)(render_context);
             record_render_update(&health, update);

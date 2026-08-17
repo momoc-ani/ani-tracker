@@ -31,11 +31,13 @@ use tauri::window::{Color, WindowBuilder};
 use tauri::LogicalPosition;
 #[cfg(desktop)]
 use tauri::Manager;
+#[cfg(any(test, all(desktop, not(target_os = "macos"))))]
+use tauri::PhysicalPosition;
 #[cfg(target_os = "macos")]
 use tauri::WebviewWindow;
 use tauri::{AppHandle, Emitter, Runtime, Window, WindowEvent};
 #[cfg(desktop)]
-use tauri::{PhysicalPosition, PhysicalSize, WebviewUrl, WebviewWindowBuilder};
+use tauri::{PhysicalSize, WebviewUrl, WebviewWindowBuilder};
 use tauri_plugin_ani_player::AniPlayerExt;
 #[cfg(desktop)]
 use tauri_plugin_ani_player::{DesktopVideoTarget, DesktopWindowController};
@@ -49,7 +51,7 @@ const PLAYER_WINDOW_HEIGHT: f64 = 630.0;
 const SESSION_TTL_HOURS: i64 = 4;
 const PLAYER_SERVICE_READY_TIMEOUT: Duration = Duration::from_secs(15);
 const PLAYER_SERVICE_READY_POLL_INTERVAL: Duration = Duration::from_millis(25);
-const PLAYER_BOUNDS_SYNC_DELAY: Duration = Duration::from_millis(16);
+const PLAYER_BOUNDS_SYNC_DELAY: Duration = Duration::from_millis(32);
 
 #[derive(Clone)]
 struct ResolvedPlaybackSession {
@@ -1165,11 +1167,11 @@ fn sync_macos_player_window_bounds<R: Runtime>(
                 let target = NSWindow::frame(controls_window);
                 let video_frame = NSWindow::frame(video_window);
                 if !macos_ns_rects_close(video_frame, target) {
-                    NSWindow::setFrame_display_animate(video_window, target, true, false);
+                    NSWindow::setFrame_display_animate(video_window, target, false, false);
                 }
                 let controls_frame = NSWindow::frame(controls_window);
                 if !macos_ns_rects_close(controls_frame, target) {
-                    NSWindow::setFrame_display_animate(controls_window, target, true, false);
+                    NSWindow::setFrame_display_animate(controls_window, target, false, false);
                 }
                 log::debug!(
                     "macOS 播放器缩放边界已按绝对 frame 同步 x={} y={} width={} height={}",
@@ -1271,6 +1273,9 @@ fn ensure_macos_player_window_layering<R: Runtime>(
             unsafe {
                 let video_window = &*(video_window as *mut NSWindow);
                 let controls_window = &*(controls_window as *mut NSWindow);
+                // live resize 期间保留上一帧内容，避免 WebView 与 OpenGL 表面同步重绘拖慢拖动。
+                video_window.setPreservesContentDuringLiveResize(true);
+                controls_window.setPreservesContentDuringLiveResize(true);
                 match controls_window.parentWindow() {
                     Some(parent) if std::ptr::eq(&*parent, video_window) => {}
                     Some(parent) => {
