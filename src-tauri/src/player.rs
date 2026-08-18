@@ -22,7 +22,9 @@ use ani_repository::{DownloadRepository, MediaRepository, PlaybackRepository};
 use ani_storage::Storage;
 use chrono::{Duration as ChronoDuration, SecondsFormat, Utc};
 #[cfg(target_os = "macos")]
-use objc2_app_kit::{NSWindow, NSWindowOrderingMode};
+use objc2::MainThreadMarker;
+#[cfg(target_os = "macos")]
+use objc2_app_kit::{NSApp, NSApplicationPresentationOptions, NSWindow, NSWindowOrderingMode};
 #[cfg(target_os = "macos")]
 use objc2_foundation::{NSPoint, NSRect, NSSize};
 #[cfg(desktop)]
@@ -131,6 +133,8 @@ pub(crate) struct AppPlayerState {
     #[cfg(target_os = "macos")]
     fullscreen_restore_frame: Arc<Mutex<Option<MacOSWindowFrame>>>,
     #[cfg(target_os = "macos")]
+    fullscreen_restore_presentation_options: Arc<Mutex<Option<NSApplicationPresentationOptions>>>,
+    #[cfg(target_os = "macos")]
     drag_state: Arc<Mutex<Option<DesktopWindowDragState>>>,
 }
 
@@ -160,6 +164,8 @@ impl AppPlayerState {
             window_restore_frame: Arc::new(Mutex::new(None)),
             #[cfg(target_os = "macos")]
             fullscreen_restore_frame: Arc::new(Mutex::new(None)),
+            #[cfg(target_os = "macos")]
+            fullscreen_restore_presentation_options: Arc::new(Mutex::new(None)),
             #[cfg(target_os = "macos")]
             drag_state: Arc::new(Mutex::new(None)),
         }
@@ -440,6 +446,10 @@ impl AppPlayerState {
             fullscreen: self.fullscreen.clone(),
             #[cfg(target_os = "macos")]
             fullscreen_restore_frame: self.fullscreen_restore_frame.clone(),
+            #[cfg(target_os = "macos")]
+            fullscreen_restore_presentation_options: self
+                .fullscreen_restore_presentation_options
+                .clone(),
         });
         let transport = self
             .app
@@ -463,6 +473,13 @@ impl AppPlayerState {
         self.poll_generation.fetch_add(1, Ordering::SeqCst);
         #[cfg(desktop)]
         self.fullscreen.store(false, Ordering::Release);
+        #[cfg(target_os = "macos")]
+        if let Err(error) = schedule_macos_fullscreen_presentation_restore(
+            &self.app,
+            self.fullscreen_restore_presentation_options.clone(),
+        ) {
+            log::warn!("关闭播放器前恢复 macOS 系统界面失败 error={error}");
+        }
         #[cfg(target_os = "macos")]
         {
             self.window_maximized.store(false, Ordering::Release);
@@ -721,11 +738,17 @@ struct TauriPlayerWindowController {
     fullscreen: Arc<AtomicBool>,
     #[cfg(target_os = "macos")]
     fullscreen_restore_frame: Arc<Mutex<Option<MacOSWindowFrame>>>,
+    #[cfg(target_os = "macos")]
+    fullscreen_restore_presentation_options: Arc<Mutex<Option<NSApplicationPresentationOptions>>>,
 }
 
 #[cfg(desktop)]
 impl DesktopWindowController for TauriPlayerWindowController {
     fn set_fullscreen(&self, fullscreen: bool) -> Result<bool, String> {
+        let was_fullscreen = self.fullscreen.load(Ordering::Acquire);
+        if was_fullscreen == fullscreen {
+            return Ok(fullscreen);
+        }
         let started = Instant::now();
         let lookup_started = Instant::now();
         let video = self
@@ -752,32 +775,56 @@ impl DesktopWindowController for TauriPlayerWindowController {
                 .set_resizable(!fullscreen)
                 .map_err(|error| format!("切换控制层缩放能力失败：{error}"))?;
             let fullscreen_restore_frame = self.fullscreen_restore_frame.clone();
+            let fullscreen_restore_presentation_options =
+                self.fullscreen_restore_presentation_options.clone();
+            let fullscreen_state = self.fullscreen.clone();
             let video_for_update = video.clone();
             let controls_for_update = controls.as_ref().window().clone();
-            video
-                .run_on_main_thread(move || {
-                    match apply_macos_fullscreen_window_mode(
-                        &video_for_update,
-                        &controls_for_update,
-                        fullscreen,
-                        &fullscreen_restore_frame,
-                    ) {
-                        Ok(target) => {
-                            log::debug!(
-                                "macOS 播放器无动画全屏边界已同步 fullscreen={} x={} y={} width={} height={}",
-                                fullscreen,
-                                target.x,
-                                target.y,
-                                target.width,
-                                target.height
-                            );
-                        }
-                        Err(error) => {
-                            log::error!("macOS 播放器无动画全屏边界失败 error={error}");
-                        }
+            self.fullscreen.store(fullscreen, Ordering::Release);
+            let submit_result = video.run_on_main_thread(move || {
+                if fullscreen_state.load(Ordering::Acquire) != fullscreen {
+                    log::debug!(
+                        "跳过已过期的 macOS 播放器全屏任务 fullscreen={fullscreen}"
+                    );
+                    return;
+                }
+                match apply_macos_fullscreen_window_mode(
+                    &video_for_update,
+                    &controls_for_update,
+                    fullscreen,
+                    &fullscreen_restore_frame,
+                    &fullscreen_restore_presentation_options,
+                ) {
+                    Ok(target) => {
+                        fullscreen_state.store(fullscreen, Ordering::Release);
+                        log::debug!(
+                            "macOS 播放器无动画全屏边界已同步 fullscreen={} x={} y={} width={} height={}",
+                            fullscreen,
+                            target.x,
+                            target.y,
+                            target.width,
+                            target.height
+                        );
                     }
-                })
-                .map_err(|error| format!("提交 macOS 播放器全屏边界失败：{error}"))?;
+                    Err(error) => {
+                        if fullscreen_state.load(Ordering::Acquire) == fullscreen {
+                            fullscreen_state.store(was_fullscreen, Ordering::Release);
+                        }
+                        log::error!("macOS 播放器无动画全屏边界失败 error={error}");
+                    }
+                }
+            });
+            if let Err(error) = submit_result {
+                self.fullscreen.store(was_fullscreen, Ordering::Release);
+                controls
+                    .set_resizable(!was_fullscreen)
+                    .map_err(|restore_error| {
+                        format!(
+                            "提交 macOS 播放器全屏边界失败：{error}；恢复控制层缩放能力失败：{restore_error}"
+                        )
+                    })?;
+                return Err(format!("提交 macOS 播放器全屏边界失败：{error}"));
+            }
         }
         #[cfg(not(target_os = "macos"))]
         {
@@ -794,6 +841,7 @@ impl DesktopWindowController for TauriPlayerWindowController {
             sync_video_window_bounds(&controls_window, &video)?;
             sync_started.elapsed().as_secs_f64() * 1_000.0
         };
+        #[cfg(not(target_os = "macos"))]
         self.fullscreen.store(fullscreen, Ordering::Release);
         log::info!(
             "Tauri 播放器窗口模式已同步 fullscreen={} controls_maximized={} driver={} lookup_ms={:.2} maximized_ms={:.2} native_ms={:.2} sync_ms={:.2} total_ms={:.2} sync_mode={}",
@@ -820,6 +868,13 @@ impl DesktopWindowController for TauriPlayerWindowController {
 
     fn close(&self) -> Result<(), String> {
         self.fullscreen.store(false, Ordering::Release);
+        #[cfg(target_os = "macos")]
+        if let Err(error) = schedule_macos_fullscreen_presentation_restore(
+            &self.app,
+            self.fullscreen_restore_presentation_options.clone(),
+        ) {
+            log::warn!("关闭播放器 transport 前恢复 macOS 系统界面失败 error={error}");
+        }
         if let Some(window) = self.app.get_webview_window(PLAYER_CONTROL_WINDOW_LABEL) {
             window
                 .close()
@@ -1005,7 +1060,9 @@ fn resolve_macos_window_mode_frame(
 ) -> Result<MacOSWindowFrame, String> {
     if maximized {
         let target = visible_frame.ok_or_else(|| "播放器窗口不在可用屏幕内".to_owned())?;
-        *restore_frame = Some(current_frame);
+        if restore_frame.is_none() {
+            *restore_frame = Some(current_frame);
+        }
         return Ok(target);
     }
     restore_frame
@@ -1065,6 +1122,7 @@ fn apply_macos_fullscreen_window_mode<R: Runtime>(
     controls: &Window<R>,
     fullscreen: bool,
     restore_frame: &Mutex<Option<MacOSWindowFrame>>,
+    restore_presentation_options: &Mutex<Option<NSApplicationPresentationOptions>>,
 ) -> Result<MacOSWindowFrame, String> {
     let video_pointer = video
         .ns_window()
@@ -1078,6 +1136,10 @@ fn apply_macos_fullscreen_window_mode<R: Runtime>(
         return Err("播放器原生窗口指针无效".to_owned());
     }
 
+    if !fullscreen {
+        apply_macos_fullscreen_presentation(false, restore_presentation_options)?;
+    }
+
     // SAFETY: 两个指针由仍存活的 Tauri Window 持有，且调用发生在 AppKit 主线程。
     unsafe {
         let video_window = &*video_pointer;
@@ -1089,18 +1151,81 @@ fn apply_macos_fullscreen_window_mode<R: Runtime>(
             let mut restore_frame = restore_frame
                 .lock()
                 .map_err(|error| format!("读取播放器全屏还原边界失败：{error}"))?;
-            resolve_macos_window_mode_frame(
-                fullscreen,
-                current_frame,
-                screen_frame,
-                &mut restore_frame,
-            )?
+            if !fullscreen && restore_frame.is_none() {
+                current_frame
+            } else {
+                resolve_macos_window_mode_frame(
+                    fullscreen,
+                    current_frame,
+                    screen_frame,
+                    &mut restore_frame,
+                )?
+            }
         };
+        if fullscreen {
+            apply_macos_fullscreen_presentation(true, restore_presentation_options)?;
+        }
         let target_rect = target.into_ns_rect();
         NSWindow::setFrame_display_animate(video_window, target_rect, true, false);
         NSWindow::setFrame_display_animate(controls_window, target_rect, true, false);
         Ok(target)
     }
+}
+
+/// 计算系统级全屏展示选项，并保存进入播放器全屏前的应用状态。
+#[cfg(target_os = "macos")]
+fn resolve_macos_presentation_options(
+    fullscreen: bool,
+    current: NSApplicationPresentationOptions,
+    restore_options: &mut Option<NSApplicationPresentationOptions>,
+) -> Option<NSApplicationPresentationOptions> {
+    if fullscreen {
+        if restore_options.is_none() {
+            *restore_options = Some(current);
+        }
+        return Some(
+            NSApplicationPresentationOptions::FullScreen
+                | NSApplicationPresentationOptions::HideDock
+                | NSApplicationPresentationOptions::HideMenuBar,
+        );
+    }
+    restore_options.take()
+}
+
+/// 在 AppKit 主线程切换应用展示状态，使无边框播放器真正覆盖 Dock 和菜单栏。
+#[cfg(target_os = "macos")]
+fn apply_macos_fullscreen_presentation(
+    fullscreen: bool,
+    restore_options: &Mutex<Option<NSApplicationPresentationOptions>>,
+) -> Result<(), String> {
+    let main_thread = MainThreadMarker::new()
+        .ok_or_else(|| "macOS 系统界面切换未在 AppKit 主线程执行".to_owned())?;
+    let application = NSApp(main_thread);
+    let current = application.presentationOptions();
+    let target = {
+        let mut restore_options = restore_options
+            .lock()
+            .map_err(|error| format!("读取 macOS 系统界面还原状态失败：{error}"))?;
+        resolve_macos_presentation_options(fullscreen, current, &mut restore_options)
+    };
+    if let Some(target) = target {
+        application.setPresentationOptions(target);
+    }
+    Ok(())
+}
+
+/// 将系统界面恢复任务提交到 AppKit 主线程；状态提取是幂等的，可安全重复调用。
+#[cfg(target_os = "macos")]
+fn schedule_macos_fullscreen_presentation_restore<R: Runtime>(
+    app: &AppHandle<R>,
+    restore_options: Arc<Mutex<Option<NSApplicationPresentationOptions>>>,
+) -> Result<(), String> {
+    app.run_on_main_thread(move || {
+        if let Err(error) = apply_macos_fullscreen_presentation(false, &restore_options) {
+            log::error!("恢复 macOS 播放器系统界面失败 error={error}");
+        }
+    })
+    .map_err(|error| format!("提交 macOS 系统界面恢复任务失败：{error}"))
 }
 
 /// 按透明控制层的物理边界同步视频窗口。
@@ -1605,10 +1730,23 @@ impl AppPlayerState {
                     tauri::async_runtime::spawn(async move {
                         if let Some(state) = app.try_state::<AppPlayerState>() {
                             state.poll_generation.fetch_add(1, Ordering::SeqCst);
+                            state.fullscreen.store(false, Ordering::Release);
                             #[cfg(target_os = "macos")]
                             {
+                                if let Err(error) = schedule_macos_fullscreen_presentation_restore(
+                                    &app,
+                                    state.fullscreen_restore_presentation_options.clone(),
+                                ) {
+                                    log::warn!(
+                                        "播放器窗口销毁后恢复 macOS 系统界面失败 error={error}"
+                                    );
+                                }
                                 state.window_maximized.store(false, Ordering::Release);
                                 if let Ok(mut restore_frame) = state.window_restore_frame.lock() {
+                                    *restore_frame = None;
+                                }
+                                if let Ok(mut restore_frame) = state.fullscreen_restore_frame.lock()
+                                {
                                     *restore_frame = None;
                                 }
                             }
@@ -1838,6 +1976,37 @@ mod tests {
             original
         );
         assert_eq!(restore_frame, None);
+    }
+
+    /// macOS 播放器全屏需隐藏系统栏，并在重复进入和退出后恢复原展示选项。
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn preserves_macos_presentation_options_across_fullscreen() {
+        let original = NSApplicationPresentationOptions::DisableMenuBarTransparency;
+        let fullscreen = NSApplicationPresentationOptions::FullScreen
+            | NSApplicationPresentationOptions::HideDock
+            | NSApplicationPresentationOptions::HideMenuBar;
+        let mut restore_options = None;
+
+        assert_eq!(
+            resolve_macos_presentation_options(true, original, &mut restore_options),
+            Some(fullscreen)
+        );
+        assert_eq!(restore_options, Some(original));
+        assert_eq!(
+            resolve_macos_presentation_options(true, fullscreen, &mut restore_options),
+            Some(fullscreen)
+        );
+        assert_eq!(restore_options, Some(original));
+        assert_eq!(
+            resolve_macos_presentation_options(false, fullscreen, &mut restore_options),
+            Some(original)
+        );
+        assert_eq!(restore_options, None);
+        assert_eq!(
+            resolve_macos_presentation_options(false, original, &mut restore_options),
+            None
+        );
     }
 
     /// 视频窗内容尺寸需扣除自身边框，保证双窗口物理外框完全重合。
