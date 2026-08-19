@@ -107,6 +107,16 @@ cost(m) = (m - 1) * rife_p95_ms
 
 验收：切换预设不中断播放，字幕边缘不参与增强，CPU 不发生视频重编码。
 
+### P2-A：策略解耦
+
+- `tauri-plugin-ani-player/src/enhancement.rs` 提供独立策略接口和注册表，播放主流程只消费 shader 列表。
+- 当前策略包括兼容 `legacy`、Anime4K Ultra、FSRCNNX 和 ArtCNN；默认仍为 `legacy`。
+- 通过 `ANI_MPV_ENHANCEMENT_STRATEGY` 显式选择外部策略；资源缺失自动回退 `legacy`，并写入初始化日志。
+- 外部 shader 只从应用资源目录或 `ANI_ANIME4K_SHADER_DIR` 读取，不运行时联网下载。
+- 本阶段仅限 Windows、macOS、Linux；Android 可用 shader/模型作为后续独立适配项，不接入当前移动 libVLC 流程。
+
+验收：新增策略不修改播放命令契约；策略切换只影响 shader 列表和诊断 pipeline，字幕/OSD 合成顺序不变。
+
 ### P3：实时降级
 
 - 轮询 mpv 丢帧计数并使用累积阈值，过滤单次抖动。
@@ -162,6 +172,7 @@ cost(m) = (m - 1) * rife_p95_ms
 ### 当前未完成项
 
 - 本地 libmpv 的模型超分/插帧渲染链；当前模型仅用于远程 HLS。
+- FSRCNNX、ArtCNN 已固定来源并纳入三桌面平台安装包；Anime4K Ultra 当前仅支持可选资源探测，未内置时自动回退 `legacy`。
 - Windows/Linux Release Runner 的真实 RIFE、Real-ESRGAN Vulkan 构建、握手、warmup 和帧耗时证据；macOS 已完成 sidecar 级别验证，但尚未完成 30 分钟播放矩阵。
 - 解码、模型 rawvideo 编码的独立 P95，显示刷新率/终端 FPS 上限探测，以及按分辨率和 GPU 缓存的容量基线；当前远程门禁使用 80% 利用率和 5 ms 固定余量保守覆盖未拆分成本。
 - RIFE 任意 timestep 协议、场景切换检测和 3x 质量矩阵；完成前实时 AI 硬上限保持 2x，4x 及以上只评估离线转码。
@@ -176,6 +187,7 @@ cost(m) = (m - 1) * rife_p95_ms
 | 阶段 | 代码状态 | 发布验收状态 |
 | --- | --- | --- |
 | 首版 P0-P3 | 已完成：libmpv 单内核、跨厂商硬解配置、Anime4K、字幕后合成和掉帧降级 | 各平台真机需持续回归 |
+| 首版 P2-A | 已完成：增强策略注册表、legacy 兼容迁移、FSRCNNX/ArtCNN 资源打包、显式策略选择和资源缺失回退 | Anime4K Ultra 尚未内置；三桌面平台真机矩阵待采集 |
 | 首版 P4 | 已完成发布资源门禁和实机矩阵声明 | Windows/AMD/NVIDIA/Intel、macOS、Linux 实机结果待采集 |
 | 终版 F1 | 已完成能力、诊断、按源帧率/滚动 P95/显存/输出上限计算的 2x 容量门禁、权重/可执行文件摘要校验和安全降级契约 | 真实 GPU 显存值仍使用配置预算；解码/编码 P95 和真机数据待采集 |
 | 终版 F2 | 已完成 RIFE 与 Real-ESRGAN 端口、长驻 sidecar、内存帧协议、2x 固定尺寸回退、双倍帧率时间轴保护和运行时 P95 降级；固定提交和子模块校验已接入 | macOS 两个模型的低分辨率 warmup 已通过；真实分辨率完整链路尚未达到发布验收，本地播放器模型链、HDR 原生输出待完成 |

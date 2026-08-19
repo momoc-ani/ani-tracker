@@ -1,0 +1,22 @@
+{
+  "repository": "https://github.com/nihui/rife-ncnn-vulkan.git",
+  "commit": "a7532fc3f9f8f008cd6eecd6f2ffe2a9698e0cf7",
+  "submodules": {
+    "ncnn": "b4ba207c18d3103d6df890c0e3a97b469b196b26",
+    "libwebp": "5abb55823bb6196a918dd87202b2f32bbaff4c18",
+    "glslang": "86ff4bca1ddc7e2262f119c16e7228d0efb67610"
+  },
+  "modelId": "rife-v4.6",
+  "backend": "ncnn-vulkan",
+  "target": "portable-model-weights",
+  "modelFiles": [
+    {
+      "name": "flownet.bin",
+      "sha256": "f334ed2260149ce0188a6dcf049844e8b0cdd912e01cbcfb63553157d2508958"
+    },
+    {
+      "name": "flownet.param",
+      "sha256": "724569596bcd1e7b9fa50455c604777ebed99746d2ef40aa86e31b5725f1053c"
+    }
+  ]
+}

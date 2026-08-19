@@ -1,0 +1,24 @@
+{
+  "schemaVersion": 1,
+  "model": {
+    "modelId": "rife-v4.6",
+    "backend": "ncnn-vulkan",
+    "operation": "interpolate",
+    "outputScale": 1,
+    "directory": "models/rife-v4.6",
+    "inputWidth": 320,
+    "inputHeight": 180,
+    "requiredVramBytes": 1073741824,
+    "estimatedFrameTimeMs": 16
+  },
+  "files": [
+    {
+      "path": "flownet.bin",
+      "sha256": "f334ed2260149ce0188a6dcf049844e8b0cdd912e01cbcfb63553157d2508958"
+    },
+    {
+      "path": "flownet.param",
+      "sha256": "724569596bcd1e7b9fa50455c604777ebed99746d2ef40aa86e31b5725f1053c"
+    }
+  ]
+}

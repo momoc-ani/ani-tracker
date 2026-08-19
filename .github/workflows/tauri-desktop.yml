@@ -185,6 +185,7 @@ jobs:
       - name: Check TypeScript contracts, Renderer and desktop runtime scripts
         run: |
           pnpm run typecheck
+          pnpm run verify:pc-enhancement-resources
           pnpm run test:desktop-gates
           pnpm run test:player-matrix
 

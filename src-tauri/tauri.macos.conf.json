@@ -14,6 +14,7 @@
       "../out/realesrgan-model-sidecar/": "realesrgan-model-sidecar/",
       "../out/qbittorrent/": "qbittorrent/",
       "../out/torrent-core/": "torrent-core/",
+      "../resources/models/": "models/",
       "../resources/licenses/mpv/": "licenses/mpv/",
       "../resources/shaders/anime4k/": "shaders/anime4k/"
     }

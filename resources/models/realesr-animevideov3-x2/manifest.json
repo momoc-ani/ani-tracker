@@ -1,0 +1,24 @@
+{
+  "schemaVersion": 1,
+  "model": {
+    "modelId": "realesr-animevideov3-x2",
+    "backend": "ncnn-vulkan",
+    "operation": "enhance",
+    "outputScale": 2,
+    "directory": "models/realesr-animevideov3-x2",
+    "inputWidth": 320,
+    "inputHeight": 180,
+    "requiredVramBytes": 1610612736,
+    "estimatedFrameTimeMs": 33
+  },
+  "files": [
+    {
+      "path": "realesr-animevideov3-x2.bin",
+      "sha256": "548a36f9c3f4ab8da56cd3b13badf23968bee207b396dad14d04b830e5f2ab2d"
+    },
+    {
+      "path": "realesr-animevideov3-x2.param",
+      "sha256": "b88ff4f00ebf019a7fdac17fdd45a7fd3665d37509efc5baf2e4da2e24420a04"
+    }
+  ]
+}

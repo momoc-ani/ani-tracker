@@ -14,6 +14,7 @@
       "../out/realesrgan-model-sidecar/win32-x64/": "realesrgan-model-sidecar/win32-x64/",
       "../out/qbittorrent/win32-x64/": "qbittorrent/win32-x64/",
       "../out/torrent-core/win32-x64/": "torrent-core/win32-x64/",
+      "../resources/models/": "models/",
       "../resources/licenses/mpv/": "licenses/mpv/",
       "../resources/shaders/anime4k/": "shaders/anime4k/"
     }

@@ -16,6 +16,7 @@ use async_trait::async_trait;
 use libloading::Library;
 
 use crate::desktop::{DesktopVideoTarget, DesktopWindowController};
+use crate::enhancement::EnhancementRegistry;
 
 #[cfg(target_os = "macos")]
 #[path = "macos_render.rs"]
@@ -219,7 +220,7 @@ struct MpvRuntime {
     target: DesktopVideoTarget,
     controller: Arc<dyn DesktopWindowController>,
     capabilities: PlayerCapabilities,
-    shaders: ShaderResources,
+    enhancements: EnhancementRegistry,
     state: Mutex<MpvRuntimeState>,
     #[cfg(target_os = "macos")]
     macos_renderer: Mutex<Option<macos_render::MacMpvRenderer>>,
@@ -281,20 +282,21 @@ impl MpvRuntime {
                 ));
             }
         };
-        let shaders = ShaderResources::resolve(shader_roots);
+        let strategy = std::env::var("ANI_MPV_ENHANCEMENT_STRATEGY").ok();
+        let enhancements = EnhancementRegistry::resolve(shader_roots, strategy.as_deref());
         log::info!(
-            "Tauri 桌面 libmpv 初始化完成 client_api={}.{} shaders={}",
+            "Tauri 桌面 libmpv 初始化完成 client_api={}.{} enhancements={}",
             major,
             version & 0xffff,
-            shaders.describe()
+            enhancements.describe()
         );
         Ok(Self {
             api,
             handle: handle as usize,
             target,
             controller,
-            capabilities: mpv_capabilities(shaders.available()),
-            shaders,
+            capabilities: mpv_capabilities(enhancements.available()),
+            enhancements,
             state: Mutex::new(MpvRuntimeState {
                 active_session_id: None,
                 active_source: None,
@@ -448,7 +450,7 @@ impl MpvRuntime {
                     snapshot.video_enhancement_degraded = false;
                     snapshot.enhancement_diagnostics.degradation_reason = None;
                     snapshot.enhancement_diagnostics.pipeline =
-                        enhancement_pipeline(&self.capabilities, *video_enhancement);
+                        self.enhancement_pipeline(*video_enhancement);
                 }
                 log::info!(
                     "Tauri 桌面 libmpv 画质增强已更新 preset={:?} session_id={}",
@@ -539,10 +541,13 @@ impl MpvRuntime {
             session_id,
             source,
             self.capabilities.clone(),
-            state.sequence,
-            state.subtitle_scale,
-            state.enhancement,
-            state.frame_interpolation,
+            SnapshotInit {
+                sequence: state.sequence,
+                subtitle_scale: state.subtitle_scale,
+                video_enhancement: state.enhancement,
+                frame_interpolation: state.frame_interpolation,
+                pipeline: self.enhancement_pipeline(state.enhancement),
+            },
         ));
         log::info!("Tauri 桌面 libmpv 已加载媒体 session_id={session_id}");
         Ok(())
@@ -593,7 +598,7 @@ impl MpvRuntime {
         enhancement: PlayerVideoEnhancement,
     ) -> Result<(), PlayerTransportError> {
         self.command(&["change-list", "glsl-shaders", "clr", ""])?;
-        for shader in self.shaders.for_preset(enhancement)? {
+        for shader in self.enhancements.shaders_for(enhancement)? {
             self.command(&[
                 "change-list",
                 "glsl-shaders",
@@ -602,6 +607,15 @@ impl MpvRuntime {
             ])?;
         }
         Ok(())
+    }
+
+    /// 返回当前策略与平台渲染器组合后的诊断名称。
+    fn enhancement_pipeline(&self, enhancement: PlayerVideoEnhancement) -> String {
+        enhancement_pipeline(
+            &self.capabilities,
+            enhancement,
+            self.enhancements.pipeline_name(),
+        )
     }
 
     /// 使用 libmpv 的显示刷新率重采样平滑播放，不冒充模型运动补帧。
@@ -954,7 +968,7 @@ impl MpvRuntime {
         state.drop_score = 0;
         snapshot.video_enhancement = next;
         snapshot.video_enhancement_degraded = true;
-        snapshot.enhancement_diagnostics.pipeline = enhancement_pipeline(&self.capabilities, next);
+        snapshot.enhancement_diagnostics.pipeline = self.enhancement_pipeline(next);
         snapshot.enhancement_diagnostics.degradation_reason = Some("持续掉帧".to_owned());
         Ok(())
     }
@@ -1238,64 +1252,6 @@ impl PlayerTransport for MpvPlayerTransport {
     }
 }
 
-#[derive(Default)]
-struct ShaderResources {
-    clamp: Option<PathBuf>,
-    upscale: Option<PathBuf>,
-}
-
-impl ShaderResources {
-    fn resolve(roots: &[PathBuf]) -> Self {
-        Self {
-            clamp: find_resource(roots, "Anime4K_Clamp_Highlights.glsl"),
-            upscale: find_resource(roots, "Anime4K_Upscale_Original_x2.glsl"),
-        }
-    }
-
-    fn available(&self) -> bool {
-        self.upscale.is_some()
-    }
-
-    fn describe(&self) -> String {
-        format!(
-            "clamp={} upscale={}",
-            self.clamp
-                .as_deref()
-                .map_or("missing".to_owned(), |path| path.display().to_string()),
-            self.upscale
-                .as_deref()
-                .map_or("missing".to_owned(), |path| path.display().to_string())
-        )
-    }
-
-    fn for_preset(
-        &self,
-        preset: PlayerVideoEnhancement,
-    ) -> Result<Vec<&Path>, PlayerTransportError> {
-        if preset == PlayerVideoEnhancement::Off {
-            return Ok(Vec::new());
-        }
-        let upscale = self.upscale.as_deref().ok_or_else(|| {
-            PlayerTransportError::Unavailable("Anime4K shader 资源缺失".to_owned())
-        })?;
-        let mut shaders = Vec::new();
-        shaders.push(upscale);
-        if preset == PlayerVideoEnhancement::Clear {
-            if let Some(clamp) = self.clamp.as_deref() {
-                shaders.push(clamp);
-            }
-        }
-        Ok(shaders)
-    }
-}
-
-fn find_resource(roots: &[PathBuf], name: &str) -> Option<PathBuf> {
-    roots
-        .iter()
-        .map(|root| root.join(name))
-        .find(|path| path.is_file())
-}
-
 fn resolve_mpv_library(roots: &[PathBuf]) -> Result<PathBuf, PlayerTransportError> {
     for root in roots {
         for library in mpv_library_candidates(root) {
@@ -1547,19 +1503,23 @@ fn unavailable_mpv_capabilities(reason: Option<&str>) -> PlayerCapabilities {
     }
 }
 
-fn initial_snapshot(
-    session_id: &str,
-    source: PlayerMediaSource,
-    capabilities: PlayerCapabilities,
+struct SnapshotInit {
     sequence: u64,
     subtitle_scale: u16,
     video_enhancement: PlayerVideoEnhancement,
     frame_interpolation: PlayerFrameInterpolation,
+    pipeline: String,
+}
+
+fn initial_snapshot(
+    session_id: &str,
+    source: PlayerMediaSource,
+    capabilities: PlayerCapabilities,
+    init: SnapshotInit,
 ) -> PlayerSnapshot {
-    let pipeline = enhancement_pipeline(&capabilities, video_enhancement);
     PlayerSnapshot {
         session_id: session_id.to_owned(),
-        sequence,
+        sequence: init.sequence,
         backend: PlayerBackend::Mpv,
         platform: PlayerHostPlatform::TauriDesktop,
         status: PlayerStatus::Loading,
@@ -1577,13 +1537,13 @@ fn initial_snapshot(
         playback_rate: 1.0,
         audio_tracks: Vec::new(),
         subtitle_tracks: Vec::new(),
-        subtitle_scale,
-        video_enhancement,
+        subtitle_scale: init.subtitle_scale,
+        video_enhancement: init.video_enhancement,
         video_enhancement_degraded: false,
-        frame_interpolation,
+        frame_interpolation: init.frame_interpolation,
         hdr: ani_contracts::PlayerHdrMode::Off,
         enhancement_diagnostics: ani_contracts::PlayerEnhancementDiagnostics {
-            pipeline,
+            pipeline: init.pipeline,
             renderer: Some(platform_renderer_name().to_owned()),
             decoder: Some(platform_decoder_name().to_owned()),
             dropped_frames: 0,
@@ -1600,9 +1560,10 @@ fn initial_snapshot(
 fn enhancement_pipeline(
     capabilities: &PlayerCapabilities,
     enhancement: PlayerVideoEnhancement,
+    strategy_name: &str,
 ) -> String {
     if capabilities.supports_video_enhancement && enhancement != PlayerVideoEnhancement::Off {
-        format!("{}-anime4k", platform_renderer_pipeline())
+        format!("{}-{strategy_name}", platform_renderer_pipeline())
     } else {
         platform_renderer_pipeline().to_owned()
     }
@@ -1690,18 +1651,18 @@ mod tests {
     #[test]
     fn resolves_bundled_anime4k_presets() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../resources/shaders/anime4k");
-        let resources = ShaderResources::resolve(&[root]);
+        let resources = EnhancementRegistry::resolve(&[root], None);
         assert!(resources.available());
         assert_eq!(
             resources
-                .for_preset(PlayerVideoEnhancement::Balanced)
+                .shaders_for(PlayerVideoEnhancement::Balanced)
                 .expect("balanced preset")
                 .len(),
             1
         );
         assert_eq!(
             resources
-                .for_preset(PlayerVideoEnhancement::Clear)
+                .shaders_for(PlayerVideoEnhancement::Clear)
                 .expect("clear preset")
                 .len(),
             2

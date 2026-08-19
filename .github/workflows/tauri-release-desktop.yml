@@ -250,6 +250,9 @@ jobs:
           pnpm run verify:realesrgan-sidecar -- \
             --platform "${{ matrix.platform }}" --arch "${{ matrix.arch }}"
 
+      - name: Verify bundled PC enhancement resources
+        run: pnpm run verify:pc-enhancement-resources
+
       - name: Import Windows signing certificate
         if: matrix.platform == 'win32' && env.WINDOWS_CERTIFICATE_BASE64 != ''
         id: windows-signing
