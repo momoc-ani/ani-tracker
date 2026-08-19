@@ -139,6 +139,7 @@ export function SettingsPage() {
   const [schedulerStatus, setSchedulerStatus] = useState<AutomationSchedulerStatus | null>(null);
   const [qbManagedStatus, setQbManagedStatus] = useState<QbittorrentManagedStatus | null>(null);
   const [qbManagedAction, setQbManagedAction] = useState<"idle" | "starting" | "stopping" | "restarting">("idle");
+  const [qbConnectionState, setQbConnectionState] = useState<"idle" | "testing" | "online" | "offline">("idle");
   const [embeddedStatus, setEmbeddedStatus] = useState<EmbeddedTorrentCoreStatus | null>(null);
   const [embeddedAction, setEmbeddedAction] = useState<"idle" | "starting" | "stopping" | "restarting">("idle");
   const [embeddedError, setEmbeddedError] = useState<string | null>(null);
@@ -356,6 +357,26 @@ export function SettingsPage() {
       toast.error(`${projectName} 地址打开失败`);
     }
   }
+
+  useEffect(() => {
+    const currentTorrentEngineMode = !hostExternalQbittorrent || draft?.download.defaultTorrentEngine === "embedded"
+      ? "embedded"
+      : hostManagedQbittorrent && draft?.download.qbittorrent.managed.enabled
+        ? "managed"
+        : "external";
+    if (!settingsReady || currentTorrentEngineMode === "embedded") {
+      setQbConnectionState("idle");
+      return;
+    }
+    void refreshQbittorrentConnection();
+  }, [
+    draft?.download.defaultTorrentEngine,
+    draft?.download.qbittorrent.baseUrl,
+    draft?.download.qbittorrent.managed.enabled,
+    hostExternalQbittorrent,
+    hostManagedQbittorrent,
+    settingsReady
+  ]);
 
   if (loading) {
     return (
@@ -627,18 +648,58 @@ export function SettingsPage() {
     }
 
     setQbTest({ state: "testing", message: "正在测试 qBittorrent 连接..." });
+    setQbConnectionState("testing");
     try {
       await persistDraftSettings(draft);
       const result = await appApi.testQbittorrent();
+      const connectionState = result.ok ? "online" : "offline";
+      setQbConnectionState(connectionState);
       setQbTest({
         state: result.ok ? "success" : "error",
         message: result.ok ? `${result.message}，当前任务 ${result.taskCount ?? 0} 个` : result.message
       });
+      console.info("[settings] qBittorrent WebUI 连接检测完成", {
+        ok: result.ok,
+        taskCount: result.taskCount
+      });
       await refreshQbittorrentManagedStatus();
     } catch (error) {
+      setQbConnectionState("offline");
       setQbTest({
         state: "error",
         message: error instanceof Error ? error.message : "qBittorrent 连接测试失败"
+      });
+    }
+  }
+
+  /** 在设置页打开时探测当前 qBittorrent WebUI，避免只依赖托管进程句柄。 */
+  async function refreshQbittorrentConnection(): Promise<void> {
+    const currentTorrentEngineMode = !hostExternalQbittorrent || draft?.download.defaultTorrentEngine === "embedded"
+      ? "embedded"
+      : hostManagedQbittorrent && draft?.download.qbittorrent.managed.enabled
+        ? "managed"
+        : "external";
+    if (!draft || currentTorrentEngineMode === "embedded") {
+      setQbConnectionState("idle");
+      return;
+    }
+    setQbConnectionState("testing");
+    try {
+      const result = await appApi.testQbittorrent();
+      setQbConnectionState(result.ok ? "online" : "offline");
+      setQbTest({
+        state: result.ok ? "success" : "error",
+        message: result.ok ? `${result.message}，当前任务 ${result.taskCount ?? 0} 个` : result.message
+      });
+      console.info("[settings] qBittorrent WebUI 初始状态已刷新", {
+        ok: result.ok,
+        taskCount: result.taskCount
+      });
+    } catch (error) {
+      setQbConnectionState("offline");
+      setQbTest({
+        state: "error",
+        message: error instanceof Error ? error.message : "qBittorrent 连接检测失败"
       });
     }
   }
@@ -653,6 +714,7 @@ export function SettingsPage() {
       await persistDraftSettings(draft);
       const status = await appApi.startQbittorrentManaged();
       setQbManagedStatus(status);
+      setQbConnectionState(status.lastError ? "offline" : "online");
       setQbTest({
         state: status.lastError ? "error" : "success",
         message: status.lastError ?? "托管 qBittorrent 已启动"
@@ -672,6 +734,7 @@ export function SettingsPage() {
     try {
       const status = await appApi.stopQbittorrentManaged();
       setQbManagedStatus(status);
+      setQbConnectionState("offline");
       setQbTest({ state: "idle", message: "托管 qBittorrent 已停止" });
     } catch (error) {
       setQbTest({
@@ -697,6 +760,7 @@ export function SettingsPage() {
       }
       const status = await appApi.startQbittorrentManaged();
       setQbManagedStatus(status);
+      setQbConnectionState(status.lastError ? "offline" : "online");
       setQbTest({
         state: status.lastError ? "error" : "success",
         message: status.lastError ?? "内置 qBittorrent-nox 已重启"
@@ -1864,8 +1928,14 @@ export function SettingsPage() {
         {torrentEngineMode === "managed" && (
           <CardFooter className="flex-col justify-between gap-3 border-t bg-muted/30 pt-4 sm:flex-row sm:pt-5">
             <div className="flex min-w-0 flex-wrap items-center gap-x-4 gap-y-2 text-xs text-muted-foreground">
-              <Badge tone={qbManagedStatus?.running ? "green" : "neutral"}>
-                {qbManagedStatus?.running ? "运行中" : "未运行"}
+              <Badge tone={qbManagedStatus?.running || qbConnectionState === "online" ? "green" : "neutral"}>
+                {qbManagedStatus?.running
+                  ? "应用进程运行中"
+                  : qbConnectionState === "online"
+                    ? "WebUI 已连接"
+                    : qbConnectionState === "testing"
+                      ? "检测中"
+                      : "未运行"}
               </Badge>
               <span>PID: {qbManagedStatus?.pid ?? "--"}</span>
               <span>架构: {qbManagedStatus?.arch ?? "--"}</span>

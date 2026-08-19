@@ -1138,6 +1138,9 @@ fn apply_macos_fullscreen_window_mode<R: Runtime>(
 
     if !fullscreen {
         apply_macos_fullscreen_presentation(false, restore_presentation_options)?;
+    } else {
+        // 先切换系统栏展示策略，再调整窗口边界，复用 tao 简单全屏的 AppKit 顺序。
+        apply_macos_fullscreen_presentation(true, restore_presentation_options)?;
     }
 
     // SAFETY: 两个指针由仍存活的 Tauri Window 持有，且调用发生在 AppKit 主线程。
@@ -1162,12 +1165,13 @@ fn apply_macos_fullscreen_window_mode<R: Runtime>(
                 )?
             }
         };
-        if fullscreen {
-            apply_macos_fullscreen_presentation(true, restore_presentation_options)?;
-        }
         let target_rect = target.into_ns_rect();
         NSWindow::setFrame_display_animate(video_window, target_rect, true, false);
         NSWindow::setFrame_display_animate(controls_window, target_rect, true, false);
+        // 窗口边界完成后再次应用系统展示状态，避免 AppKit resize 事务覆盖隐藏设置。
+        if fullscreen {
+            apply_macos_fullscreen_presentation(true, restore_presentation_options)?;
+        }
         Ok(target)
     }
 }
@@ -1184,8 +1188,7 @@ fn resolve_macos_presentation_options(
             *restore_options = Some(current);
         }
         return Some(
-            NSApplicationPresentationOptions::FullScreen
-                | NSApplicationPresentationOptions::HideDock
+            NSApplicationPresentationOptions::HideDock
                 | NSApplicationPresentationOptions::HideMenuBar,
         );
     }
@@ -1201,6 +1204,10 @@ fn apply_macos_fullscreen_presentation(
     let main_thread = MainThreadMarker::new()
         .ok_or_else(|| "macOS 系统界面切换未在 AppKit 主线程执行".to_owned())?;
     let application = NSApp(main_thread);
+    if fullscreen {
+        // 无边框播放器不是系统原生全屏窗口，先激活应用才能让展示选项作用于当前桌面。
+        application.activate();
+    }
     let current = application.presentationOptions();
     let target = {
         let mut restore_options = restore_options
@@ -1210,6 +1217,12 @@ fn apply_macos_fullscreen_presentation(
     };
     if let Some(target) = target {
         application.setPresentationOptions(target);
+        log::debug!(
+            "macOS 播放器系统展示状态已更新 fullscreen={} target={:?} actual={:?}",
+            fullscreen,
+            target,
+            application.currentSystemPresentationOptions()
+        );
     }
     Ok(())
 }
@@ -1978,13 +1991,12 @@ mod tests {
         assert_eq!(restore_frame, None);
     }
 
-    /// macOS 播放器全屏需隐藏系统栏，并在重复进入和退出后恢复原展示选项。
+    /// macOS 播放器简单全屏需完全隐藏系统栏，并在重复进入和退出后恢复原展示选项。
     #[cfg(target_os = "macos")]
     #[test]
     fn preserves_macos_presentation_options_across_fullscreen() {
         let original = NSApplicationPresentationOptions::DisableMenuBarTransparency;
-        let fullscreen = NSApplicationPresentationOptions::FullScreen
-            | NSApplicationPresentationOptions::HideDock
+        let fullscreen = NSApplicationPresentationOptions::HideDock
             | NSApplicationPresentationOptions::HideMenuBar;
         let mut restore_options = None;
 
