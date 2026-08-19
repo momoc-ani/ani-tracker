@@ -472,9 +472,11 @@ impl RemoteRpcHandler for TauriRemoteRpcHandler {
             }
             "searchAnimeCatalog" => {
                 let keyword = string_arg(&args, 0)?;
+                let include_online = args.get(1).and_then(Value::as_bool);
                 command_value(
                     crate::commands::data::search_anime_catalog(
                         keyword,
+                        include_online,
                         self.app.state(),
                         self.app.state(),
                     )

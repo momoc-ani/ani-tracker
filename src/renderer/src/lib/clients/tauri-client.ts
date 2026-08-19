@@ -449,9 +449,9 @@ class TauriClientCore implements AppClient {
     });
   }
 
-  /** 按标题、原名和别名搜索本地番剧目录。 */
-  async searchAnimeCatalog(keyword: string): Promise<AnimeDiscoverySearchResult> {
-    return invoke<AnimeDiscoverySearchResult>("search_anime_catalog", { keyword }).catch((error) => {
+  /** 按标题、原名和别名搜索本地目录，并按需请求在线来源。 */
+  async searchAnimeCatalog(keyword: string, includeOnline = true): Promise<AnimeDiscoverySearchResult> {
+    return invoke<AnimeDiscoverySearchResult>("search_anime_catalog", { keyword, includeOnline }).catch((error) => {
       throw normalizeTauriError("search_anime_catalog", error);
     });
   }

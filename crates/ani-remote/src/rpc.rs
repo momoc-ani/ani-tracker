@@ -284,14 +284,23 @@ fn validate_args(method: &str, args: Vec<Value>) -> Result<Vec<Value>, RemoteRpc
             Ok(args)
         }
         "searchAnimeCatalog" => {
-            let args = require_count(args, 1)?;
+            if !(1..=2).contains(&args.len()) {
+                return Err(invalid_args("新番搜索参数数量无效"));
+            }
             let keyword = args[0]
                 .as_str()
                 .map(str::trim)
                 .filter(|value| !value.is_empty() && value.chars().count() <= 120)
                 .filter(|value| !value.chars().any(char::is_control))
                 .ok_or_else(|| invalid_args("搜索关键词长度必须为 1-120 个字符"))?;
-            Ok(vec![Value::String(keyword.to_owned())])
+            if args.len() == 2 && !args[1].is_null() && !args[1].is_boolean() {
+                return Err(invalid_args("在线搜索开关必须是布尔值"));
+            }
+            let mut normalized = vec![Value::String(keyword.to_owned())];
+            if let Some(include_online) = args.get(1) {
+                normalized.push(include_online.clone());
+            }
+            Ok(normalized)
         }
         "browseBangumiAnime" => validate_domain_object::<ani_domain::BangumiBrowseQuery>(
             args,
@@ -1516,6 +1525,30 @@ mod tests {
             )
             .await
             .expect_err("unknown argument");
+        assert_eq!(invalid.code, "INVALID_ARGUMENTS");
+    }
+
+    /// 验证新番搜索的在线来源开关可选且仅接受布尔值。
+    #[tokio::test]
+    async fn accepts_remote_catalog_search_online_flag() {
+        let service = RemoteRpcService::new(std::sync::Arc::new(EchoHandler));
+        let local_only = service
+            .dispatch(
+                json!({ "method": "searchAnimeCatalog", "args": ["测试番", false] }),
+                &["catalog.read".to_owned()],
+            )
+            .await
+            .expect("local-only catalog search");
+        assert_eq!(local_only["args"][0], "测试番");
+        assert_eq!(local_only["args"][1], false);
+
+        let invalid = service
+            .dispatch(
+                json!({ "method": "searchAnimeCatalog", "args": ["测试番", "false"] }),
+                &["catalog.read".to_owned()],
+            )
+            .await
+            .expect_err("non-boolean online search flag must fail");
         assert_eq!(invalid.code, "INVALID_ARGUMENTS");
     }
 
