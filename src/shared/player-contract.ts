@@ -130,7 +130,7 @@ export interface PlayerSubtitleSource {
   id: string;
   label: string;
   language?: string;
-  type: "ass" | "vtt";
+  type: "ass" | "vtt" | "pgs";
   uri: string;
   default: boolean;
 }

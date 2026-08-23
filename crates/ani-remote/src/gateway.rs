@@ -779,11 +779,11 @@ async fn stream_media(
         .await
         .map_err(|_| GatewayHttpError::new(404, "MEDIA_ASSET_NOT_FOUND", "媒体资源不存在"))?;
     let requested_range = headers.get(RANGE).and_then(|value| value.to_str().ok());
-    let range = asset
-        .direct
+    let supports_range = asset.direct || asset.range_supported;
+    let range = supports_range
         .then(|| parse_byte_range(requested_range, metadata.len()))
         .flatten();
-    if asset.direct && requested_range.is_some() && range.is_none() {
+    if supports_range && requested_range.is_some() && range.is_none() {
         log::warn!(
             "Rust 远程媒体 Range 无效 method={} file_name={} requested_range={} total={}",
             method,
@@ -827,7 +827,7 @@ async fn stream_media(
         )
     });
     let mut extra_headers = vec![(CACHE_CONTROL, "no-store")];
-    if asset.direct {
+    if supports_range {
         extra_headers.push((ACCEPT_RANGES, "bytes"));
     }
     if let Some(content_disposition) = content_disposition.as_deref() {
@@ -1056,8 +1056,8 @@ fn add_inline_script_nonce(html: &str, script_nonce: &str) -> String {
 /// 创建远程 PWA CSP，只放行当前入口响应的内联初始化脚本。
 fn create_renderer_content_security_policy(script_nonce: Option<&str>) -> String {
     let script_source = script_nonce.map_or_else(
-        || "script-src 'self'".to_owned(),
-        |nonce| format!("script-src 'self' 'nonce-{nonce}'"),
+        || "script-src 'self' 'wasm-unsafe-eval'".to_owned(),
+        |nonce| format!("script-src 'self' 'wasm-unsafe-eval' 'nonce-{nonce}'"),
     );
     format!(
         "default-src 'self'; {script_source}; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; connect-src 'self'; media-src 'self' blob:; worker-src 'self' blob:; object-src 'none'; base-uri 'self'; frame-ancestors 'none'"
@@ -1231,6 +1231,7 @@ fn is_subtitle_name(value: &str) -> bool {
             value
                 .strip_suffix(".ass")
                 .or_else(|| value.strip_suffix(".vtt"))
+                .or_else(|| value.strip_suffix(".sup"))
         })
         .is_some_and(|value| value.len() == 3 && value.bytes().all(|byte| byte.is_ascii_digit()))
 }
@@ -1471,6 +1472,10 @@ mod tests {
             "/api/media/sessions/{session}/hls/segment-000001.ts"
         ))
         .is_some());
+        assert!(parse_browser_media_route(&format!(
+            "/api/media/sessions/{session}/subtitles/subtitle-001.sup"
+        ))
+        .is_some());
         assert!(
             parse_browser_media_route(&format!("/api/media/sessions/{session}/../../secret"))
                 .is_none()
@@ -1478,6 +1483,10 @@ mod tests {
         let token = "b".repeat(43);
         assert!(parse_external_media_route(&format!(
             "/api/media/external/{token}/sessions/{session}/file"
+        ))
+        .is_some());
+        assert!(parse_external_media_route(&format!(
+            "/api/media/external/{token}/sessions/{session}/subtitles/subtitle-001.sup"
         ))
         .is_some());
         let named = parse_external_media_route(&format!(
@@ -1691,6 +1700,7 @@ mod tests {
             .expect("inline script nonce");
         assert!(renderer_html.contains("<base href=\"/\" />"));
         assert!(renderer_html.contains("<title>Ani</title>"));
+        assert!(content_security_policy.contains("script-src 'self' 'wasm-unsafe-eval'"));
         assert!(content_security_policy.contains(&format!("'nonce-{script_nonce}'")));
         assert!(!content_security_policy.contains("script-src 'self' 'unsafe-inline'"));
 

@@ -131,6 +131,7 @@ pub struct RemoteMediaAsset {
     pub file_path: PathBuf,
     pub content_type: String,
     pub direct: bool,
+    pub range_supported: bool,
     pub file_name: Option<String>,
 }
 
@@ -181,7 +182,20 @@ enum RequestedSubtitleMode {
 
 struct PreparedSubtitle {
     public: RemotePlaybackSubtitle,
+    asset_name: String,
+    asset: PreparedSubtitleAsset,
+}
+
+enum PreparedSubtitleAsset {
+    Ready(PathBuf),
+    LazyPgs(PgsSubtitleAsset),
+}
+
+#[derive(Clone)]
+struct PgsSubtitleAsset {
+    stream_index: i64,
     output_path: PathBuf,
+    stream_start_position_seconds: f64,
 }
 
 struct SessionRecord {
@@ -192,6 +206,8 @@ struct SessionRecord {
     source_path: PathBuf,
     content_type: String,
     temporary_directory: PathBuf,
+    pgs_subtitles: HashMap<String, PgsSubtitleAsset>,
+    pgs_materialization: Mutex<()>,
     process: Mutex<Option<MediaProcess>>,
     last_accessed_at_millis: Mutex<i64>,
 }
@@ -433,9 +449,6 @@ impl RemoteMediaSessionService {
                 "烧录字幕必须指定字幕轨道",
             ));
         }
-        if subtitle_mode == RequestedSubtitleMode::Burned {
-            self.ensure_subtitle_burn_supported().await?;
-        }
         self.cleanup_expired().await;
         let task = self
             .repository
@@ -503,9 +516,19 @@ impl RemoteMediaSessionService {
             match prepared_subtitles
                 .iter()
                 .find(|subtitle| Some(subtitle.public.id.as_str()) == subtitle_id)
-                .map(|subtitle| subtitle.output_path.clone())
-            {
-                Some(output_path) => Some(output_path),
+                .map(|subtitle| match &subtitle.asset {
+                    PreparedSubtitleAsset::Ready(path) => Some(path.clone()),
+                    PreparedSubtitleAsset::LazyPgs(_) => None,
+                }) {
+                Some(Some(burn_subtitle)) => Some(burn_subtitle),
+                Some(None) => {
+                    let _ = tokio::fs::remove_dir_all(&temporary_directory).await;
+                    return Err(RemoteMediaError::new(
+                        409,
+                        "MEDIA_SUBTITLE_UNAVAILABLE",
+                        "PGS 字幕暂不支持外部播放器烧录，请使用网页直传字幕",
+                    ));
+                }
                 None => {
                     let _ = tokio::fs::remove_dir_all(&temporary_directory).await;
                     return Err(RemoteMediaError::new(
@@ -518,10 +541,19 @@ impl RemoteMediaSessionService {
         } else {
             None
         };
+        if burn_subtitle.is_some() {
+            self.ensure_subtitle_burn_supported().await?;
+        }
+        let mut pgs_subtitles = HashMap::new();
         let subtitles = if subtitle_mode == RequestedSubtitleMode::Soft {
             prepared_subtitles
                 .into_iter()
-                .map(|subtitle| subtitle.public)
+                .map(|subtitle| {
+                    if let PreparedSubtitleAsset::LazyPgs(asset) = subtitle.asset {
+                        pgs_subtitles.insert(subtitle.asset_name, asset);
+                    }
+                    subtitle.public
+                })
                 .collect()
         } else {
             Vec::new()
@@ -604,6 +636,8 @@ impl RemoteMediaSessionService {
             source_path: media.path,
             content_type: media.content_type,
             temporary_directory,
+            pgs_subtitles,
+            pgs_materialization: Mutex::new(()),
             process: Mutex::new(process),
             last_accessed_at_millis: Mutex::new(now.timestamp_millis()),
         });
@@ -752,28 +786,36 @@ impl RemoteMediaSessionService {
         record: &SessionRecord,
         asset_name: &str,
     ) -> Result<RemoteMediaAsset, RemoteMediaError> {
-        let public = record.public.lock().await;
-        if let Some(subtitle) = public
+        let subtitle = record
+            .public
+            .lock()
+            .await
             .subtitles
             .iter()
             .find(|subtitle| subtitle.url.ends_with(&format!("/subtitles/{asset_name}")))
-        {
+            .cloned();
+        if let Some(subtitle) = subtitle {
             if !is_subtitle_asset(asset_name) {
                 return Err(asset_not_found());
+            }
+            if subtitle.subtitle_type == "pgs" {
+                self.materialize_pgs_subtitle(record, asset_name).await?;
             }
             let path = canonical_asset(&record.temporary_directory, asset_name).await?;
             return Ok(RemoteMediaAsset {
                 file_path: path,
-                content_type: if subtitle.subtitle_type == "ass" {
-                    "text/x-ssa; charset=utf-8"
-                } else {
-                    "text/vtt; charset=utf-8"
+                content_type: match subtitle.subtitle_type.as_str() {
+                    "ass" => "text/x-ssa; charset=utf-8",
+                    "vtt" => "text/vtt; charset=utf-8",
+                    _ => "application/octet-stream",
                 }
                 .to_owned(),
                 direct: false,
+                range_supported: subtitle.subtitle_type == "pgs",
                 file_name: None,
             });
         }
+        let public = record.public.lock().await;
         if public.mode == "direct" {
             if asset_name != "file" && asset_name != public.file_name {
                 return Err(asset_not_found());
@@ -782,6 +824,7 @@ impl RemoteMediaSessionService {
                 file_path: record.source_path.clone(),
                 content_type: record.content_type.clone(),
                 direct: true,
+                range_supported: true,
                 file_name: Some(public.file_name.clone()),
             });
         }
@@ -797,8 +840,98 @@ impl RemoteMediaSessionService {
             }
             .to_owned(),
             direct: false,
+            range_supported: false,
             file_name: None,
         })
+    }
+
+    /// 首次请求 PGS 轨道时从原媒体抽取 SUP 文件，并在当前播放会话内复用。
+    async fn materialize_pgs_subtitle(
+        &self,
+        record: &SessionRecord,
+        asset_name: &str,
+    ) -> Result<(), RemoteMediaError> {
+        let asset = record
+            .pgs_subtitles
+            .get(asset_name)
+            .cloned()
+            .ok_or_else(asset_not_found)?;
+        let _guard = record.pgs_materialization.lock().await;
+        if tokio::fs::metadata(&asset.output_path)
+            .await
+            .is_ok_and(|metadata| metadata.len() > 0)
+        {
+            return Ok(());
+        }
+        let partial_path = asset.output_path.with_extension("sup.partial");
+        let _ = tokio::fs::remove_file(&partial_path).await;
+        log::info!(
+            "Rust 远程 PGS 字幕开始抽取 stream_index={} asset={} start_position={:.3}",
+            asset.stream_index,
+            asset_name,
+            asset.stream_start_position_seconds
+        );
+        let mut command = hidden_command(&self.tools.ffmpeg_path);
+        command.args(["-nostdin", "-hide_banner", "-loglevel", "error"]);
+        append_input_seek_args(&mut command, asset.stream_start_position_seconds);
+        command
+            .arg("-i")
+            .arg(&record.source_path)
+            .args([
+                "-map",
+                &format!("0:{}", asset.stream_index),
+                "-c:s",
+                "copy",
+                "-f",
+                "sup",
+                "-y",
+            ])
+            .arg(&partial_path)
+            .kill_on_drop(true);
+        let output = tokio::time::timeout(self.tools.timeout, command.output())
+            .await
+            .map_err(|_| {
+                log::error!(
+                    "Rust 远程 PGS 字幕抽取超时 stream_index={} asset={}",
+                    asset.stream_index,
+                    asset_name
+                );
+                RemoteMediaError::new(503, "MEDIA_SUBTITLE_UNAVAILABLE", "PGS 字幕准备超时")
+            })?
+            .map_err(|error| internal_media_error(error.to_string()))?;
+        let valid = output.status.success()
+            && tokio::fs::metadata(&partial_path)
+                .await
+                .is_ok_and(|metadata| metadata.len() > 0);
+        if !valid {
+            let detail = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+            let _ = tokio::fs::remove_file(&partial_path).await;
+            log::error!(
+                "Rust 远程 PGS 字幕抽取失败 stream_index={} asset={} error={}",
+                asset.stream_index,
+                asset_name,
+                detail
+            );
+            return Err(RemoteMediaError::new(
+                503,
+                "MEDIA_SUBTITLE_UNAVAILABLE",
+                "PGS 字幕准备失败",
+            ));
+        }
+        tokio::fs::rename(&partial_path, &asset.output_path)
+            .await
+            .map_err(|error| internal_media_error(error.to_string()))?;
+        let size = tokio::fs::metadata(&asset.output_path)
+            .await
+            .map(|metadata| metadata.len())
+            .unwrap_or(0);
+        log::info!(
+            "Rust 远程 PGS 字幕抽取完成 stream_index={} asset={} size={}",
+            asset.stream_index,
+            asset_name,
+            size
+        );
+        Ok(())
     }
 
     /// 关闭设备拥有的会话并回收 FFmpeg 与临时资源。
@@ -1054,6 +1187,7 @@ impl RemoteMediaSessionService {
         None
     }
 
+    /// 探测文本与 PGS 轨道；文本字幕立即转换，PGS 保留到首次请求时按需抽取。
     async fn prepare_subtitles(
         &self,
         source_path: &Path,
@@ -1074,8 +1208,30 @@ impl RemoteMediaSessionService {
             .collect::<Vec<_>>();
         let mut subtitles = Vec::new();
         for (order, stream) in supported.into_iter().enumerate() {
-            let asset_name = format!("subtitle-{order:03}.{}", stream.output_type);
+            let asset_name = subtitle_asset_name(order, stream.output_type);
             let output_path = output_directory.join(&asset_name);
+            let language = normalize_language(stream.tags.get("language").map(String::as_str));
+            let title = stream.tags.get("title").map(String::as_str);
+            let public = RemotePlaybackSubtitle {
+                id: format!("subtitle-{}", stream.index),
+                label: subtitle_label(title, language.as_deref(), order),
+                language,
+                subtitle_type: stream.output_type.to_owned(),
+                url: format!("{asset_base}/subtitles/{asset_name}"),
+                default: stream.disposition.default == 1,
+            };
+            if stream.output_type == "pgs" {
+                subtitles.push(PreparedSubtitle {
+                    public,
+                    asset_name,
+                    asset: PreparedSubtitleAsset::LazyPgs(PgsSubtitleAsset {
+                        stream_index: stream.index,
+                        output_path,
+                        stream_start_position_seconds,
+                    }),
+                });
+                continue;
+            }
             let mut command = hidden_command(&self.tools.ffmpeg_path);
             command.args(["-nostdin", "-hide_banner", "-loglevel", "error"]);
             append_input_seek_args(&mut command, stream_start_position_seconds);
@@ -1101,24 +1257,23 @@ impl RemoteMediaSessionService {
                     .await
                     .is_ok_and(|metadata| metadata.len() > 0);
             if valid {
-                let language = normalize_language(stream.tags.get("language").map(String::as_str));
-                let title = stream.tags.get("title").map(String::as_str);
                 subtitles.push(PreparedSubtitle {
-                    public: RemotePlaybackSubtitle {
-                        id: format!("subtitle-{}", stream.index),
-                        label: subtitle_label(title, language.as_deref(), order),
-                        language,
-                        subtitle_type: stream.output_type.to_owned(),
-                        url: format!("{asset_base}/subtitles/{asset_name}"),
-                        default: stream.disposition.default == 1,
-                    },
-                    output_path,
+                    public,
+                    asset_name,
+                    asset: PreparedSubtitleAsset::Ready(output_path),
                 });
+            } else {
+                log::warn!(
+                    "远程文本字幕转换失败 stream_index={} type={}",
+                    stream.index,
+                    stream.output_type
+                );
             }
         }
         subtitles
     }
 
+    /// 使用 FFprobe 返回媒体内全部字幕流及其显示元数据。
     async fn probe_subtitles(&self, source_path: &Path) -> Result<Vec<SubtitleStream>, String> {
         let mut last_error = "没有可用 FFprobe".to_owned();
         for command_path in &self.tools.ffprobe_paths {
@@ -3032,6 +3187,7 @@ struct SupportedSubtitle {
 }
 
 impl SupportedSubtitle {
+    /// 将 FFprobe 字幕流收敛为远程播放器明确支持的文本或 PGS 类型。
     fn from_stream(stream: SubtitleStream) -> Option<Self> {
         let index = stream.index?;
         let codec = stream.codec_name.as_deref()?.to_ascii_lowercase();
@@ -3042,6 +3198,8 @@ impl SupportedSubtitle {
             "subrip" | "srt" | "webvtt" | "mov_text" | "text"
         ) {
             "vtt"
+        } else if matches!(codec.as_str(), "hdmv_pgs_subtitle" | "pgssub") {
+            "pgs"
         } else {
             return None;
         };
@@ -3241,6 +3399,16 @@ fn is_hls_asset(value: &str) -> bool {
             })
 }
 
+/// 按字幕类型生成会话资源名；PGS 位图流使用 FFmpeg 输出的 SUP 扩展名。
+fn subtitle_asset_name(order: usize, output_type: &str) -> String {
+    let extension = if output_type == "pgs" {
+        "sup"
+    } else {
+        output_type
+    };
+    format!("subtitle-{order:03}.{extension}")
+}
+
 fn is_subtitle_asset(value: &str) -> bool {
     value
         .strip_prefix("subtitle-")
@@ -3248,6 +3416,7 @@ fn is_subtitle_asset(value: &str) -> bool {
             value
                 .strip_suffix(".ass")
                 .or_else(|| value.strip_suffix(".vtt"))
+                .or_else(|| value.strip_suffix(".sup"))
         })
         .is_some_and(|digits| digits.len() == 3 && digits.bytes().all(|byte| byte.is_ascii_digit()))
 }
@@ -3319,7 +3488,35 @@ mod tests {
         assert!(is_hls_asset("segment-000001.ts"));
         assert!(!is_hls_asset("../segment-000001.ts"));
         assert!(is_subtitle_asset("subtitle-001.ass"));
+        assert!(is_subtitle_asset("subtitle-001.sup"));
         assert!(!is_subtitle_asset("subtitle-1.ass"));
+    }
+
+    /// 验证 PGS 位图字幕进入远程轨道列表，而未知图片字幕编码仍被拒绝。
+    #[test]
+    fn maps_supported_pgs_subtitle_streams() {
+        let pgs = SupportedSubtitle::from_stream(SubtitleStream {
+            index: Some(2),
+            codec_name: Some("hdmv_pgs_subtitle".to_owned()),
+            disposition: SubtitleDisposition { default: 1 },
+            tags: HashMap::from([("title".to_owned(), "简日图形字幕".to_owned())]),
+        })
+        .expect("PGS subtitle should be supported");
+        assert_eq!(pgs.index, 2);
+        assert_eq!(pgs.output_type, "pgs");
+        assert_eq!(subtitle_asset_name(0, pgs.output_type), "subtitle-000.sup");
+        assert_eq!(pgs.disposition.default, 1);
+        assert_eq!(
+            pgs.tags.get("title").map(String::as_str),
+            Some("简日图形字幕")
+        );
+
+        assert!(SupportedSubtitle::from_stream(SubtitleStream {
+            index: Some(3),
+            codec_name: Some("dvd_subtitle".to_owned()),
+            ..Default::default()
+        })
+        .is_none());
     }
 
     /// 验证 URL 末段保留扩展名并编码路径、查询字符串保留字符。

@@ -1,5 +1,6 @@
 import Artplayer from "artplayer";
 import Hls from "hls.js";
+import { PgsRenderer } from "libbitsub";
 import type { DirectEnhancementPlaybackState } from "./direct-enhancement-playback";
 import {
   parseDirectEnhancementSubtitleCues,
@@ -67,6 +68,7 @@ export class ArtPlayerAdapter implements UnifiedPlayerAdapter {
   private snapshot: PlayerSnapshot;
   private player?: Artplayer;
   private hls?: Hls;
+  private pgsRenderer?: PgsRenderer;
   private source?: PlayerMediaSource;
   private directEnhancementActive = false;
   private directSubtitleCues: DirectEnhancementSubtitleCue[] = [];
@@ -481,16 +483,19 @@ export class ArtPlayerAdapter implements UnifiedPlayerAdapter {
     });
   }
 
+  /** 切换当前字幕轨道；关闭时同时清理文本与位图字幕图层。 */
   private async selectSubtitle(subtitleId?: string): Promise<void> {
     const player = this.player!;
     const subtitle = this.source?.subtitles.find((item) => item.id === subtitleId);
     if (!subtitle) {
+      this.disposePgsSubtitle();
       if (this.directEnhancementActive) {
         this.directSubtitleCues = [];
         this.directSubtitleRequest += 1;
         player.template.$subtitle.replaceChildren();
       } else {
         player.subtitle.show = false;
+        player.template.$subtitle.replaceChildren();
       }
       this.markSelectedSubtitle(undefined);
       return;
@@ -499,7 +504,16 @@ export class ArtPlayerAdapter implements UnifiedPlayerAdapter {
     this.markSelectedSubtitle(subtitle.id);
   }
 
+  /** 按字幕类型选择 ArtPlayer 文本轨或独立 PGS Canvas 渲染器。 */
   private async switchSubtitle(player: Artplayer, subtitle: PlayerMediaSource["subtitles"][number]): Promise<void> {
+    if (subtitle.type === "pgs") {
+      if (this.directEnhancementActive) {
+        throw new Error("直传增强画布暂不支持 PGS 字幕");
+      }
+      this.switchPgsSubtitle(player, subtitle);
+      return;
+    }
+    this.disposePgsSubtitle();
     if (this.directEnhancementActive) {
       await this.loadDirectSubtitle(subtitle);
       return;
@@ -513,7 +527,59 @@ export class ArtPlayerAdapter implements UnifiedPlayerAdapter {
     player.subtitle.show = true;
   }
 
+  /** 创建与当前视频时钟绑定的 PGS 位图字幕图层。 */
+  private switchPgsSubtitle(
+    player: Artplayer,
+    subtitle: PlayerMediaSource["subtitles"][number]
+  ): void {
+    this.disposePgsSubtitle();
+    player.subtitle.show = false;
+    player.template.$subtitle.replaceChildren();
+    const subtitleUrl = new URL(subtitle.uri, this.options.baseUrl ?? window.location.origin).toString();
+    let renderer: PgsRenderer;
+    renderer = new PgsRenderer({
+      video: player.template.$video,
+      container: player.template.$video.parentElement ?? undefined,
+      subUrl: subtitleUrl,
+      devicePixelRatioCap: 2,
+      cacheLimit: 24,
+      prefetchWindow: { before: 1, after: 2 },
+      displaySettings: { scale: this.snapshot.subtitleScale / 100 },
+      onLoaded: () => {
+        if (this.pgsRenderer !== renderer) return;
+        console.info("[remote] PGS 字幕加载完成", { subtitleId: subtitle.id });
+      },
+      onWarning: (warning) => {
+        if (this.pgsRenderer !== renderer) return;
+        console.warn("[remote] PGS 字幕渲染降级", {
+          subtitleId: subtitle.id,
+          code: warning.code,
+          message: warning.message
+        });
+      },
+      onError: (error) => {
+        if (this.pgsRenderer !== renderer) return;
+        console.warn("[remote] PGS 字幕加载失败，继续播放视频", {
+          subtitleId: subtitle.id,
+          error
+        });
+        this.disposePgsSubtitle();
+        this.markSelectedSubtitle(undefined);
+      }
+    });
+    this.pgsRenderer = renderer;
+    console.info("[remote] PGS 字幕开始加载", { subtitleId: subtitle.id });
+  }
+
+  /** 释放当前 PGS 渲染器及其 Canvas、Worker 和 WASM 会话资源。 */
+  private disposePgsSubtitle(): void {
+    this.pgsRenderer?.dispose();
+    this.pgsRenderer = undefined;
+  }
+
+  /** 为直传增强画布读取并解析文本字幕。 */
   private async loadDirectSubtitle(subtitle: PlayerMediaSource["subtitles"][number]): Promise<void> {
+    if (subtitle.type === "pgs") throw new Error("直传增强画布暂不支持 PGS 字幕");
     const player = this.player;
     if (!player) return;
     const request = ++this.directSubtitleRequest;
@@ -565,6 +631,7 @@ export class ArtPlayerAdapter implements UnifiedPlayerAdapter {
   /** 即时调整 ArtPlayer 字幕 CSS 变量并更新统一快照。 */
   private setSubtitleScale(subtitleScale: PlayerSubtitleScale): void {
     this.applySubtitleScale(this.player!, subtitleScale);
+    this.pgsRenderer?.setDisplaySettings({ scale: subtitleScale / 100 });
     this.patch({ subtitleScale });
     console.info("[remote] ArtPlayer 字幕大小已更新", { subtitleScale });
   }
@@ -655,6 +722,7 @@ export class ArtPlayerAdapter implements UnifiedPlayerAdapter {
     this.directSubtitleRequest += 1;
     this.directSubtitleCues = [];
     this.directEnhancementActive = false;
+    this.disposePgsSubtitle();
     this.hls?.destroy();
     this.hls = undefined;
     const player = this.player;

@@ -111,3 +111,7 @@ cargo test --workspace
 
 ## 其他文档约束，需要静默加载
 [other.md](other.md)
+
+## 代码推送约束
+
+先推送gitee在推送github，两者同步

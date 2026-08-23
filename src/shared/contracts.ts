@@ -682,7 +682,7 @@ export interface DesktopMediaToolsStatus {
   ffmpeg: MediaToolStatus;
 }
 
-export type RemotePlaybackSubtitleType = "ass" | "vtt";
+export type RemotePlaybackSubtitleType = "ass" | "vtt" | "pgs";
 
 export interface RemotePlaybackSubtitle {
   id: string;
