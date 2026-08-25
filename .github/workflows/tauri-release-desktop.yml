@@ -90,6 +90,12 @@ jobs:
         with:
           workspaces: . -> out/cargo-target
 
+      - name: Install pinned Vulkan SDK
+        uses: humbletim/setup-vulkan-sdk@v1.2.1
+        with:
+          vulkan-query-version: 1.3.296.0
+          vulkan-use-cache: true
+
       - uses: ilammy/msvc-dev-cmd@v1
         if: matrix.platform == 'win32'
 
@@ -99,8 +105,8 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y \
             build-essential cmake ffmpeg libayatana-appindicator3-dev \
-            libboost-system-dev librsvg2-dev libssl-dev libwebkit2gtk-4.1-dev \
-            libx11-dev libxdo-dev ninja-build patchelf pax-utils vlc wget
+            libboost-system-dev libmpv1 librsvg2-dev libssl-dev libwebkit2gtk-4.1-dev \
+            libx11-dev libxdo-dev ninja-build patchelf pax-utils wget
 
       - name: Install macOS native dependencies
         if: matrix.platform == 'darwin'
@@ -159,20 +165,18 @@ jobs:
             fi
           done
 
-      - name: Prepare Windows libVLC
+      - name: Prepare Windows libmpv
         if: matrix.platform == 'win32'
         shell: pwsh
-        run: pnpm run prepare:tauri:win-libvlc -- --arch "${{ matrix.arch }}"
+        run: pnpm run prepare:tauri:win-libmpv -- --arch "${{ matrix.arch }}"
 
-      - name: Prepare macOS libVLC
+      - name: Prepare macOS libmpv
         if: matrix.platform == 'darwin'
         shell: bash
-        run: pnpm run prepare:tauri:mac-libvlc -- --arch "${{ matrix.arch }}"
+        run: pnpm run prepare:tauri:mac-libmpv -- --arch "${{ matrix.arch }}" --pinned
 
-      - name: Prepare Linux libVLC
-        if: matrix.platform == 'linux'
-        shell: bash
-        run: pnpm run prepare:tauri:linux-libvlc -- --arch "${{ matrix.arch }}"
+      - name: Verify desktop libmpv runtime
+        run: pnpm run verify:libmpv -- --platform "${{ matrix.platform }}" --arch "${{ matrix.arch }}" --require-pinned
 
       - name: Build Windows torrent-core
         if: matrix.platform == 'win32'
@@ -229,6 +233,25 @@ jobs:
       - name: Stage FFmpeg and FFprobe
         if: matrix.platform != 'linux'
         run: pnpm run prepare:ffmpeg -- --platform ${{ matrix.platform }} --arch ${{ matrix.arch }}
+
+      - name: Build and verify RIFE model sidecar
+        shell: bash
+        run: |
+          pnpm run prepare:rife-sidecar -- \
+            --platform "${{ matrix.platform }}" --arch "${{ matrix.arch }}"
+          pnpm run verify:rife-sidecar -- \
+            --platform "${{ matrix.platform }}" --arch "${{ matrix.arch }}"
+
+      - name: Build and verify Real-ESRGAN model sidecar
+        shell: bash
+        run: |
+          pnpm run prepare:realesrgan-sidecar -- \
+            --platform "${{ matrix.platform }}" --arch "${{ matrix.arch }}"
+          pnpm run verify:realesrgan-sidecar -- \
+            --platform "${{ matrix.platform }}" --arch "${{ matrix.arch }}"
+
+      - name: Verify bundled PC enhancement resources
+        run: pnpm run verify:pc-enhancement-resources
 
       - name: Import Windows signing certificate
         if: matrix.platform == 'win32' && env.WINDOWS_CERTIFICATE_BASE64 != ''
@@ -319,6 +342,7 @@ jobs:
         run: |
           pnpm run typecheck
           pnpm run test:theme
+          pnpm run test:player-matrix
           cargo fmt --all -- --check
           cargo test --workspace
           cargo clippy --workspace --all-targets -- -D warnings
@@ -412,6 +436,17 @@ jobs:
           codesign --force --options runtime --timestamp=none \
             --sign "${APPLE_SIGNING_IDENTITY}" "${managed_app}"
           codesign --verify --deep --strict "${managed_app}"
+
+          mpv_directory="${final_app}/Contents/Resources/libmpv/darwin-${{ matrix.arch }}"
+          if [[ ! -f "${mpv_directory}/libmpv.2.dylib" ]]; then
+            echo "未找到最终包内的 macOS libmpv：${mpv_directory}" >&2
+            exit 1
+          fi
+          while IFS= read -r -d '' library; do
+            echo "[macos-signing] 签名最终包 libmpv 动态库：${library}"
+            codesign --force --options runtime --timestamp=none \
+              --sign "${APPLE_SIGNING_IDENTITY}" "${library}"
+          done < <(find "${mpv_directory}" -type f -name '*.dylib' -print0)
 
           codesign --force --options runtime --timestamp=none \
             --sign "${APPLE_SIGNING_IDENTITY}" "${final_app}"

@@ -14,7 +14,7 @@ fn command_error(code: &str, message: String) -> AppCommandError {
     }
 }
 
-/// 打开 Tauri 桌面 libVLC 双窗口。
+/// 打开 Tauri 桌面 MPV 双窗口。
 #[tauri::command]
 pub(crate) async fn open_desktop_player_window(
     input: DesktopPlayerWindowInput,
@@ -33,7 +33,7 @@ pub(crate) async fn open_desktop_player_window(
     })
 }
 
-/// 关闭 Tauri 桌面 libVLC 双窗口。
+/// 关闭 Tauri 桌面 MPV 双窗口。
 #[tauri::command]
 pub(crate) async fn close_desktop_player_window(
     state: State<'_, AppPlayerState>,
@@ -87,7 +87,7 @@ pub(crate) fn close_desktop_playback_session(
         .map_err(|message| command_error("player_session_close_failed", message))
 }
 
-/// 读取当前 Tauri libVLC 后端能力。
+/// 读取当前 Tauri MPV 后端能力。
 #[tauri::command]
 pub(crate) async fn get_desktop_player_capabilities(
     state: State<'_, AppPlayerState>,
@@ -95,7 +95,7 @@ pub(crate) async fn get_desktop_player_capabilities(
     Ok(state.capabilities().await)
 }
 
-/// 读取当前 libVLC 完整快照，供控制页在事件订阅完成后补拉状态。
+/// 读取当前 MPV 完整快照，供控制页在事件订阅完成后补拉状态。
 #[tauri::command]
 pub(crate) async fn get_desktop_player_snapshot(
     state: State<'_, AppPlayerState>,

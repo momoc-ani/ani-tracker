@@ -5,9 +5,9 @@ use ani_media::player::PlayerTransport;
 use serde::de::DeserializeOwned;
 use tauri::{plugin::PluginApi, AppHandle, Manager, Runtime};
 
-use crate::desktop_runtime::DesktopPlayerTransport;
+use crate::mpv_runtime::{MpvPlayerTransport, MpvRuntimeConfig};
 
-/// libVLC 视频输出绑定的平台原生窗口句柄。
+/// libmpv 视频输出绑定的平台原生窗口句柄。
 #[derive(Debug, Clone, Copy)]
 pub enum DesktopVideoTarget {
     Windows(isize),
@@ -23,7 +23,7 @@ pub trait DesktopWindowController: Send + Sync {
     fn close(&self) -> Result<(), String>;
 }
 
-/// 保存应用句柄并按播放窗口创建独立 libVLC transport。
+/// 保存应用句柄并按播放窗口创建独立 libmpv transport。
 pub struct AniPlayer<R: Runtime>(AppHandle<R>);
 
 impl<R: Runtime> AniPlayer<R> {
@@ -33,12 +33,87 @@ impl<R: Runtime> AniPlayer<R> {
         target: DesktopVideoTarget,
         controller: Arc<dyn DesktopWindowController>,
     ) -> Arc<dyn PlayerTransport> {
-        Arc::new(DesktopPlayerTransport::new(
+        let mpv = MpvPlayerTransport::new(
             target,
             controller,
-            desktop_runtime_roots(&self.0),
-        ))
+            MpvRuntimeConfig {
+                library_roots: desktop_mpv_runtime_roots(&self.0),
+                shader_roots: desktop_shader_roots(&self.0),
+            },
+        );
+        if mpv.is_available() {
+            log::info!("Tauri 桌面播放器已选择 libmpv transport");
+        } else {
+            log::error!("Tauri 桌面播放器缺少可用 libmpv transport");
+        }
+        Arc::new(mpv)
     }
+}
+
+fn desktop_mpv_runtime_roots<R: Runtime>(app: &AppHandle<R>) -> Vec<PathBuf> {
+    let executable_directory = std::env::current_exe()
+        .ok()
+        .and_then(|path| path.parent().map(PathBuf::from));
+    let current = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let platform = platform_directory();
+    mpv_runtime_roots_for(
+        &platform,
+        std::env::var_os("ANI_LIBMPV_DIR").map(PathBuf::from),
+        executable_directory,
+        app.path().resource_dir().ok(),
+        current,
+    )
+}
+
+/// 生成 libmpv 搜索根，兼容打包资源与自定义 Cargo target-dir。
+fn mpv_runtime_roots_for(
+    platform: &str,
+    configured: Option<PathBuf>,
+    executable_directory: Option<PathBuf>,
+    resource_directory: Option<PathBuf>,
+    current_directory: PathBuf,
+) -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    if let Some(configured) = configured {
+        push_unique_root(&mut roots, configured);
+    }
+    if let Some(resource_directory) = resource_directory {
+        push_unique_root(&mut roots, resource_directory.join("libmpv").join(platform));
+    }
+    if let Some(executable_directory) = executable_directory {
+        push_unique_root(
+            &mut roots,
+            executable_directory.join("libmpv").join(platform),
+        );
+    }
+    push_unique_root(
+        &mut roots,
+        current_directory.join("out/libmpv").join(platform),
+    );
+    push_unique_root(
+        &mut roots,
+        current_directory.join("resources/libmpv").join(platform),
+    );
+    roots
+}
+
+fn desktop_shader_roots<R: Runtime>(app: &AppHandle<R>) -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    if let Some(configured) = std::env::var_os("ANI_ANIME4K_SHADER_DIR") {
+        push_unique_root(&mut roots, PathBuf::from(configured));
+    }
+    if let Ok(resource_directory) = app.path().resource_dir() {
+        push_unique_root(&mut roots, resource_directory.join("shaders/anime4k"));
+    }
+    if let Ok(executable) = std::env::current_exe() {
+        if let Some(directory) = executable.parent() {
+            push_unique_root(&mut roots, directory.join("shaders/anime4k"));
+        }
+    }
+    let current = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    push_unique_root(&mut roots, current.join("resources/shaders/anime4k"));
+    push_unique_root(&mut roots, current.join("../resources/shaders/anime4k"));
+    roots
 }
 
 /// 从任意 Tauri Manager 读取播放器插件句柄。
@@ -59,52 +134,6 @@ pub fn init<R: Runtime, C: DeserializeOwned>(
     _api: PluginApi<R, C>,
 ) -> crate::Result<AniPlayer<R>> {
     Ok(AniPlayer(app.clone()))
-}
-
-fn desktop_runtime_roots<R: Runtime>(app: &AppHandle<R>) -> Vec<PathBuf> {
-    let executable_directory = std::env::current_exe()
-        .ok()
-        .and_then(|path| path.parent().map(PathBuf::from));
-    let current = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    runtime_roots_for(
-        &platform_directory(),
-        std::env::var_os("ANI_LIBVLC_DIR").map(PathBuf::from),
-        executable_directory,
-        app.path().resource_dir().ok(),
-        current,
-    )
-}
-
-/// 生成 libVLC 搜索根，兼容自定义 Cargo target-dir 的开发产物目录。
-fn runtime_roots_for(
-    platform: &str,
-    configured: Option<PathBuf>,
-    executable_directory: Option<PathBuf>,
-    resource_directory: Option<PathBuf>,
-    current_directory: PathBuf,
-) -> Vec<PathBuf> {
-    let mut roots = Vec::new();
-    if let Some(configured) = configured {
-        push_unique_root(&mut roots, configured);
-    }
-    if let Some(resource_directory) = resource_directory {
-        push_unique_root(&mut roots, resource_directory.join("libvlc").join(platform));
-    }
-    if let Some(executable_directory) = executable_directory {
-        push_unique_root(
-            &mut roots,
-            executable_directory.join("libvlc").join(platform),
-        );
-    }
-    push_unique_root(
-        &mut roots,
-        current_directory.join("out/libvlc").join(platform),
-    );
-    push_unique_root(
-        &mut roots,
-        current_directory.join("resources/libvlc").join(platform),
-    );
-    roots
 }
 
 /// 追加尚未出现的运行时根目录，避免重复探测与重复日志。
@@ -139,7 +168,7 @@ fn platform_directory_for(os: &str, arch: &str) -> String {
 mod tests {
     use std::path::PathBuf;
 
-    use super::{platform_directory_for, runtime_roots_for};
+    use super::{mpv_runtime_roots_for, platform_directory_for};
 
     #[test]
     fn maps_supported_desktop_resource_directories() {
@@ -151,9 +180,9 @@ mod tests {
 
     #[test]
     fn resolves_runtime_next_to_custom_cargo_target_executable() {
-        let roots = runtime_roots_for(
+        let roots = mpv_runtime_roots_for(
             "darwin-x64",
-            Some(PathBuf::from("/override/vlc")),
+            Some(PathBuf::from("/override/mpv")),
             Some(PathBuf::from("/repo/out/cargo-target/debug")),
             Some(PathBuf::from("/bundle/Contents/Resources")),
             PathBuf::from("/repo/src-tauri"),
@@ -162,11 +191,11 @@ mod tests {
         assert_eq!(
             roots,
             vec![
-                PathBuf::from("/override/vlc"),
-                PathBuf::from("/bundle/Contents/Resources/libvlc/darwin-x64"),
-                PathBuf::from("/repo/out/cargo-target/debug/libvlc/darwin-x64"),
-                PathBuf::from("/repo/src-tauri/out/libvlc/darwin-x64"),
-                PathBuf::from("/repo/src-tauri/resources/libvlc/darwin-x64"),
+                PathBuf::from("/override/mpv"),
+                PathBuf::from("/bundle/Contents/Resources/libmpv/darwin-x64"),
+                PathBuf::from("/repo/out/cargo-target/debug/libmpv/darwin-x64"),
+                PathBuf::from("/repo/src-tauri/out/libmpv/darwin-x64"),
+                PathBuf::from("/repo/src-tauri/resources/libmpv/darwin-x64"),
             ]
         );
     }

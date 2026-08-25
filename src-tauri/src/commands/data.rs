@@ -682,10 +682,17 @@ pub(crate) async fn list_anime_catalog(
 #[tauri::command]
 pub(crate) async fn search_anime_catalog(
     keyword: String,
+    include_online: Option<bool>,
     state: State<'_, AppStorageState>,
     source_state: State<'_, AppSourceState>,
 ) -> Result<AnimeDiscoverySearchResult, AppCommandError> {
     let keyword = keyword.trim().to_owned();
+    let include_online = include_online.unwrap_or(true);
+    log::info!(
+        "Tauri 新番关键词搜索开始 keyword={} include_online={}",
+        keyword,
+        include_online
+    );
     let storage = Arc::clone(state.storage());
     let defaults = state.platform_defaults().clone();
     let query_keyword = keyword.clone();
@@ -700,10 +707,15 @@ pub(crate) async fn search_anime_catalog(
         },
     )
     .await?;
-    if keyword.is_empty() {
+    if keyword.is_empty() || !include_online {
         local
             .items
             .retain(|item| !is_restricted_anime_content(item));
+        log::info!(
+            "Tauri 新番关键词搜索完成 keyword={} source=local items={}",
+            keyword,
+            local.items.len()
+        );
         return Ok(local);
     }
     let network = source_state
@@ -742,7 +754,7 @@ pub(crate) async fn search_anime_catalog(
             errors.push(format!("local-cache: {}", error.message));
         }
     }
-    Ok(AnimeDiscoverySearchResult {
+    let result = AnimeDiscoverySearchResult {
         keyword,
         items,
         source: if online.source.is_empty() {
@@ -751,7 +763,15 @@ pub(crate) async fn search_anime_catalog(
             format!("local+{}", online.source)
         },
         errors,
-    })
+    };
+    log::info!(
+        "Tauri 新番关键词搜索完成 keyword={} source={} items={} errors={}",
+        result.keyword,
+        result.source,
+        result.items.len(),
+        result.errors.len()
+    );
+    Ok(result)
 }
 
 /// 直接在线浏览 Bangumi，结果不写入季度目录缓存。

@@ -20,8 +20,11 @@ import {
   type PlayerAspectRatio,
   type PlayerCapabilities,
   type PlayerCommand,
+  type PlayerFrameInterpolation,
+  type PlayerHdrMode,
   type PlayerSnapshot,
-  type PlayerSubtitleScale
+  type PlayerSubtitleScale,
+  type PlayerVideoEnhancement
 } from "@shared/player-contract";
 import { resolvePlayerShortcut } from "@shared/player-shortcuts";
 import {
@@ -40,8 +43,11 @@ import { buildPlayerEpisodeItems, type PlayerEpisodeUiItem } from "./player-ui-m
 import { useDesktopWindowDrag } from "./use-desktop-window-drag";
 import { usePlaybackBusiness } from "./use-playback-business";
 import { readStoredSubtitleScale, storeSubtitleScale } from "./subtitle-scale";
+import { readStoredVideoEnhancement, storeVideoEnhancement } from "./video-enhancement";
 
 const TOOLBAR_HIDE_DELAY_MS = 3_000;
+const FULLSCREEN_TRANSITION_SETTLE_MS = 220;
+const FULLSCREEN_TRANSITION_MAX_MS = 700;
 
 interface DesktopPlayerPageProps {
   taskId: string;
@@ -49,7 +55,7 @@ interface DesktopPlayerPageProps {
   onClose: () => void;
 }
 
-/** 加载桌面播放列表，并将专用控制页连接到主进程 libVLC 后端。 */
+/** 加载桌面播放列表，并将专用控制页连接到主进程 libmpv 后端。 */
 export function DesktopPlayerPage({ taskId, initialFileIndex, onClose }: DesktopPlayerPageProps) {
   const [playlist, setPlaylist] = useState<RemotePlaylistItem[]>([]);
   const [downloadTasks, setDownloadTasks] = useState<DownloadTask[]>([]);
@@ -103,7 +109,7 @@ export function DesktopPlayerPage({ taskId, initialFileIndex, onClose }: Desktop
           });
         });
       }
-      console.info("[player] 桌面 libVLC 播放列表读取完成", {
+      console.info("[player] 桌面 libmpv 播放列表读取完成", {
         taskId,
         itemCount: items.length,
         fileIndex: initialItem.fileIndex
@@ -118,18 +124,18 @@ export function DesktopPlayerPage({ taskId, initialFileIndex, onClose }: Desktop
     return () => { active = false; };
   }, [initialFileIndex, taskId]);
 
-  /** 切集时保留当前独立窗口，仅由新会话触发 libVLC 换源。 */
+  /** 切集时保留当前独立窗口，仅由新会话触发 libmpv 换源。 */
   const selectItem = useCallback((item: RemotePlaylistItem): void => {
     setActiveItemId(item.id);
     document.title = `${item.displayTitle} - Ani Tracker`;
-    console.info("[player] 桌面 libVLC 切换文件", {
+    console.info("[player] 桌面 libmpv 切换文件", {
       taskId: item.task.id,
       fileIndex: item.fileIndex
     });
   }, []);
 
   return (
-    <DesktopVlcControls
+    <DesktopMpvControls
       activeItem={activeItem}
       anime={anime}
       downloadTasks={downloadTasks}
@@ -143,7 +149,7 @@ export function DesktopPlayerPage({ taskId, initialFileIndex, onClose }: Desktop
   );
 }
 
-interface DesktopVlcControlsProps {
+interface DesktopMpvControlsProps {
   activeItem: RemotePlaylistItem | null;
   anime?: Anime;
   downloadTasks: DownloadTask[];
@@ -156,7 +162,7 @@ interface DesktopVlcControlsProps {
 }
 
 /** 将播放器控制层交互映射为 preload 暴露的统一命令。 */
-function DesktopVlcControls({
+function DesktopMpvControls({
   activeItem,
   anime,
   downloadTasks,
@@ -166,12 +172,14 @@ function DesktopVlcControls({
   onClose,
   onSelectItem,
   playlist
-}: DesktopVlcControlsProps) {
+}: DesktopMpvControlsProps) {
   const toolbarTimerRef = useRef<number>();
   const activeSessionIdRef = useRef<string>();
   const commandSequenceRef = useRef(0);
   const [subtitleScale, setSubtitleScale] = useState<PlayerSubtitleScale>(readStoredSubtitleScale);
   const initialSubtitleScaleRef = useRef(subtitleScale);
+  const [videoEnhancement, setVideoEnhancement] = useState<PlayerVideoEnhancement>(readStoredVideoEnhancement);
+  const initialVideoEnhancementRef = useRef(videoEnhancement);
   const [capabilities, setCapabilities] = useState<PlayerCapabilities>();
   const [session, setSession] = useState<RemotePlaybackSession | null>(null);
   const [snapshot, setSnapshot] = useState<PlayerSnapshot>();
@@ -180,6 +188,11 @@ function DesktopVlcControls({
   const [toolbarVisible, setToolbarVisible] = useState(true);
   const [playlistOpen, setPlaylistOpen] = useState(false);
   const [panelOpen, setPanelOpen] = useState(false);
+  const [fullscreenTransition, setFullscreenTransition] = useState(false);
+  const [fullscreenTransitionSequence, setFullscreenTransitionSequence] = useState(0);
+  const fullscreenTargetRef = useRef<boolean>();
+  const fullscreenTransitionTimerRef = useRef<number>();
+  const fullscreenTransitionStartedAtRef = useRef<number>();
   const windowDrag = useDesktopWindowDrag();
 
   const previousItem = useMemo(
@@ -195,9 +208,11 @@ function DesktopVlcControls({
   const animeTitle = anime?.title ?? activeItem?.task.animeTitle ?? "Ani Tracker";
   const episodeLabel = activeItem ? playlistItemLabel(activeItem) : "当前视频";
   const runtimeError = capabilities?.availability === "unavailable"
-    ? capabilities.unavailableReason ?? "libVLC 原生运行时不可用"
+    ? capabilities.unavailableReason ?? "原生播放器运行时不可用"
     : null;
   const currentError = loadError ?? playbackError ?? snapshot?.error?.message ?? runtimeError;
+  // 全屏命令提交后先乐观更新控制层，避免等待下一次原生快照才切换图标和布局。
+  const effectiveFullscreen = fullscreenTargetRef.current ?? snapshot?.fullscreen ?? false;
   const episodeItems = useMemo(() => buildPlayerEpisodeItems({
     activeItem,
     currentTimeSeconds: snapshot?.positionSeconds ?? 0,
@@ -236,8 +251,8 @@ function DesktopVlcControls({
       if (active) setCapabilities(result);
     }).catch((caught) => {
       if (!active) return;
-      console.error("[player] libVLC 能力读取失败", caught);
-      setPlaybackError(caught instanceof Error ? caught.message : "libVLC 能力读取失败");
+      console.error("[player] libmpv 能力读取失败", caught);
+      setPlaybackError(caught instanceof Error ? caught.message : "libmpv 能力读取失败");
     });
     return () => { active = false; };
   }, []);
@@ -245,6 +260,7 @@ function DesktopVlcControls({
   useEffect(() => appApi.onDesktopPlayerSnapshot((incoming) => {
     const activeSessionId = activeSessionIdRef.current;
     if (!activeSessionId) return;
+    setCapabilities(incoming.capabilities);
     setSnapshot((current) => acceptPlayerSnapshot(activeSessionId, current, incoming));
   }), []);
 
@@ -258,14 +274,15 @@ function DesktopVlcControls({
     setPlaybackError(null);
     queueMicrotask(() => {
       if (!active) return;
-      console.info("[player] 正在创建桌面 libVLC 会话", {
+      console.info("[player] 正在创建桌面 libmpv 会话", {
         taskId: activeItem.task.id,
         fileIndex: activeItem.fileIndex
       });
       void desktopPlaybackSessionClient.create(
         activeItem.task.id,
         "direct",
-        activeItem.fileIndex
+        activeItem.fileIndex,
+        { videoEnhancement: "off", frameInterpolation: "off" }
       ).then(async (result) => {
         createdSession = result;
         if (!active) {
@@ -311,9 +328,24 @@ function DesktopVlcControls({
             error: subtitleScaleResult.error.message
           });
         }
+        if (capabilities.supportsVideoEnhancement) {
+          const enhancementCommand: Extract<PlayerCommand, { type: "set-video-enhancement" }> = {
+            type: "set-video-enhancement",
+            commandId: createCommandId(commandSequenceRef),
+            sessionId: result.id,
+            videoEnhancement: initialVideoEnhancementRef.current
+          };
+          const enhancementResult = await appApi.dispatchDesktopPlayerCommand(enhancementCommand);
+          if (!enhancementResult.accepted) {
+            console.warn("[player] 桌面画质增强恢复失败", {
+              videoEnhancement: initialVideoEnhancementRef.current,
+              error: enhancementResult.error.message
+            });
+          }
+        }
       }).catch((caught) => {
         if (!active) return;
-        console.error("[player] 桌面 libVLC 会话加载失败", {
+        console.error("[player] 桌面 libmpv 会话加载失败", {
           taskId: activeItem.task.id,
           fileIndex: activeItem.fileIndex,
           error: caught
@@ -374,6 +406,51 @@ function DesktopVlcControls({
     return () => window.clearTimeout(toolbarTimerRef.current);
   }, [buffering, currentError, panelOpen, playing, playlistOpen, scheduleToolbarHide, session]);
 
+  const clearFullscreenTransition = useCallback((): void => {
+    window.clearTimeout(fullscreenTransitionTimerRef.current);
+    const startedAt = fullscreenTransitionStartedAtRef.current;
+    if (startedAt !== undefined) {
+      console.info("[player] 桌面播放器全屏过渡结束", {
+        elapsedMs: Math.round(performance.now() - startedAt)
+      });
+    }
+    fullscreenTransitionStartedAtRef.current = undefined;
+    fullscreenTargetRef.current = undefined;
+    setFullscreenTransition(false);
+  }, []);
+
+  const beginFullscreenTransition = useCallback((target: boolean): void => {
+    window.clearTimeout(fullscreenTransitionTimerRef.current);
+    fullscreenTransitionStartedAtRef.current = performance.now();
+    fullscreenTargetRef.current = target;
+    setFullscreenTransitionSequence((value) => value + 1);
+    setFullscreenTransition(true);
+    console.info("[player] 桌面播放器全屏切换开始", { target });
+    fullscreenTransitionTimerRef.current = window.setTimeout(
+      clearFullscreenTransition,
+      FULLSCREEN_TRANSITION_MAX_MS
+    );
+  }, [clearFullscreenTransition]);
+
+  useEffect(() => {
+    const target = fullscreenTargetRef.current;
+    if (target === undefined || snapshot?.fullscreen !== target) return;
+    const startedAt = fullscreenTransitionStartedAtRef.current;
+    console.info("[player] 桌面播放器全屏快照已确认", {
+      target,
+      elapsedMs: startedAt === undefined ? undefined : Math.round(performance.now() - startedAt)
+    });
+    window.clearTimeout(fullscreenTransitionTimerRef.current);
+    fullscreenTransitionTimerRef.current = window.setTimeout(
+      clearFullscreenTransition,
+      FULLSCREEN_TRANSITION_SETTLE_MS
+    );
+  }, [clearFullscreenTransition, snapshot?.fullscreen]);
+
+  useEffect(() => () => {
+    window.clearTimeout(fullscreenTransitionTimerRef.current);
+  }, []);
+
   const togglePlayback = (): void => sendSimpleCommand(playing ? "pause" : "play");
   const seekTo = (positionSeconds: number): void => {
     const command = createCommand<Extract<PlayerCommand, { type: "seek" }>>({
@@ -425,19 +502,60 @@ function DesktopVlcControls({
       console.info("[player] 桌面字幕大小已保存", { subtitleScale: value });
     });
   };
-  const toggleFullscreen = (): void => {
-    const command = createCommand<Extract<PlayerCommand, { type: "set-fullscreen" }>>({
-      type: "set-fullscreen",
-      fullscreen: !(snapshot?.fullscreen ?? false)
+  const changeVideoEnhancement = (value: PlayerVideoEnhancement): void => {
+    const command = createCommand<Extract<PlayerCommand, { type: "set-video-enhancement" }>>({
+      type: "set-video-enhancement",
+      videoEnhancement: value
+    });
+    if (!command) return;
+    void dispatchCommand(command).then((accepted) => {
+      if (!accepted) return;
+      initialVideoEnhancementRef.current = value;
+      setVideoEnhancement(value);
+      storeVideoEnhancement(value);
+      console.info("[player] 桌面画质增强预设已保存", { videoEnhancement: value });
+    });
+  };
+  const changeFrameInterpolation = (value: PlayerFrameInterpolation): void => {
+    const command = createCommand<Extract<PlayerCommand, { type: "set-frame-interpolation" }>>({
+      type: "set-frame-interpolation",
+      frameInterpolation: value
     });
     if (command) void dispatchCommand(command);
+  };
+  const changeHdr = (value: PlayerHdrMode): void => {
+    const command = createCommand<Extract<PlayerCommand, { type: "set-hdr" }>>({
+      type: "set-hdr",
+      hdr: value
+    });
+    if (command) void dispatchCommand(command);
+  };
+  const toggleFullscreen = (): void => {
+    if (fullscreenTargetRef.current !== undefined) return;
+    const fullscreen = !effectiveFullscreen;
+    const command = createCommand<Extract<PlayerCommand, { type: "set-fullscreen" }>>({
+      type: "set-fullscreen",
+      fullscreen
+    });
+    if (!command) return;
+    beginFullscreenTransition(fullscreen);
+    const startedAt = performance.now();
+    void dispatchCommand(command).then((accepted) => {
+      console.info("[player] 桌面播放器全屏命令已返回", {
+        accepted,
+        elapsedMs: Math.round(performance.now() - startedAt)
+      });
+      if (!accepted) clearFullscreenTransition();
+    });
   };
 
   /** 在播放器非编辑态处理空格和既有播放快捷键。 */
   const handleKeyDown = (event: ReactKeyboardEvent<HTMLElement>): void => {
     const key = resolvePlayerShortcut(event);
     if (!key) return;
-    if (["space", "arrowleft", "arrowright", "arrowup", "arrowdown"].includes(key)) event.preventDefault();
+    if (["space", "arrowleft", "arrowright", "arrowup", "arrowdown", "escape"].includes(key)) {
+      event.preventDefault();
+    }
     if (key === "space") togglePlayback();
     if (key === "arrowleft") seekTo((snapshot?.positionSeconds ?? 0) - 10);
     if (key === "arrowright") seekTo((snapshot?.positionSeconds ?? 0) + 10);
@@ -445,6 +563,7 @@ function DesktopVlcControls({
     if (key === "arrowdown") setVolume(Math.max(0, (snapshot?.volume ?? 0.7) - 0.05));
     if (key === "m") toggleMute();
     if (key === "f") toggleFullscreen();
+    if (key === "escape" && effectiveFullscreen) toggleFullscreen();
     if (key === "l") setPlaylistOpen(true);
     if (key === "p" && previousItem) selectItemAfterFlush(previousItem);
     if (key === "n" && nextItem) selectItemAfterFlush(nextItem);
@@ -475,7 +594,11 @@ function DesktopVlcControls({
     else setRetryNonce((value) => value + 1);
   };
   const statusBadges = [
-    "libVLC",
+    snapshot?.backend === "mpv" ? "libmpv" : snapshot?.backend,
+    snapshot?.enhancementDiagnostics.pipeline !== "none"
+      ? snapshot?.enhancementDiagnostics.pipeline
+      : undefined,
+    snapshot?.enhancementDiagnostics.degradationReason ? "增强已降级" : undefined,
     session ? "原文件直放" : undefined,
     snapshot ? `${snapshot.subtitleTracks.length} 条字幕` : undefined,
     activeItem?.task.resolution?.toUpperCase()
@@ -496,12 +619,19 @@ function DesktopVlcControls({
       onPointerMove={revealToolbar}
       tabIndex={0}
     >
+      {fullscreenTransition && (
+        <div
+          key={fullscreenTransitionSequence}
+          aria-hidden="true"
+          className="player-fullscreen-transition"
+        />
+      )}
       <section className="player-video-stage" aria-label={`${animeTitle} ${episodeLabel} 视频播放器`}>
         {(loading || (activeItem && !session && !currentError)) && (
           <div className="absolute inset-0 z-10 flex items-center justify-center text-white">
             <div className="flex flex-col items-center gap-2 text-sm">
               <LoaderCircle className="animate-spin" aria-hidden="true" />
-              <span>正在准备 libVLC</span>
+              <span>正在准备原生播放器</span>
             </div>
           </div>
         )}
@@ -510,7 +640,7 @@ function DesktopVlcControls({
             message={currentError}
             onClose={() => closeAfterFlush(onClose)}
             onRetry={capabilities?.availability === "available" ? retry : undefined}
-            title={runtimeError ? "libVLC 无法启动" : loadError ? "播放器无法打开" : "播放失败"}
+            title={runtimeError ? "原生播放器无法启动" : loadError ? "播放器无法打开" : "播放失败"}
           />
         )}
         {autoNextSeconds !== undefined && nextItem && (
@@ -530,13 +660,16 @@ function DesktopVlcControls({
           currentTimeSeconds={snapshot?.positionSeconds ?? 0}
           durationSeconds={snapshot?.durationSeconds ?? session?.durationSeconds ?? 0}
           episodeLabel={episodeLabel}
-          fullscreen={snapshot?.fullscreen ?? false}
+          fullscreen={effectiveFullscreen}
           muted={snapshot?.muted ?? false}
           nativeWindowDrag={windowDrag.nativeWindowDrag}
           onActivity={revealToolbar}
           onChangeRate={setRate}
           onChangeSubtitle={changeSubtitle}
           onChangeSubtitleScale={changeSubtitleScale}
+          onChangeVideoEnhancement={changeVideoEnhancement}
+          onChangeFrameInterpolation={changeFrameInterpolation}
+          onChangeHdr={changeHdr}
           onClose={() => closeAfterFlush(onClose)}
           onGoNext={() => nextItem && selectItemAfterFlush(nextItem)}
           onGoPrevious={() => previousItem && selectItemAfterFlush(previousItem)}
@@ -557,6 +690,13 @@ function DesktopVlcControls({
           statusBadges={statusBadges}
           subtitleScale={subtitleScale}
           subtitleScaleAvailable={capabilities?.supportsSubtitleScale ?? false}
+          videoEnhancement={snapshot?.videoEnhancement ?? videoEnhancement}
+          videoEnhancementAvailable={capabilities?.supportsVideoEnhancement ?? false}
+          videoEnhancementDegraded={snapshot?.videoEnhancementDegraded ?? false}
+          frameInterpolation={snapshot?.frameInterpolation ?? "off"}
+          frameInterpolationAvailable={capabilities?.supportsFrameInterpolation ?? false}
+          hdr={snapshot?.hdr ?? "off"}
+          hdrAvailable={capabilities?.supportsHdr ?? false}
           subtitles={subtitleOptions}
           visible={toolbarVisible}
           volume={snapshot?.volume ?? 0.7}

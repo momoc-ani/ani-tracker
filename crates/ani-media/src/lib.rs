@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use sha1::{Digest, Sha1};
 use tokio::process::Command;
 
+pub mod model_sidecar;
 pub mod player;
 
 const DEFAULT_VIDEO_EXTENSIONS: &[&str] = &[".mkv", ".mp4", ".avi"];

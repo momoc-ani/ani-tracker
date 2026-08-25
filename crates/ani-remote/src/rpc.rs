@@ -284,14 +284,23 @@ fn validate_args(method: &str, args: Vec<Value>) -> Result<Vec<Value>, RemoteRpc
             Ok(args)
         }
         "searchAnimeCatalog" => {
-            let args = require_count(args, 1)?;
+            if !(1..=2).contains(&args.len()) {
+                return Err(invalid_args("新番搜索参数数量无效"));
+            }
             let keyword = args[0]
                 .as_str()
                 .map(str::trim)
                 .filter(|value| !value.is_empty() && value.chars().count() <= 120)
                 .filter(|value| !value.chars().any(char::is_control))
                 .ok_or_else(|| invalid_args("搜索关键词长度必须为 1-120 个字符"))?;
-            Ok(vec![Value::String(keyword.to_owned())])
+            if args.len() == 2 && !args[1].is_null() && !args[1].is_boolean() {
+                return Err(invalid_args("在线搜索开关必须是布尔值"));
+            }
+            let mut normalized = vec![Value::String(keyword.to_owned())];
+            if let Some(include_online) = args.get(1) {
+                normalized.push(include_online.clone());
+            }
+            Ok(normalized)
         }
         "browseBangumiAnime" => validate_domain_object::<ani_domain::BangumiBrowseQuery>(
             args,
@@ -514,19 +523,7 @@ fn validate_args(method: &str, args: Vec<Value>) -> Result<Vec<Value>, RemoteRpc
             validate_optional_text(object.get("name"), "任务名称", 300)?;
             validate_optional_bool(object.get("paused"), "暂停状态")
         }),
-        "addReleaseDownload" => validate_object_input(
-            args,
-            &[
-                "release",
-                "animeId",
-                "episodeId",
-                "episodeNo",
-                "fansubGroupId",
-                "paused",
-                "confirmUnknownSeason",
-            ],
-            validate_add_release_download,
-        ),
+        "addReleaseDownload" => validate_add_release_download_input(args),
         "setSourceEnabled" => {
             let args = require_count(args, 2)?;
             parse_id(&args[0], "下载源标识")?;
@@ -742,12 +739,38 @@ fn validate_binding_ids(object: &Map<String, Value>, keys: &[&str]) -> Result<()
     Ok(())
 }
 
-fn validate_add_release_download(object: &Map<String, Value>) -> Result<(), RemoteRpcError> {
+/// 校验并归一化资源下载输入，兼容带合法 info-hash 的历史标题型资源标识。
+fn validate_add_release_download_input(mut args: Vec<Value>) -> Result<Vec<Value>, RemoteRpcError> {
+    const ALLOWED_KEYS: &[&str] = &[
+        "release",
+        "animeId",
+        "episodeId",
+        "episodeNo",
+        "fansubGroupId",
+        "paused",
+        "confirmUnknownSeason",
+    ];
+    args = require_count(args, 1)?;
+    let object = args[0]
+        .as_object_mut()
+        .ok_or_else(|| invalid_args("远程参数格式无效"))?;
+    if object
+        .keys()
+        .any(|key| !ALLOWED_KEYS.contains(&key.as_str()))
+    {
+        return Err(invalid_args("远程参数包含未知字段"));
+    }
+    validate_add_release_download(object)?;
+    Ok(args)
+}
+
+/// 校验资源下载字段，并将旧版标题型 ID 规范化为来源加 info-hash。
+fn validate_add_release_download(object: &mut Map<String, Value>) -> Result<(), RemoteRpcError> {
     let release = object
-        .get("release")
-        .and_then(Value::as_object)
+        .get_mut("release")
+        .and_then(Value::as_object_mut)
         .ok_or_else(|| invalid_args("资源信息格式无效"))?;
-    parse_id(release.get("id").unwrap_or(&Value::Null), "资源标识")?;
+    normalize_legacy_release_id(release)?;
     let source = ["magnetUrl", "torrentUrl"]
         .iter()
         .filter_map(|key| release.get(*key))
@@ -763,6 +786,39 @@ fn validate_add_release_download(object: &Map<String, Value>) -> Result<(), Remo
     }
     validate_optional_bool(object.get("paused"), "暂停状态")?;
     validate_optional_bool(object.get("confirmUnknownSeason"), "季度确认状态")
+}
+
+/// 将带合法 info-hash 的历史标题型资源 ID转换为稳定 ASCII 标识。
+fn normalize_legacy_release_id(release: &mut Map<String, Value>) -> Result<(), RemoteRpcError> {
+    let id = release
+        .get("id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .ok_or_else(|| invalid_args("资源标识必须是字符串"))?;
+    if is_valid_identifier(id) {
+        return Ok(());
+    }
+
+    let source_id = release
+        .get("sourceId")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| is_valid_identifier(value));
+    let info_hash = release
+        .get("infoHash")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| value.len() == 40 && value.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .map(str::to_ascii_lowercase);
+    let Some((source_id, info_hash)) = source_id.zip(info_hash) else {
+        return Err(invalid_args("资源标识格式无效"));
+    };
+    let normalized = format!("{source_id}:{info_hash}");
+    if !is_valid_identifier(&normalized) {
+        return Err(invalid_args("资源标识格式无效"));
+    }
+    release.insert("id".to_owned(), Value::String(normalized));
+    Ok(())
 }
 
 fn validate_source(object: &Map<String, Value>) -> Result<(), RemoteRpcError> {
@@ -1084,15 +1140,19 @@ fn parse_id<'a>(value: &'a Value, label: &str) -> Result<&'a str, RemoteRpcError
         .as_str()
         .map(str::trim)
         .ok_or_else(|| invalid_args(format!("{label}必须是字符串")))?;
-    if value.is_empty()
-        || value.len() > 160
-        || !value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || b"._:-".contains(&byte))
-    {
+    if !is_valid_identifier(value) {
         return Err(invalid_args(format!("{label}格式无效")));
     }
     Ok(value)
+}
+
+/// 判断远程协议使用的 ASCII 标识是否满足长度和字符约束。
+fn is_valid_identifier(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 160
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"._:-".contains(&byte))
 }
 
 fn validate_year_month(args: Vec<Value>) -> Result<Vec<Value>, RemoteRpcError> {
@@ -1519,6 +1579,30 @@ mod tests {
         assert_eq!(invalid.code, "INVALID_ARGUMENTS");
     }
 
+    /// 验证新番搜索的在线来源开关可选且仅接受布尔值。
+    #[tokio::test]
+    async fn accepts_remote_catalog_search_online_flag() {
+        let service = RemoteRpcService::new(std::sync::Arc::new(EchoHandler));
+        let local_only = service
+            .dispatch(
+                json!({ "method": "searchAnimeCatalog", "args": ["测试番", false] }),
+                &["catalog.read".to_owned()],
+            )
+            .await
+            .expect("local-only catalog search");
+        assert_eq!(local_only["args"][0], "测试番");
+        assert_eq!(local_only["args"][1], false);
+
+        let invalid = service
+            .dispatch(
+                json!({ "method": "searchAnimeCatalog", "args": ["测试番", "false"] }),
+                &["catalog.read".to_owned()],
+            )
+            .await
+            .expect_err("non-boolean online search flag must fail");
+        assert_eq!(invalid.code, "INVALID_ARGUMENTS");
+    }
+
     /// 验证远程仅接受布尔类型的单条未知季度确认，不放宽其他下载参数。
     #[tokio::test]
     async fn accepts_remote_unknown_season_confirmation() {
@@ -1561,6 +1645,29 @@ mod tests {
             .await
             .expect_err("non-boolean confirmation must fail");
         assert_eq!(invalid.code, "INVALID_ARGUMENTS");
+    }
+
+    /// 验证历史标题型资源标识会基于来源和 info-hash 归一化。
+    #[test]
+    fn normalizes_legacy_release_title_id() {
+        let args = validate_args(
+            "addReleaseDownload",
+            vec![json!({
+                "release": {
+                    "id": "mikan:[字幕组] 测试番 - 19(91)",
+                    "sourceId": "mikan",
+                    "infoHash": "503F6CCE64F4261207BF4536EDB2F99BBB756D29",
+                    "torrentUrl": "https://mikanani.me/Download/20260822/503f6cce64f4261207bf4536edb2f99bbb756d29.torrent"
+                },
+                "episodeNo": 19
+            })],
+        )
+        .expect("legacy title ID should normalize");
+
+        assert_eq!(
+            args[0]["release"]["id"],
+            json!("mikan:503f6cce64f4261207bf4536edb2f99bbb756d29")
+        );
     }
 
     /// 验证远程可以保存下载目录、引擎和做种配置。

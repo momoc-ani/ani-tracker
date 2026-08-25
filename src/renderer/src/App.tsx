@@ -35,7 +35,6 @@ import { ReleaseSearchPage } from "@/features/release-search/ReleaseSearchPage";
 import { SettingsPage } from "@/features/settings/SettingsPage";
 import { PlayerDesignPreview } from "@/features/player/PlayerDesignPreview";
 import { DesktopPlayerPage } from "@/features/player/DesktopPlayerPage";
-import { DesktopVlcHostPage } from "@/features/player/DesktopVlcHostPage";
 import { SourcesPage } from "@/features/sources/SourcesPage";
 import { appApi, isTauriClient } from "@/lib/api";
 import {
@@ -47,10 +46,7 @@ import { toast } from "@/lib/toast";
 import type { DownloadServiceStatus, MobilePlatformStatus } from "@shared/contracts";
 import type { Anime } from "@shared/domain";
 import type { MyAnimePageIntent } from "@/features/my-anime/MyAnimePage";
-import {
-  isDesktopVlcHostView,
-  resolveDesktopPlayerWindowInput
-} from "@shared/desktop-player-route";
+import { resolveDesktopPlayerWindowInput } from "@shared/desktop-player-route";
 import {
   resolvePlaybackFileIndex,
   usesBuiltinPlayer,
@@ -201,9 +197,6 @@ function renderPage(page: PageId, options: RenderPageOptions) {
 
 /** 按当前窗口用途渲染主界面或独立播放器。 */
 export function App() {
-  if (isDesktopVlcHostView(window.location.search)) {
-    return <DesktopVlcHostPage />;
-  }
   const playerPreview = import.meta.env.DEV
     ? new URLSearchParams(window.location.search).get("playerPreview")
     : null;

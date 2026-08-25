@@ -1,0 +1,49 @@
+{
+  "schemaVersion": 1,
+  "runtime": "libmpv-glsl",
+  "resources": [
+    {
+      "file": "Anime4K_Clamp_Highlights.glsl",
+      "strategy": "legacy",
+      "sha256": "f3cdf83652328c04c09bb5bc41a733cfe03198c6be66e14b1bebe5c6a9523986",
+      "source": "Anime4K v4.0",
+      "license": "MIT"
+    },
+    {
+      "file": "Anime4K_Upscale_Original_x2.glsl",
+      "strategy": "legacy",
+      "sha256": "842feff5fc800c2eb2d504aaf7e864d232a86072cd88edf360e6e93127e0eedc",
+      "source": "Anime4K v3.2",
+      "license": "MIT"
+    },
+    {
+      "file": "FSRCNNX_x2_8-0-4-1.glsl",
+      "strategy": "fsrcnnx-fidelity",
+      "sha256": "c831d602e28b2bd880e3ffa61f80f9537ce88dcd4ea3ea6ce35a49f4607f969b",
+      "source": "https://github.com/deus0ww/mpv-conf/tree/master/shaders/igv",
+      "license": "LGPL-3.0-or-later"
+    },
+    {
+      "file": "ArtCNN_C4F16.glsl",
+      "strategy": "artcnn",
+      "sha256": "1706bddf4350643b34815c1baa72d26bfebd30e1f0473cf5352507c312757dfd",
+      "source": "https://github.com/Artoriuz/ArtCNN",
+      "license": "MIT"
+    },
+    {
+      "file": "ArtCNN_C4F32.glsl",
+      "strategy": "artcnn",
+      "sha256": "b4181db4baecab6669d69d3618f3ade554ffbba5210ba437fe947387e4acf487",
+      "source": "https://github.com/Artoriuz/ArtCNN",
+      "license": "MIT"
+    }
+  ],
+  "optionalNotBundled": [
+    {
+      "file": "Anime4K-Ultra.glsl",
+      "strategy": "anime4k-ultra",
+      "sha1": "a13bee632180bf0bdaac8025c0d61b4388f07013",
+      "source": "https://github.com/Chinna95P/mpv-anime-build"
+    }
+  ]
+}

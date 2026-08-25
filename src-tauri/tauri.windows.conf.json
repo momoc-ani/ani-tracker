@@ -9,10 +9,14 @@
       "../LICENSE": "licenses/ani-tracker-LICENSE.txt",
       "../NOTICE": "licenses/ani-tracker-NOTICE.txt",
       "../out/ffmpeg/win32-x64/": "ffmpeg/win32-x64/",
-      "../out/libvlc/win32-x64/": "libvlc/win32-x64/",
+      "../out/libmpv/win32-x64/": "libmpv/win32-x64/",
+      "../out/model-sidecar/win32-x64/": "model-sidecar/win32-x64/",
+      "../out/realesrgan-model-sidecar/win32-x64/": "realesrgan-model-sidecar/win32-x64/",
       "../out/qbittorrent/win32-x64/": "qbittorrent/win32-x64/",
       "../out/torrent-core/win32-x64/": "torrent-core/win32-x64/",
-      "../resources/licenses/vlc/": "licenses/vlc/"
+      "../resources/models/": "models/",
+      "../resources/licenses/mpv/": "licenses/mpv/",
+      "../resources/shaders/anime4k/": "shaders/anime4k/"
     }
   }
 }

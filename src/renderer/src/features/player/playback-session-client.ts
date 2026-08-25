@@ -1,14 +1,30 @@
-import type { RemotePlaybackRequestMode, RemotePlaybackSession } from "@shared/contracts";
+import type {
+  RemoteDirectEnhancementReport,
+  RemotePlaybackEnhancement,
+  RemotePlaybackRequestMode,
+  RemotePlaybackSession
+} from "@shared/contracts";
 import { appApi } from "@/lib/api";
 
 export interface PlaybackSessionClient {
-  create(taskId: string, mode: RemotePlaybackRequestMode, fileIndex?: number): Promise<RemotePlaybackSession>;
+  create(
+    taskId: string,
+    mode: RemotePlaybackRequestMode,
+    fileIndex: number | undefined,
+    enhancement: RemotePlaybackEnhancement,
+    startPositionSeconds?: number
+  ): Promise<RemotePlaybackSession>;
+  refresh?(sessionId: string): Promise<RemotePlaybackSession>;
+  reportDirectEnhancement?(
+    sessionId: string,
+    diagnostics: RemoteDirectEnhancementReport
+  ): Promise<RemotePlaybackSession>;
   close(sessionId: string): Promise<void>;
 }
 
 /** 使用本地 AppClient 创建受控播放器会话。 */
 export const desktopPlaybackSessionClient: PlaybackSessionClient = {
-  create: (taskId, _mode, fileIndex) => appApi.createDesktopPlaybackSession({
+  create: (taskId, _mode, fileIndex, _enhancement, _startPositionSeconds) => appApi.createDesktopPlaybackSession({
     taskId,
     ...(fileIndex === undefined ? {} : { fileIndex })
   }),

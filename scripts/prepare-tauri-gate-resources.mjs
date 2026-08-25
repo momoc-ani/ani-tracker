@@ -25,15 +25,30 @@ export function compileOnlyResourceDirectories(platform, arch) {
   if (platform === "win32") {
     return [
       `out/ffmpeg/${target}`,
+      `out/libmpv/${target}`,
+      `out/model-sidecar/${target}`,
+      `out/realesrgan-model-sidecar/${target}`,
       `out/qbittorrent/${target}`,
       `out/torrent-core/${target}`
     ];
   }
   if (platform === "darwin") {
-    return ["out/ffmpeg", "out/qbittorrent", "out/torrent-core"];
+    return [
+      "out/ffmpeg",
+      "out/libmpv",
+      "out/model-sidecar",
+      "out/realesrgan-model-sidecar",
+      "out/qbittorrent",
+      "out/torrent-core"
+    ];
   }
   if (platform === "linux") {
-    return [`out/qbittorrent/${target}`, `out/torrent-core/${target}`];
+    return [
+      `out/model-sidecar/${target}`,
+      `out/realesrgan-model-sidecar/${target}`,
+      `out/qbittorrent/${target}`,
+      `out/torrent-core/${target}`
+    ];
   }
   throw new Error(`[tauri-gate] unsupported target: ${target}`);
 }

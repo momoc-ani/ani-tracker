@@ -42,6 +42,18 @@
       "sessionId": "session-contract-1",
       "subtitleScale": 150
     },
+    "frameInterpolationCommand": {
+      "type": "set-frame-interpolation",
+      "commandId": "command-contract-4",
+      "sessionId": "session-contract-1",
+      "frameInterpolation": "rife-realtime"
+    },
+    "hdrCommand": {
+      "type": "set-hdr",
+      "commandId": "command-contract-5",
+      "sessionId": "session-contract-1",
+      "hdr": "auto"
+    },
     "androidCapabilities": {
       "backend": "libvlc",
       "platform": "android",
@@ -53,13 +65,16 @@
       "supportsAudioTracks": true,
       "supportsSubtitleTracks": true,
       "supportsSubtitleScale": true,
+      "supportsVideoEnhancement": false,
+      "supportsFrameInterpolation": false,
+      "supportsModelEnhancement": false,
       "supportsAspectRatio": true,
       "supportsFullscreen": true,
       "supportsPictureInPicture": false,
       "supportsPlaylistNavigation": true,
       "supportsDirectPlayback": true,
       "supportsTranscodingFallback": false,
-      "supportsHdr": true
+      "supportsHdr": false
     },
     "iosCapabilities": {
       "backend": "libvlc",
@@ -72,13 +87,16 @@
       "supportsAudioTracks": true,
       "supportsSubtitleTracks": true,
       "supportsSubtitleScale": true,
+      "supportsVideoEnhancement": false,
+      "supportsFrameInterpolation": false,
+      "supportsModelEnhancement": false,
       "supportsAspectRatio": true,
       "supportsFullscreen": true,
       "supportsPictureInPicture": false,
       "supportsPlaylistNavigation": true,
       "supportsDirectPlayback": true,
       "supportsTranscodingFallback": false,
-      "supportsHdr": true
+      "supportsHdr": false
     },
     "playbackSession": {
       "id": "session-contract-1",
@@ -90,7 +108,14 @@
       "expiresAt": "2026-07-25T13:00:00.000Z",
       "durationSeconds": 1440,
       "startPositionSeconds": 42.5,
-      "subtitles": []
+      "subtitles": [],
+      "diagnostics": {
+        "encoderDegraded": false,
+        "subtitleMode": "soft",
+        "enhancedFrameInput": false,
+        "videoEnhancement": "off",
+        "frameInterpolation": "off"
+      }
     }
   }
 }

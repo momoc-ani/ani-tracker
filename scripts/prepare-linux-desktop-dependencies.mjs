@@ -12,6 +12,7 @@ const REQUIRED_PACKAGES = Object.freeze([
   "gnome-keyring",
   "libayatana-appindicator3-dev",
   "libboost-system-dev",
+  "libmpv1",
   "librsvg2-dev",
   "libssl-dev",
   "libwebkit2gtk-4.1-dev",
@@ -21,7 +22,6 @@ const REQUIRED_PACKAGES = Object.freeze([
   "patchelf",
   "pax-utils",
   "pkg-config",
-  "vlc",
   "wget"
 ]);
 

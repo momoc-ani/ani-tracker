@@ -68,6 +68,11 @@ static_regex!(
     r"(?i)(?:^|[\s_-])s\d{1,2}e(\d{1,3}(?:\.\d)?)"
 );
 static_regex!(episode_bracket, r"\[\s*(\d{1,3}(?:\.\d)?)\s*\]");
+// 匹配“本季集数（全系列集数）”格式，例如 `- 19(91)`。
+static_regex!(
+    episode_hyphen_with_total,
+    r"(?i)-\s*(\d{1,3}(?:\.\d)?)\s*[\(（]\s*\d{1,4}(?:\.\d+)?\s*[\)）](?:\s|\[|【|$)"
+);
 static_regex!(
     episode_hyphen,
     r"(?i)-\s*(\d{1,3}(?:\.\d)?)\s*(?:v\d)?(?:\s|\[|$)"
@@ -732,6 +737,7 @@ fn detect_episode_no(title: &str) -> Option<f64> {
     [
         episode_season(),
         episode_bracket(),
+        episode_hyphen_with_total(),
         episode_hyphen(),
         episode_chinese(),
         episode_latin(),
@@ -1256,6 +1262,19 @@ mod tests {
             vec![SubtitleLanguage::Chs, SubtitleLanguage::Cht]
         );
         assert_eq!(parsed.subtitle, Some(SubtitlePreference::Multi));
+    }
+
+    /// 验证“本季集数（全系列集数）”格式优先解析本季集数且不破坏旧规则。
+    #[test]
+    fn parses_episode_with_overall_episode_number() {
+        let parsed = parse_release_title(
+            "[豌豆字幕组&LoliHouse] 关于我转生变成史莱姆这档事 第四季 - 19(91) [WebRip 1080p HEVC-10bit AAC]",
+            &[],
+        );
+
+        assert_eq!(parsed.episode_no, Some(19.0));
+        assert_eq!(parsed.series_season_no, Some(4));
+        assert_eq!(parsed.content_kind, ReleaseContentKind::Episode);
     }
 
     /// 验证 NIX-RAWS 的“简繁内封”会明确识别为简体与繁体字幕。

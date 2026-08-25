@@ -51,7 +51,15 @@
           "url": "/api/media/sessions/0123456789abcdef0123456789abcdef/subtitles/subtitle-1.ass",
           "default": true
         }
-      ]
+      ],
+      "diagnostics": {
+        "encoder": "libx264",
+        "encoderDegraded": true,
+        "subtitleMode": "soft",
+        "enhancedFrameInput": false,
+        "videoEnhancement": "off",
+        "frameInterpolation": "off"
+      }
     }
   }
 }

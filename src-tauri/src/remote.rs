@@ -472,9 +472,11 @@ impl RemoteRpcHandler for TauriRemoteRpcHandler {
             }
             "searchAnimeCatalog" => {
                 let keyword = string_arg(&args, 0)?;
+                let include_online = args.get(1).and_then(Value::as_bool);
                 command_value(
                     crate::commands::data::search_anime_catalog(
                         keyword,
+                        include_online,
                         self.app.state(),
                         self.app.state(),
                     )
@@ -658,27 +660,16 @@ impl RemoteRpcHandler for TauriRemoteRpcHandler {
                     .downloads
                     .default_engine(&settings)
                     .map_err(|error| error.to_string())?;
-                if engine == ani_domain::TorrentEngineKind::Qbittorrent {
-                    let managed = self.downloads.managed_qbittorrent_status().await?;
-                    if managed.enabled && !managed.running {
-                        log::debug!(
-                            "Rust 远程下载刷新跳过：托管 qBittorrent 未运行，返回持久化快照"
-                        );
-                        return serde_json::to_value(
-                            self.downloads
-                                .service()
-                                .list_for_engine(&engine)
-                                .map_err(|error| error.to_string())?,
-                        )
-                        .map_err(|error| error.to_string());
-                    }
-                }
+                log::debug!("Rust 远程刷新下载任务 engine={engine:?}");
                 let result = self
                     .downloads
                     .service()
                     .refresh(engine)
                     .await
-                    .map_err(|error| error.to_string())?;
+                    .map_err(|error| {
+                        log::error!("Rust 远程刷新下载任务失败 error={error}");
+                        error.to_string()
+                    })?;
                 serde_json::to_value(result.tasks).map_err(|error| error.to_string())
             }
             "pauseDownload" => {

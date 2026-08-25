@@ -5,6 +5,7 @@ on:
   push:
     branches:
       - master
+      - develop
       - master_android
       - Tauri_迁移
     paths:
@@ -19,20 +20,27 @@ on:
       - "package.json"
       - "pnpm-lock.yaml"
       - "rust-toolchain.toml"
-      - "scripts/libvlc-macos-relocation.mjs"
-      - "scripts/libvlc-macos-relocation.test.mjs"
-      - "scripts/download-libvlc-archive.mjs"
-      - "scripts/download-libvlc-archive.test.mjs"
-      - "scripts/libvlc-resource-manifest.mjs"
-      - "scripts/prepare-libvlc-resources.mjs"
       - "scripts/prepare-linux-desktop-dependencies.mjs"
-      - "scripts/prepare-linux-libvlc-dev.mjs"
-      - "scripts/prepare-mac-libvlc-dev.mjs"
+      - "scripts/prepare-macos-libmpv-dev.mjs"
+      - "scripts/prepare-macos-libmpv-dev.test.mjs"
       - "scripts/prepare-qbittorrent-resources.mjs"
       - "scripts/prepare-qbittorrent-resources.test.mjs"
+      - "scripts/prepare-rife-model-sidecar.mjs"
+      - "scripts/prepare-rife-model-sidecar.test.mjs"
+      - "scripts/prepare-realesrgan-model-sidecar.mjs"
+      - "scripts/prepare-realesrgan-model-sidecar.test.mjs"
       - "scripts/prepare-tauri-gate-resources.mjs"
       - "scripts/prepare-tauri-gate-resources.test.mjs"
-      - "scripts/prepare-windows-libvlc-dev.mjs"
+      - "scripts/prepare-windows-libmpv-dev.mjs"
+      - "scripts/prepare-windows-libmpv-dev.test.mjs"
+      - "scripts/verify-desktop-libmpv-runtime.mjs"
+      - "scripts/verify-desktop-libmpv-runtime.test.mjs"
+      - "scripts/verify-tauri-desktop-workflow.test.mjs"
+      - "native/rife-model-sidecar/**"
+      - "native/realesrgan-model-sidecar/**"
+      - "scripts/player-enhancement-matrix.mjs"
+      - "scripts/player-enhancement-matrix.test.mjs"
+      - "resources/shaders/**"
       - "scripts/verify-tauri-mobile-package.mjs"
       - "scripts/verify-tauri-mobile-package.test.mjs"
       - "vite.remote.config.ts"
@@ -50,20 +58,25 @@ on:
       - "package.json"
       - "pnpm-lock.yaml"
       - "rust-toolchain.toml"
-      - "scripts/libvlc-macos-relocation.mjs"
-      - "scripts/libvlc-macos-relocation.test.mjs"
-      - "scripts/download-libvlc-archive.mjs"
-      - "scripts/download-libvlc-archive.test.mjs"
-      - "scripts/libvlc-resource-manifest.mjs"
-      - "scripts/prepare-libvlc-resources.mjs"
       - "scripts/prepare-linux-desktop-dependencies.mjs"
-      - "scripts/prepare-linux-libvlc-dev.mjs"
-      - "scripts/prepare-mac-libvlc-dev.mjs"
+      - "scripts/prepare-macos-libmpv-dev.mjs"
+      - "scripts/prepare-macos-libmpv-dev.test.mjs"
       - "scripts/prepare-qbittorrent-resources.mjs"
       - "scripts/prepare-qbittorrent-resources.test.mjs"
+      - "scripts/prepare-rife-model-sidecar.mjs"
+      - "scripts/prepare-rife-model-sidecar.test.mjs"
+      - "scripts/prepare-realesrgan-model-sidecar.mjs"
+      - "scripts/prepare-realesrgan-model-sidecar.test.mjs"
       - "scripts/prepare-tauri-gate-resources.mjs"
       - "scripts/prepare-tauri-gate-resources.test.mjs"
-      - "scripts/prepare-windows-libvlc-dev.mjs"
+      - "scripts/prepare-windows-libmpv-dev.mjs"
+      - "scripts/prepare-windows-libmpv-dev.test.mjs"
+      - "scripts/verify-desktop-libmpv-runtime.mjs"
+      - "scripts/verify-desktop-libmpv-runtime.test.mjs"
+      - "scripts/verify-tauri-desktop-workflow.test.mjs"
+      - "native/rife-model-sidecar/**"
+      - "native/realesrgan-model-sidecar/**"
+      - "resources/shaders/**"
       - "scripts/verify-tauri-mobile-package.mjs"
       - "scripts/verify-tauri-mobile-package.test.mjs"
       - "vite.remote.config.ts"
@@ -140,13 +153,13 @@ jobs:
             curl \
             file \
             libayatana-appindicator3-dev \
+            libmpv1 \
             librsvg2-dev \
             libssl-dev \
             libwebkit2gtk-4.1-dev \
             libxdo-dev \
             patchelf \
             pax-utils \
-            vlc \
             wget
 
       - name: Install JavaScript dependencies
@@ -154,17 +167,13 @@ jobs:
           corepack enable
           pnpm install --frozen-lockfile --ignore-scripts
 
-      - name: Prepare Windows Tauri libVLC runtime
+      - name: Prepare Windows Tauri libmpv runtime
         if: runner.os == 'Windows'
-        run: pnpm run prepare:tauri:win-libvlc -- --arch "${{ matrix.arch }}"
+        run: pnpm run prepare:tauri:win-libmpv -- --arch "${{ matrix.arch }}"
 
-      - name: Prepare macOS Tauri libVLC runtime
+      - name: Prepare macOS Tauri libmpv runtime
         if: runner.os == 'macOS'
-        run: pnpm run prepare:tauri:mac-libvlc -- --arch "${{ matrix.arch }}"
-
-      - name: Prepare Linux Tauri libVLC runtime
-        if: runner.os == 'Linux'
-        run: pnpm run prepare:tauri:linux-libvlc -- --arch "${{ matrix.arch }}"
+        run: pnpm run prepare:tauri:mac-libmpv -- --arch "${{ matrix.arch }}" --pinned
 
       - name: Prepare compile-only Tauri resources
         shell: bash
@@ -173,10 +182,12 @@ jobs:
           node scripts/prepare-tauri-gate-resources.mjs \
             --platform "${{ matrix.platform }}" --arch "${{ matrix.arch }}"
 
-      - name: Check TypeScript contracts, Renderer and libVLC scripts
+      - name: Check TypeScript contracts, Renderer and desktop runtime scripts
         run: |
           pnpm run typecheck
+          pnpm run verify:pc-enhancement-resources
           pnpm run test:desktop-gates
+          pnpm run test:player-matrix
 
       - name: Check Rust formatting
         run: cargo fmt --all -- --check
@@ -190,5 +201,5 @@ jobs:
       - name: Build Tauri desktop host
         run: pnpm exec tauri build --no-bundle --ci --config src-tauri/tauri.remote.conf.json
 
-      - name: Verify staged libVLC runtime
-        run: pnpm run verify:libvlc
+      - name: Verify desktop libmpv runtime
+        run: pnpm run verify:libmpv -- --platform "${{ matrix.platform }}" --arch "${{ matrix.arch }}" --require-pinned

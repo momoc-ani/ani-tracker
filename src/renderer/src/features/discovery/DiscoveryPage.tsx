@@ -69,6 +69,7 @@ import {
   SheetTitle
 } from "@/components/ui/sheet";
 import { Slider } from "@/components/ui/slider";
+import { Switch } from "@/components/ui/switch";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
@@ -147,6 +148,7 @@ export function DiscoveryPage({
   const [selectedMonth, setSelectedMonth] = useState<number | null>(null);
   const [keyword, setKeyword] = useState("");
   const [appliedKeyword, setAppliedKeyword] = useState("");
+  const [onlineSearchEnabled, setOnlineSearchEnabled] = useState(false);
   const [sortKey, setSortKey] = useState<DiscoverySortKey>(DEFAULT_DISCOVERY_SORT);
   const [items, setItems] = useState<Anime[]>([]);
   const [searchItems, setSearchItems] = useState<Anime[]>([]);
@@ -360,9 +362,10 @@ export function DiscoveryPage({
     }
   }
 
-  /** 搜索本地全量缓存与在线元数据来源。 */
-  async function searchCatalog() {
+  /** 搜索本地目录，并按需查询在线元数据来源。 */
+  async function searchCatalog(options: { includeOnline?: boolean } = {}) {
     const normalizedKeyword = keyword.trim();
+    const includeOnline = options.includeOnline ?? onlineSearchEnabled;
     if (!normalizedKeyword) {
       searchRequestId.current += 1;
       setAppliedKeyword("");
@@ -376,10 +379,13 @@ export function DiscoveryPage({
     setSearchItems([]);
     setSearching(true);
     setMessage(null);
-    console.info("[discovery] searching local and online catalog", { keyword: normalizedKeyword });
+    console.info("[discovery] searching anime catalog", {
+      keyword: normalizedKeyword,
+      includeOnline
+    });
 
     try {
-      const result = await appApi.searchAnimeCatalog(normalizedKeyword);
+      const result = await appApi.searchAnimeCatalog(normalizedKeyword, includeOnline);
       if (requestId !== searchRequestId.current) return;
       setSearchItems(result.items);
       setMessage(result.errors.length ? {
@@ -567,14 +573,28 @@ export function DiscoveryPage({
                 />
                 <InputGroupAddon>
                   <InputGroupButton aria-label="搜索新番" disabled={searching} title="搜索" type="submit">
-                    <Search />
+                    {searching ? <LoaderCircle className="animate-spin" /> : <Search />}
                   </InputGroupButton>
                 </InputGroupAddon>
               </InputGroup>
             </Field>
           </form>
 
-          <div className="flex min-w-0 gap-2 sm:w-auto">
+          <div className="flex min-w-0 flex-wrap gap-2 sm:w-auto sm:flex-nowrap">
+            <div className="flex min-h-9 shrink-0 items-center justify-between gap-2 rounded-md border border-border/70 px-3 text-sm sm:justify-start">
+              <span id="discovery-online-search-label">在线搜索</span>
+              <Switch
+                aria-labelledby="discovery-online-search-label"
+                checked={onlineSearchEnabled}
+                disabled={searching}
+                onCheckedChange={(checked) => {
+                  setOnlineSearchEnabled(checked);
+                  if (appliedKeyword) {
+                    void searchCatalog({ includeOnline: checked });
+                  }
+                }}
+              />
+            </div>
             <Field className="min-w-0 flex-1 sm:w-[9.375rem] sm:flex-none">
               <FieldLabel className="sr-only" htmlFor="discovery-sort">排序方式</FieldLabel>
               <Select value={sortKey} onValueChange={(value) => setSortKey(value as DiscoverySortKey)}>
@@ -606,7 +626,10 @@ export function DiscoveryPage({
       </FilterToolbar>
 
       {visibleLoading ? (
-        <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5" aria-label="正在加载季度新番目录">
+        <div
+          aria-label={appliedKeyword ? "正在搜索新番" : "正在加载季度新番目录"}
+          className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5"
+        >
           {Array.from({ length: 10 }, (_, index) => (
             <div className="flex min-w-0 flex-col gap-3" key={index}>
               <Skeleton className="aspect-[2/3] w-full rounded-lg" />
@@ -679,7 +702,7 @@ export function DiscoveryPage({
 
   if (workspaceTabs) {
     return (
-      <Page className="gap-0">
+      <Page aria-busy={visibleLoading} className="gap-0">
         <header>
           <Breadcrumb className="pt-1">
             <BreadcrumbList className="gap-1.5 text-sm">
@@ -731,7 +754,7 @@ export function DiscoveryPage({
   }
 
   return (
-    <Page>
+    <Page aria-busy={visibleLoading}>
       <PageHeader>
         <PageHeading description="按季度浏览新番目录，并查看作品信息。" title="新番发现" />
         <PageActions className={cn("grid grid-cols-1", allowCollection && "sm:grid-cols-2")}>
@@ -1463,7 +1486,11 @@ function DiscoveryBrowsePanel({
   const appliedBadges = buildBrowseFilterBadges(filters);
 
   return (
-    <section className={cn("min-w-0 flex-col", hidden ? "hidden" : "flex")} hidden={hidden}>
+    <section
+      aria-busy={loading}
+      className={cn("min-w-0 flex-col", hidden ? "hidden" : "flex")}
+      hidden={hidden}
+    >
       <div
         className="mt-4 flex h-auto min-w-0 flex-col gap-2 border-y py-2 sm:h-[88px] sm:justify-between sm:gap-0"
         data-testid="discovery-browse-toolbar"

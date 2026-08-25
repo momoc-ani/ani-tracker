@@ -1,9 +1,12 @@
 import type {
   ImageCacheResolveResult,
+  RemoteDirectEnhancementReport,
+  RemotePlaybackEnhancement,
   RemotePlaybackRequestMode,
   RemotePlaybackSession
 } from "@shared/contracts";
 import type { AppClient } from "@shared/app-client";
+import { buildRemoteMediaSessionRequest } from "@shared/remote-media-session-request";
 import { createRemoteClient } from "@/lib/clients/remote-client";
 
 interface RemoteRpcResponse {
@@ -123,18 +126,39 @@ async function resolveCachedImageUrlOnce(sourceUrl: string): Promise<string> {
 export async function createRemotePlaybackSession(
   taskId: string,
   mode: RemotePlaybackRequestMode,
-  fileIndex?: number
+  fileIndex: number | undefined,
+  enhancement: RemotePlaybackEnhancement,
+  startPositionSeconds?: number
 ): Promise<RemotePlaybackSession> {
-  return createRemoteMediaSession("/api/media/sessions", taskId, mode, fileIndex);
+  return createRemoteMediaSession(
+    "/api/media/sessions",
+    taskId,
+    mode,
+    fileIndex,
+    enhancement,
+    startPositionSeconds
+  );
 }
 
 /** 为 PotPlayer 或 IINA 创建无需 Cookie 的短期拉流会话。 */
 export async function createRemoteExternalPlaybackSession(
   taskId: string,
   mode: RemotePlaybackRequestMode,
-  fileIndex?: number
+  fileIndex: number | undefined,
+  enhancement: RemotePlaybackEnhancement,
+  startPositionSeconds?: number,
+  subtitleId?: string
 ): Promise<RemotePlaybackSession> {
-  return createRemoteMediaSession("/api/media/external-sessions", taskId, mode, fileIndex);
+  return createRemoteMediaSession(
+    "/api/media/external-sessions",
+    taskId,
+    mode,
+    fileIndex,
+    enhancement,
+    startPositionSeconds,
+    subtitleId ? "burned" : undefined,
+    subtitleId
+  );
 }
 
 /** 调用指定媒体入口创建远程播放会话。 */
@@ -142,7 +166,11 @@ async function createRemoteMediaSession(
   endpoint: "/api/media/sessions" | "/api/media/external-sessions",
   taskId: string,
   mode: RemotePlaybackRequestMode,
-  fileIndex?: number
+  fileIndex: number | undefined,
+  enhancement: RemotePlaybackEnhancement,
+  startPositionSeconds?: number,
+  subtitleMode?: "soft" | "burned" | "off",
+  subtitleId?: string
 ): Promise<RemotePlaybackSession> {
   const baseUrl = getRemoteBaseUrl();
   const accessToken = window.localStorage.getItem(REMOTE_TOKEN_STORAGE_KEY);
@@ -154,7 +182,15 @@ async function createRemoteMediaSession(
       "Content-Type": "application/json",
       Authorization: `Bearer ${accessToken}`
     },
-    body: JSON.stringify({ taskId, mode, ...(fileIndex === undefined ? {} : { fileIndex }) })
+    body: JSON.stringify(buildRemoteMediaSessionRequest({
+      taskId,
+      mode,
+      enhancement,
+      fileIndex,
+      startPositionSeconds,
+      subtitleMode,
+      subtitleId
+    }))
   });
   const payload = (await response.json().catch(() => ({}))) as RemotePlaybackSession & { error?: string };
   if (!response.ok || !payload.id) {
@@ -171,12 +207,58 @@ export async function closeRemotePlaybackSession(sessionId: string): Promise<voi
   if (!accessToken) return;
   const response = await fetch(`${baseUrl}/api/media/sessions/${encodeURIComponent(sessionId)}`, {
     method: "DELETE",
+    keepalive: true,
     credentials: "same-origin",
     headers: { Authorization: `Bearer ${accessToken}` }
   });
   if (!response.ok && response.status !== 404) {
     console.warn("[remote] 播放会话关闭失败", { sessionId, status: response.status });
   }
+}
+
+/** 读取远程播放会话的最新实际编码和模型降级状态。 */
+export async function getRemotePlaybackSession(sessionId: string): Promise<RemotePlaybackSession> {
+  const baseUrl = getRemoteBaseUrl();
+  const accessToken = window.localStorage.getItem(REMOTE_TOKEN_STORAGE_KEY);
+  if (!accessToken) throw new Error("当前设备尚未完成远程配对");
+  const response = await fetch(`${baseUrl}/api/media/sessions/${encodeURIComponent(sessionId)}`, {
+    credentials: "same-origin",
+    headers: { Authorization: `Bearer ${accessToken}` }
+  });
+  const payload = (await response.json().catch(() => ({}))) as RemotePlaybackSession & { error?: string };
+  if (!response.ok || !payload.id) {
+    if (response.status === 401) clearRemoteDeviceToken();
+    throw new Error(payload.error ?? `播放会话状态读取失败：${response.status}`);
+  }
+  return payload;
+}
+
+/** 将终端 WebCodecs/WebGPU 实际运行状态写回设备绑定的播放会话。 */
+export async function reportRemoteDirectEnhancementDiagnostics(
+  sessionId: string,
+  diagnostics: RemoteDirectEnhancementReport
+): Promise<RemotePlaybackSession> {
+  const baseUrl = getRemoteBaseUrl();
+  const accessToken = window.localStorage.getItem(REMOTE_TOKEN_STORAGE_KEY);
+  if (!accessToken) throw new Error("当前设备尚未完成远程配对");
+  const response = await fetch(
+    `${baseUrl}/api/media/sessions/${encodeURIComponent(sessionId)}/diagnostics`,
+    {
+      method: "PUT",
+      credentials: "same-origin",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${accessToken}`
+      },
+      body: JSON.stringify(diagnostics)
+    }
+  );
+  const payload = (await response.json().catch(() => ({}))) as RemotePlaybackSession & { error?: string };
+  if (!response.ok || !payload.id) {
+    if (response.status === 401) clearRemoteDeviceToken();
+    throw new Error(payload.error ?? `终端增强诊断上报失败：${response.status}`);
+  }
+  return payload;
 }
 
 /** 调用桌面端暴露的远程 RPC，并统一处理协议错误。 */

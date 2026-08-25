@@ -4,21 +4,82 @@ import { readFile } from "node:fs/promises";
 import test from "node:test";
 
 const workflow = await readFile(".github/workflows/tauri-release-desktop.yml", "utf8");
+const desktopWorkflow = await readFile(".github/workflows/tauri-desktop.yml", "utf8");
 const torrentCorePrepare = await readFile("scripts/prepare-desktop-torrent-core-dev.mjs", "utf8");
 const qbittorrentUnixBuild = await readFile("scripts/build-qbittorrent-nox-unix.sh", "utf8");
 const windowsSigningImport = await readFile("scripts/import-windows-signing-certificate.ps1", "utf8");
 const windowsSignatureVerification = await readFile("scripts/verify-windows-self-signature.ps1", "utf8");
+const windowsConfig = JSON.parse(await readFile("src-tauri/tauri.windows.conf.json", "utf8"));
+const macosConfig = JSON.parse(await readFile("src-tauri/tauri.macos.conf.json", "utf8"));
+const linuxConfig = JSON.parse(await readFile("src-tauri/tauri.linux.conf.json", "utf8"));
 
-test("桌面原生依赖按平台使用独立步骤和工具链", () => {
-  assert.match(workflow, /name: Prepare Windows libVLC[\s\S]*?if: matrix\.platform == 'win32'[\s\S]*?shell: pwsh/);
-  assert.match(workflow, /name: Prepare macOS libVLC[\s\S]*?if: matrix\.platform == 'darwin'[\s\S]*?shell: bash/);
-  assert.match(workflow, /name: Prepare Linux libVLC[\s\S]*?if: matrix\.platform == 'linux'[\s\S]*?shell: bash/);
+test("桌面原生依赖统一使用 libmpv 且不再准备 VLC", () => {
+  assert.match(workflow, /name: Prepare Windows libmpv[\s\S]*?if: matrix\.platform == 'win32'[\s\S]*?shell: pwsh/);
+  assert.match(workflow, /pnpm run prepare:tauri:win-libmpv/);
+  assert.match(desktopWorkflow, /name: Prepare Windows Tauri libmpv runtime[\s\S]*?pnpm run prepare:tauri:win-libmpv/);
+  assert.match(desktopWorkflow, /Install Linux Tauri dependencies[\s\S]*?libmpv1/);
+  assert.match(workflow, /Install Linux desktop dependencies[\s\S]*?libmpv1/);
+  assert.match(workflow, /name: Prepare macOS libmpv[\s\S]*?if: matrix\.platform == 'darwin'[\s\S]*?--pinned/);
+  assert.match(desktopWorkflow, /name: Prepare macOS Tauri libmpv runtime[\s\S]*?--pinned/);
+  assert.match(workflow, /name: Verify desktop libmpv runtime[\s\S]*?--require-pinned/);
+  assert.match(desktopWorkflow, /name: Verify desktop libmpv runtime[\s\S]*?--require-pinned/);
+  assert.doesNotMatch(workflow, /prepare:tauri:.*libvlc|\bvlc\b/i);
+  assert.doesNotMatch(desktopWorkflow, /prepare:tauri:.*libvlc|\bvlc\b/i);
+  assert.equal(windowsConfig.bundle.resources["../out/libmpv/win32-x64/"], "libmpv/win32-x64/");
+  assert.equal(macosConfig.bundle.resources["../out/libmpv/"], "libmpv/");
+  assert.equal(linuxConfig.bundle.linux.deb.depends.includes("libmpv1"), true);
+  assert.equal(linuxConfig.bundle.linux.deb.depends.some((value) => /vlc/i.test(value)), false);
   assert.match(workflow, /name: Build Windows torrent-core[\s\S]*?shell: pwsh/);
   assert.match(workflow, /name: Build macOS torrent-core[\s\S]*?shell: bash/);
   assert.match(workflow, /name: Build Linux torrent-core[\s\S]*?shell: bash/);
   assert.match(workflow, /name: Build Windows managed qBittorrent[\s\S]*?shell: pwsh/);
   assert.match(workflow, /name: Build macOS managed qBittorrent[\s\S]*?shell: bash/);
   assert.match(workflow, /name: Build Linux managed qBittorrent[\s\S]*?shell: bash/);
+});
+
+test("RIFE sidecar 使用固定 Vulkan SDK 构建校验后再进入三平台安装包", () => {
+  const prepareIndex = workflow.indexOf("name: Build and verify RIFE model sidecar");
+  const windowsBuildIndex = workflow.indexOf("name: Build signed Windows installers");
+  const macosBuildIndex = workflow.indexOf("name: Build self-signed macOS app");
+  const linuxBuildIndex = workflow.indexOf("name: Build Linux bundles");
+  assert.match(workflow, /name: Install pinned Vulkan SDK[\s\S]*?vulkan-query-version: 1\.3\.296\.0/);
+  assert.match(workflow, /pnpm run prepare:rife-sidecar[\s\S]*?pnpm run verify:rife-sidecar/);
+  assert.ok(prepareIndex >= 0 && prepareIndex < windowsBuildIndex);
+  assert.ok(prepareIndex < macosBuildIndex && prepareIndex < linuxBuildIndex);
+  assert.equal(
+    windowsConfig.bundle.resources["../out/model-sidecar/win32-x64/"],
+    "model-sidecar/win32-x64/"
+  );
+  assert.equal(macosConfig.bundle.resources["../out/model-sidecar/"], "model-sidecar/");
+  assert.equal(
+    linuxConfig.bundle.resources["../out/model-sidecar/linux-x64/"],
+    "model-sidecar/linux-x64/"
+  );
+});
+
+test("Real-ESRGAN sidecar 使用独立资源目录并在三平台打包前校验", () => {
+  const prepareIndex = workflow.indexOf("name: Build and verify Real-ESRGAN model sidecar");
+  const windowsBuildIndex = workflow.indexOf("name: Build signed Windows installers");
+  const macosBuildIndex = workflow.indexOf("name: Build self-signed macOS app");
+  const linuxBuildIndex = workflow.indexOf("name: Build Linux bundles");
+  assert.match(
+    workflow,
+    /pnpm run prepare:realesrgan-sidecar[\s\S]*?pnpm run verify:realesrgan-sidecar/
+  );
+  assert.ok(prepareIndex >= 0 && prepareIndex < windowsBuildIndex);
+  assert.ok(prepareIndex < macosBuildIndex && prepareIndex < linuxBuildIndex);
+  assert.equal(
+    windowsConfig.bundle.resources["../out/realesrgan-model-sidecar/win32-x64/"],
+    "realesrgan-model-sidecar/win32-x64/"
+  );
+  assert.equal(
+    macosConfig.bundle.resources["../out/realesrgan-model-sidecar/"],
+    "realesrgan-model-sidecar/"
+  );
+  assert.equal(
+    linuxConfig.bundle.resources["../out/realesrgan-model-sidecar/linux-x64/"],
+    "realesrgan-model-sidecar/linux-x64/"
+  );
 });
 
 test("桌面重发同一版本时保留旧 Release，等待全平台成功后覆盖资产", () => {
@@ -135,6 +196,9 @@ test("macOS 发布修复最终应用内的 qBittorrent 签名后再生成 DMG", 
   assert.match(workflow, /--sign "\$\{APPLE_SIGNING_IDENTITY\}" "\$\{managed_executable\}"/);
   assert.match(workflow, /--sign "\$\{APPLE_SIGNING_IDENTITY\}" "\$\{managed_app\}"/);
   assert.match(workflow, /codesign --verify --deep --strict "\$\{managed_app\}"/);
+  assert.match(workflow, /mpv_directory="\$\{final_app\}\/Contents\/Resources\/libmpv\/darwin-\$\{\{ matrix\.arch \}\}"/);
+  assert.match(workflow, /find "\$\{mpv_directory\}" -type f -name '\*\.dylib'/);
+  assert.match(workflow, /签名最终包 libmpv 动态库/);
   assert.match(workflow, /--sign "\$\{APPLE_SIGNING_IDENTITY\}" "\$\{final_app\}"/);
   assert.match(workflow, /codesign --verify --deep --strict "\$\{final_app\}"/);
   assert.match(workflow, /echo "ANI_FINAL_MACOS_APP=\$\{final_app\}" >> "\$\{GITHUB_ENV\}"/);

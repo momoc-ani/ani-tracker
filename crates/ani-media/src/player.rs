@@ -1,3 +1,5 @@
+use std::collections::VecDeque;
+use std::path::Path;
 use std::sync::Arc;
 
 use ani_contracts::{
@@ -5,10 +7,398 @@ use ani_contracts::{
     PlayerErrorCode, PlayerRecoveryAction, PlayerSnapshot,
 };
 use async_trait::async_trait;
+use sha2::{Digest, Sha256};
+use tokio::io::AsyncReadExt;
 use tokio::sync::Mutex;
 
 const PLAYBACK_RATES: &[f64] = &[0.5, 0.75, 1.0, 1.25, 1.5, 2.0];
 const SUBTITLE_SCALES: &[u16] = &[100, 125, 150, 175, 200];
+
+/// 终版增强链路中可独立替换的处理阶段。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnhancementStage {
+    Shader,
+    ModelSuperResolution,
+    FrameInterpolation,
+}
+
+/// 单帧预算，调度器据此拒绝超预算的模型组合。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct EnhancementBudget {
+    pub target_frame_time_ms: f64,
+    pub estimated_frame_time_ms: f64,
+    pub available_vram_bytes: u64,
+    pub required_vram_bytes: u64,
+}
+
+/// 基于整条源帧间隔计算插帧倍率，避免只按 GPU 品牌或单次模型耗时猜测能力。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct InterpolationCapacityInput {
+    pub source_frame_rate: f64,
+    pub output_frame_rate_cap: f64,
+    pub interpolation_p95_ms: f64,
+    pub enhancement_p95_ms: f64,
+    pub decode_p95_ms: f64,
+    pub encode_p95_ms: f64,
+    pub safety_margin_ms: f64,
+    pub utilization_limit: f64,
+    pub available_vram_bytes: u64,
+    pub required_vram_bytes: u64,
+    pub hard_max_multiplier: u8,
+}
+
+/// 当前硬件和处理链允许的插帧计划；倍率 1 表示保持源帧率。
+#[derive(Debug, Clone, PartialEq)]
+pub struct InterpolationPlan {
+    pub source_frame_rate: f64,
+    pub target_frame_rate: f64,
+    pub selected_multiplier: u8,
+    pub max_feasible_multiplier: u8,
+    pub interval_budget_ms: f64,
+    pub estimated_interval_cost_ms: f64,
+    pub rejection_reason: Option<String>,
+}
+
+/// 计算整数插帧倍率上限。每个源帧间隔需要生成 `倍率 - 1` 帧，并处理全部输出帧。
+pub fn plan_interpolation(input: InterpolationCapacityInput) -> InterpolationPlan {
+    let source_interval_ms = 1_000.0 / input.source_frame_rate;
+    let interval_budget_ms = source_interval_ms * input.utilization_limit;
+    let base_cost_ms = input.decode_p95_ms + input.encode_p95_ms + input.safety_margin_ms;
+    let valid = input.source_frame_rate.is_finite()
+        && input.source_frame_rate > 0.0
+        && input.output_frame_rate_cap.is_finite()
+        && input.output_frame_rate_cap > 0.0
+        && input.interpolation_p95_ms.is_finite()
+        && input.interpolation_p95_ms > 0.0
+        && input.enhancement_p95_ms.is_finite()
+        && input.enhancement_p95_ms >= 0.0
+        && input.decode_p95_ms.is_finite()
+        && input.decode_p95_ms >= 0.0
+        && input.encode_p95_ms.is_finite()
+        && input.encode_p95_ms >= 0.0
+        && input.safety_margin_ms.is_finite()
+        && input.safety_margin_ms >= 0.0
+        && input.utilization_limit.is_finite()
+        && input.utilization_limit > 0.0
+        && input.utilization_limit <= 1.0
+        && input.hard_max_multiplier >= 2;
+    if !valid {
+        return InterpolationPlan {
+            source_frame_rate: input.source_frame_rate,
+            target_frame_rate: input.source_frame_rate,
+            selected_multiplier: 1,
+            max_feasible_multiplier: 1,
+            interval_budget_ms,
+            estimated_interval_cost_ms: f64::NAN,
+            rejection_reason: Some("插帧性能遥测无效，已保持源帧率".to_owned()),
+        };
+    }
+
+    let cost_for = |multiplier: u8| {
+        input.interpolation_p95_ms * f64::from(multiplier.saturating_sub(1))
+            + input.enhancement_p95_ms * f64::from(multiplier)
+            + base_cost_ms
+    };
+    let output_limited_multiplier =
+        (input.output_frame_rate_cap / input.source_frame_rate).floor() as u8;
+    let candidate_max = input
+        .hard_max_multiplier
+        .min(output_limited_multiplier.max(1));
+    let mut max_feasible_multiplier = 1;
+    if input.required_vram_bytes <= input.available_vram_bytes {
+        for multiplier in 2..=candidate_max {
+            if cost_for(multiplier) <= interval_budget_ms {
+                max_feasible_multiplier = multiplier;
+            } else {
+                break;
+            }
+        }
+    }
+    let estimated_interval_cost_ms = cost_for(max_feasible_multiplier.max(2));
+    let rejection_reason = if max_feasible_multiplier >= 2 {
+        None
+    } else if input.required_vram_bytes > input.available_vram_bytes {
+        Some("插帧模型超出当前显存预算，已保持源帧率".to_owned())
+    } else if output_limited_multiplier < 2 {
+        Some("源帧率已达到输出帧率上限，已跳过 AI 插帧".to_owned())
+    } else {
+        Some(format!(
+            "插帧链路 P95 预计 {:.2}ms，超过每个源帧间隔 {:.2}ms 的安全预算",
+            estimated_interval_cost_ms, interval_budget_ms
+        ))
+    };
+    InterpolationPlan {
+        source_frame_rate: input.source_frame_rate,
+        target_frame_rate: input.source_frame_rate * f64::from(max_feasible_multiplier),
+        selected_multiplier: max_feasible_multiplier,
+        max_feasible_multiplier,
+        interval_budget_ms,
+        estimated_interval_cost_ms,
+        rejection_reason,
+    }
+}
+
+/// 模型权重的受控清单；播放器只接受摘要、尺寸和资源预算均有效的模型。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnhancementModelManifest {
+    pub model_id: String,
+    pub backend: String,
+    pub weight_sha256: String,
+    pub input_width: u32,
+    pub input_height: u32,
+    pub required_vram_bytes: u64,
+    pub estimated_frame_time_ms: u32,
+}
+
+/// 校验模型清单和当前会话预算，失败时保持能力关闭。
+pub fn validate_model_manifest(
+    manifest: &EnhancementModelManifest,
+    available_vram_bytes: u64,
+    target_frame_time_ms: f64,
+) -> Result<(), String> {
+    if manifest.model_id.trim().is_empty() || manifest.backend.trim().is_empty() {
+        return Err("模型标识或推理后端为空".to_owned());
+    }
+    if manifest.input_width == 0 || manifest.input_height == 0 {
+        return Err("模型输入尺寸无效".to_owned());
+    }
+    if manifest.weight_sha256.len() != 64
+        || !manifest
+            .weight_sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err("模型权重 SHA-256 摘要无效".to_owned());
+    }
+    let budget = EnhancementBudget {
+        target_frame_time_ms,
+        estimated_frame_time_ms: f64::from(manifest.estimated_frame_time_ms),
+        available_vram_bytes,
+        required_vram_bytes: manifest.required_vram_bytes,
+    };
+    if !budget.fits() {
+        return Err("模型超出当前帧时间或显存预算".to_owned());
+    }
+    Ok(())
+}
+
+/// 读取权重文件并验证其 SHA-256；文件校验失败时模型不得进入可用状态。
+pub async fn validate_model_weight(
+    weight_path: &Path,
+    manifest: &EnhancementModelManifest,
+    available_vram_bytes: u64,
+    target_frame_time_ms: f64,
+) -> Result<(), String> {
+    validate_model_manifest(manifest, available_vram_bytes, target_frame_time_ms)?;
+    let mut file = tokio::fs::File::open(weight_path)
+        .await
+        .map_err(|error| format!("读取模型权重失败：{error}"))?;
+    let mut digest = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .await
+            .map_err(|error| format!("读取模型权重失败：{error}"))?;
+        if read == 0 {
+            break;
+        }
+        digest.update(&buffer[..read]);
+    }
+    let digest = digest.finalize();
+    let actual = format!("{digest:x}");
+    if !actual.eq_ignore_ascii_case(&manifest.weight_sha256) {
+        return Err("模型权重 SHA-256 与清单不一致".to_owned());
+    }
+    Ok(())
+}
+
+/// RIFE 等插帧后端共用的有界帧队列，满载时丢弃最旧帧并可观测计数。
+#[derive(Debug)]
+pub struct BoundedFrameQueue<T> {
+    capacity: usize,
+    frames: VecDeque<T>,
+    dropped_frames: u64,
+}
+
+impl<T> BoundedFrameQueue<T> {
+    /// 创建至少容纳一帧的队列。
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            capacity: capacity.max(1),
+            frames: VecDeque::new(),
+            dropped_frames: 0,
+        }
+    }
+
+    /// 推入一帧，满载时丢弃最旧帧。
+    pub fn push(&mut self, frame: T) {
+        if self.frames.len() == self.capacity {
+            let _ = self.frames.pop_front();
+            self.dropped_frames = self.dropped_frames.saturating_add(1);
+        }
+        self.frames.push_back(frame);
+    }
+
+    /// 取出最早的一帧。
+    pub fn pop(&mut self) -> Option<T> {
+        self.frames.pop_front()
+    }
+
+    /// 返回当前队列长度。
+    pub fn len(&self) -> usize {
+        self.frames.len()
+    }
+
+    /// 返回队列是否为空。
+    pub fn is_empty(&self) -> bool {
+        self.frames.is_empty()
+    }
+
+    /// 返回累计丢帧数。
+    pub fn dropped_frames(&self) -> u64 {
+        self.dropped_frames
+    }
+}
+
+impl EnhancementBudget {
+    /// 返回当前模型是否能在目标帧预算与显存预算内运行。
+    pub fn fits(self) -> bool {
+        self.target_frame_time_ms.is_finite()
+            && self.estimated_frame_time_ms.is_finite()
+            && self.target_frame_time_ms > 0.0
+            && self.estimated_frame_time_ms <= self.target_frame_time_ms
+            && self.required_vram_bytes <= self.available_vram_bytes
+    }
+}
+
+/// 模型超分后端端口；真实推理 SDK 由桌面平台另行实现。
+#[async_trait]
+pub trait ModelEnhancer: Send + Sync {
+    /// 返回后端稳定标识。
+    fn backend_id(&self) -> &str;
+    /// 返回模型是否已完成权重摘要和资源校验。
+    fn ready(&self) -> bool;
+    /// 返回本次处理的资源预算。
+    fn budget(&self) -> EnhancementBudget;
+    /// 对一帧不含字幕和 OSD 的 RGB24 视频数据执行模型增强。
+    async fn enhance(&self, frame: RawVideoFrame) -> Result<RawVideoFrame, String>;
+}
+
+/// 模型插帧后端端口；输入帧队列由具体实现负责保持有界。
+#[async_trait]
+pub trait FrameInterpolator: Send + Sync {
+    /// 返回后端稳定标识。
+    fn backend_id(&self) -> &str;
+    /// 返回模型是否已完成权重摘要和资源校验。
+    fn ready(&self) -> bool;
+    /// 返回本次处理的资源预算。
+    fn budget(&self) -> EnhancementBudget;
+    /// 在两帧 RGB24 视频数据之间生成一帧，字幕必须在该阶段之后合成。
+    async fn interpolate(
+        &self,
+        previous: RawVideoFrame,
+        next: RawVideoFrame,
+    ) -> Result<RawVideoFrame, String>;
+}
+
+/// 交给模型 sidecar 的无字幕 RGB24 视频帧。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RawVideoFrame {
+    pub width: u32,
+    pub height: u32,
+    pub stride: u32,
+    pub pts_micros: i64,
+    pub data: Vec<u8>,
+}
+
+impl RawVideoFrame {
+    /// 拒绝尺寸溢出、非紧凑 RGB24 和长度不一致的帧。
+    pub fn validate(&self, max_frame_bytes: usize) -> Result<(), String> {
+        if self.width == 0 || self.height == 0 {
+            return Err("模型输入帧尺寸无效".to_owned());
+        }
+        let expected_stride = self
+            .width
+            .checked_mul(3)
+            .ok_or_else(|| "模型输入帧步长溢出".to_owned())?;
+        if self.stride != expected_stride {
+            return Err("模型输入只接受紧凑 RGB24 帧".to_owned());
+        }
+        let expected_bytes = usize::try_from(self.stride)
+            .ok()
+            .and_then(|stride| {
+                usize::try_from(self.height)
+                    .ok()
+                    .and_then(|height| stride.checked_mul(height))
+            })
+            .ok_or_else(|| "模型输入帧长度溢出".to_owned())?;
+        if expected_bytes > max_frame_bytes || self.data.len() != expected_bytes {
+            return Err("模型输入帧长度无效或超过限制".to_owned());
+        }
+        Ok(())
+    }
+}
+
+/// 按“插帧 -> 模型超分 -> Shader”顺序做安全降级的调度结果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnhancementDecision {
+    Disabled,
+    Shader,
+    ModelSuperResolution,
+    FrameInterpolation,
+}
+
+/// 统一模型能力门禁，未准备好或超预算时永远不会打开能力字段。
+pub struct EnhancementScheduler<'a> {
+    pub model: Option<&'a dyn ModelEnhancer>,
+    pub interpolator: Option<&'a dyn FrameInterpolator>,
+    pub shader_available: bool,
+}
+
+impl EnhancementScheduler<'_> {
+    /// 计算当前会话唯一允许的增强阶段。
+    pub fn decide(&self, requested: EnhancementStage) -> EnhancementDecision {
+        match requested {
+            EnhancementStage::FrameInterpolation => {
+                if self
+                    .interpolator
+                    .is_some_and(|backend| backend.ready() && backend.budget().fits())
+                {
+                    EnhancementDecision::FrameInterpolation
+                } else if self
+                    .model
+                    .is_some_and(|backend| backend.ready() && backend.budget().fits())
+                {
+                    EnhancementDecision::ModelSuperResolution
+                } else if self.shader_available {
+                    EnhancementDecision::Shader
+                } else {
+                    EnhancementDecision::Disabled
+                }
+            }
+            EnhancementStage::ModelSuperResolution => {
+                if self
+                    .model
+                    .is_some_and(|backend| backend.ready() && backend.budget().fits())
+                {
+                    EnhancementDecision::ModelSuperResolution
+                } else if self.shader_available {
+                    EnhancementDecision::Shader
+                } else {
+                    EnhancementDecision::Disabled
+                }
+            }
+            EnhancementStage::Shader => {
+                if self.shader_available {
+                    EnhancementDecision::Shader
+                } else {
+                    EnhancementDecision::Disabled
+                }
+            }
+        }
+    }
+}
 
 /// 平台播放器 transport 的稳定失败，不泄漏 SDK 或 FFI 类型。
 #[derive(Debug, Clone, thiserror::Error)]
@@ -17,6 +407,8 @@ pub enum PlayerTransportError {
     Unavailable(String),
     #[error("播放器原生调用失败：{0}")]
     Native(String),
+    #[error("播放器媒体加载失败：{0}")]
+    LoadFailed(String),
     #[error("播放器返回无效状态：{0}")]
     InvalidResponse(String),
 }
@@ -177,6 +569,8 @@ pub fn validate_command(command: &PlayerCommand) -> Option<PlayerError> {
                 return Some(invalid_command("字幕缩放比例无效"));
             }
         }
+        PlayerCommandAction::SetVideoEnhancement { .. } => {}
+        PlayerCommandAction::SetFrameInterpolation { .. } => {}
         PlayerCommandAction::SetAspectRatio {
             aspect_ratio: ani_contracts::PlayerAspectRatio::Custom,
             value,
@@ -221,9 +615,9 @@ fn invalid_command(message: impl Into<String>) -> PlayerError {
 fn transport_error(error: PlayerTransportError) -> PlayerError {
     let (code, recoverable) = match &error {
         PlayerTransportError::Unavailable(_) => (PlayerErrorCode::RuntimeMissing, false),
-        PlayerTransportError::Native(_) | PlayerTransportError::InvalidResponse(_) => {
-            (PlayerErrorCode::Unknown, true)
-        }
+        PlayerTransportError::Native(_)
+        | PlayerTransportError::LoadFailed(_)
+        | PlayerTransportError::InvalidResponse(_) => (PlayerErrorCode::Unknown, true),
     };
     PlayerError {
         code,
@@ -258,6 +652,52 @@ mod tests {
     };
 
     use super::*;
+
+    struct TestModel {
+        ready: bool,
+        budget: EnhancementBudget,
+    }
+
+    #[async_trait]
+    impl ModelEnhancer for TestModel {
+        fn backend_id(&self) -> &str {
+            "test-model"
+        }
+        fn ready(&self) -> bool {
+            self.ready
+        }
+        fn budget(&self) -> EnhancementBudget {
+            self.budget
+        }
+        async fn enhance(&self, frame: RawVideoFrame) -> Result<RawVideoFrame, String> {
+            Ok(frame)
+        }
+    }
+
+    struct TestInterpolator {
+        ready: bool,
+        budget: EnhancementBudget,
+    }
+
+    #[async_trait]
+    impl FrameInterpolator for TestInterpolator {
+        fn backend_id(&self) -> &str {
+            "test-interpolator"
+        }
+        fn ready(&self) -> bool {
+            self.ready
+        }
+        fn budget(&self) -> EnhancementBudget {
+            self.budget
+        }
+        async fn interpolate(
+            &self,
+            previous: RawVideoFrame,
+            _next: RawVideoFrame,
+        ) -> Result<RawVideoFrame, String> {
+            Ok(previous)
+        }
+    }
 
     struct StubTransport {
         snapshot: Mutex<Option<PlayerSnapshot>>,
@@ -337,6 +777,188 @@ mod tests {
         assert!(validate_command(&invalid_subtitle_scale).is_some());
     }
 
+    #[test]
+    fn scheduler_requires_ready_models_and_falls_back_in_order() {
+        let budget = EnhancementBudget {
+            target_frame_time_ms: 16.67,
+            estimated_frame_time_ms: 8.0,
+            available_vram_bytes: 2,
+            required_vram_bytes: 1,
+        };
+        let model = TestModel {
+            ready: true,
+            budget,
+        };
+        let interpolator = TestInterpolator {
+            ready: false,
+            budget,
+        };
+        let scheduler = EnhancementScheduler {
+            model: Some(&model),
+            interpolator: Some(&interpolator),
+            shader_available: true,
+        };
+        assert_eq!(
+            scheduler.decide(EnhancementStage::FrameInterpolation),
+            EnhancementDecision::ModelSuperResolution
+        );
+
+        let over_budget = TestModel {
+            ready: true,
+            budget: EnhancementBudget {
+                estimated_frame_time_ms: 20.0,
+                ..budget
+            },
+        };
+        let scheduler = EnhancementScheduler {
+            model: Some(&over_budget),
+            interpolator: None,
+            shader_available: true,
+        };
+        assert_eq!(
+            scheduler.decide(EnhancementStage::ModelSuperResolution),
+            EnhancementDecision::Shader
+        );
+    }
+
+    fn interpolation_input(source_frame_rate: f64) -> InterpolationCapacityInput {
+        InterpolationCapacityInput {
+            source_frame_rate,
+            output_frame_rate_cap: 60.0,
+            interpolation_p95_ms: 20.0,
+            enhancement_p95_ms: 0.0,
+            decode_p95_ms: 0.0,
+            encode_p95_ms: 0.0,
+            safety_margin_ms: 5.0,
+            utilization_limit: 0.8,
+            available_vram_bytes: 4_000,
+            required_vram_bytes: 2_000,
+            hard_max_multiplier: 2,
+        }
+    }
+
+    #[test]
+    fn plans_ai_interpolation_from_source_interval_output_cap_and_cost() {
+        for (source_frame_rate, target_frame_rate) in [(24.0, 48.0), (25.0, 50.0)] {
+            let plan = plan_interpolation(interpolation_input(source_frame_rate));
+            assert_eq!(plan.selected_multiplier, 2);
+            assert_eq!(plan.target_frame_rate, target_frame_rate);
+            assert!(plan.rejection_reason.is_none());
+        }
+
+        let over_budget = plan_interpolation(InterpolationCapacityInput {
+            interpolation_p95_ms: 25.0,
+            ..interpolation_input(30.0)
+        });
+        assert_eq!(over_budget.selected_multiplier, 1);
+        assert!(over_budget
+            .rejection_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("P95")));
+
+        let output_limited = plan_interpolation(interpolation_input(60.0));
+        assert_eq!(output_limited.selected_multiplier, 1);
+        assert!(output_limited
+            .rejection_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("输出帧率上限")));
+    }
+
+    #[test]
+    fn interpolation_capacity_accounts_for_combined_models_vram_and_invalid_telemetry() {
+        let combined = plan_interpolation(InterpolationCapacityInput {
+            enhancement_p95_ms: 10.0,
+            ..interpolation_input(24.0)
+        });
+        assert_eq!(combined.selected_multiplier, 1);
+
+        let insufficient_vram = plan_interpolation(InterpolationCapacityInput {
+            available_vram_bytes: 1_999,
+            ..interpolation_input(24.0)
+        });
+        assert_eq!(insufficient_vram.selected_multiplier, 1);
+        assert!(insufficient_vram
+            .rejection_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("显存")));
+
+        let invalid = plan_interpolation(InterpolationCapacityInput {
+            interpolation_p95_ms: f64::NAN,
+            ..interpolation_input(24.0)
+        });
+        assert_eq!(invalid.selected_multiplier, 1);
+        assert!(invalid
+            .rejection_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("遥测无效")));
+    }
+
+    #[test]
+    fn interpolation_calculator_supports_future_protocol_multipliers() {
+        let plan = plan_interpolation(InterpolationCapacityInput {
+            output_frame_rate_cap: 120.0,
+            interpolation_p95_ms: 10.0,
+            safety_margin_ms: 0.0,
+            utilization_limit: 1.0,
+            hard_max_multiplier: 4,
+            ..interpolation_input(24.0)
+        });
+        assert_eq!(plan.max_feasible_multiplier, 4);
+        assert_eq!(plan.target_frame_rate, 96.0);
+    }
+
+    #[test]
+    fn validates_model_manifest_and_bounds_frame_queue() {
+        let manifest = EnhancementModelManifest {
+            model_id: "rife-v4".to_owned(),
+            backend: "onnx-runtime".to_owned(),
+            weight_sha256: "a".repeat(64),
+            input_width: 1920,
+            input_height: 1080,
+            required_vram_bytes: 1,
+            estimated_frame_time_ms: 8,
+        };
+        assert!(validate_model_manifest(&manifest, 2, 16.67).is_ok());
+        assert!(validate_model_manifest(&manifest, 0, 16.67).is_err());
+
+        let mut queue = BoundedFrameQueue::new(2);
+        queue.push(1);
+        queue.push(2);
+        queue.push(3);
+        assert_eq!(queue.len(), 2);
+        assert_eq!(queue.pop(), Some(2));
+        assert_eq!(queue.dropped_frames(), 1);
+    }
+
+    #[tokio::test]
+    async fn validates_model_weight_digest_before_enabling_backend() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("model.bin");
+        let bytes = b"model-weight";
+        tokio::fs::write(&path, bytes).await.expect("write model");
+        let digest = format!("{:x}", Sha256::digest(bytes));
+        let manifest = EnhancementModelManifest {
+            model_id: "rife-v4".to_owned(),
+            backend: "onnx-runtime".to_owned(),
+            weight_sha256: digest,
+            input_width: 1920,
+            input_height: 1080,
+            required_vram_bytes: 1,
+            estimated_frame_time_ms: 8,
+        };
+        assert!(validate_model_weight(&path, &manifest, 2, 16.67)
+            .await
+            .is_ok());
+
+        let invalid = EnhancementModelManifest {
+            weight_sha256: "b".repeat(64),
+            ..manifest
+        };
+        assert!(validate_model_weight(&path, &invalid, 2, 16.67)
+            .await
+            .is_err());
+    }
+
     fn load_command(session_id: &str) -> PlayerCommand {
         PlayerCommand {
             command_id: "command-1".to_owned(),
@@ -371,13 +993,16 @@ mod tests {
             supports_audio_tracks: true,
             supports_subtitle_tracks: true,
             supports_subtitle_scale: true,
+            supports_video_enhancement: true,
+            supports_frame_interpolation: false,
+            supports_model_enhancement: false,
             supports_aspect_ratio: true,
             supports_fullscreen: true,
             supports_picture_in_picture: false,
             supports_playlist_navigation: false,
             supports_direct_playback: true,
             supports_transcoding_fallback: false,
-            supports_hdr: true,
+            supports_hdr: false,
             unavailable_reason: None,
         }
     }

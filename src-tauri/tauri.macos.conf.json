@@ -9,10 +9,14 @@
       "../LICENSE": "licenses/ani-tracker-LICENSE.txt",
       "../NOTICE": "licenses/ani-tracker-NOTICE.txt",
       "../out/ffmpeg/": "ffmpeg/",
-      "../out/libvlc/": "libvlc/",
+      "../out/libmpv/": "libmpv/",
+      "../out/model-sidecar/": "model-sidecar/",
+      "../out/realesrgan-model-sidecar/": "realesrgan-model-sidecar/",
       "../out/qbittorrent/": "qbittorrent/",
       "../out/torrent-core/": "torrent-core/",
-      "../resources/licenses/vlc/": "licenses/vlc/"
+      "../resources/models/": "models/",
+      "../resources/licenses/mpv/": "licenses/mpv/",
+      "../resources/shaders/anime4k/": "shaders/anime4k/"
     }
   }
 }

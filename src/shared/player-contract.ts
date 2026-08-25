@@ -1,5 +1,34 @@
 /** 播放器后端类型，网页端与原生端通过同一行为契约接入。 */
-export type PlayerBackend = "artplayer" | "libvlc";
+export type PlayerBackend = "artplayer" | "libvlc" | "mpv";
+
+/** GPU 视频增强预设；字幕和 OSD 在增强后合成。 */
+export type PlayerVideoEnhancement = "off" | "balanced" | "clear";
+
+/** 插帧模式；RIFE 仅在真实模型运行时可用时展示。 */
+export type PlayerFrameInterpolation = "off" | "display-resample" | "motion-compensated" | "rife-realtime";
+
+/** HDR 输出模式；当前仅在真实显示链路探测通过时可用。 */
+export type PlayerHdrMode = "off" | "auto";
+
+/** HDR 自动输出必须同时具备的源、渲染器和显示器能力。 */
+export interface PlayerHdrCapabilities {
+  sourceHdr: boolean;
+  rendererHdr: boolean;
+  displayHdr: boolean;
+}
+
+/** 增强链路的诊断快照，便于区分 Shader、模型和降级状态。 */
+export interface PlayerEnhancementDiagnostics {
+  pipeline: string;
+  gpuVendor?: string;
+  renderer?: string;
+  decoder?: string;
+  modelBackend?: string;
+  frameTimeMs?: number;
+  droppedFrames: number;
+  degradationReason?: string;
+  hdrCapabilities: PlayerHdrCapabilities;
+}
 
 /** 播放器宿主平台。 */
 export type PlayerHostPlatform = "remote-web" | "tauri-desktop" | "android" | "ios";
@@ -81,6 +110,9 @@ export interface PlayerCapabilities {
   supportsAudioTracks: boolean;
   supportsSubtitleTracks: boolean;
   supportsSubtitleScale: boolean;
+  supportsVideoEnhancement: boolean;
+  supportsFrameInterpolation: boolean;
+  supportsModelEnhancement: boolean;
   supportsAspectRatio: boolean;
   supportsFullscreen: boolean;
   supportsPictureInPicture: boolean;
@@ -88,6 +120,8 @@ export interface PlayerCapabilities {
   supportsDirectPlayback: boolean;
   supportsTranscodingFallback: boolean;
   supportsHdr: boolean;
+  /** WebCodecs/WebGPU 直传增强；未完成能力探测时必须保持 false 或缺省。 */
+  supportsDirectEnhancement?: boolean;
   unavailableReason?: string;
 }
 
@@ -96,7 +130,7 @@ export interface PlayerSubtitleSource {
   id: string;
   label: string;
   language?: string;
-  type: "ass" | "vtt";
+  type: "ass" | "vtt" | "pgs";
   uri: string;
   default: boolean;
 }
@@ -112,6 +146,7 @@ export interface PlayerMediaSource {
   uri: string;
   mode: "direct" | "hls";
   durationSeconds?: number;
+  streamStartPositionSeconds?: number;
   subtitles: PlayerSubtitleSource[];
 }
 
@@ -157,6 +192,9 @@ export type PlayerCommand =
   | (PlayerCommandBase & { type: "select-audio-track"; trackId: string })
   | (PlayerCommandBase & { type: "select-subtitle-track"; trackId?: string })
   | (PlayerCommandBase & { type: "set-subtitle-scale"; subtitleScale: PlayerSubtitleScale })
+  | (PlayerCommandBase & { type: "set-video-enhancement"; videoEnhancement: PlayerVideoEnhancement })
+  | (PlayerCommandBase & { type: "set-frame-interpolation"; frameInterpolation: PlayerFrameInterpolation })
+  | (PlayerCommandBase & { type: "set-hdr"; hdr: PlayerHdrMode })
   | (PlayerCommandBase & { type: "set-aspect-ratio"; aspectRatio: PlayerAspectRatio; value?: string })
   | (PlayerCommandBase & { type: "set-fullscreen"; fullscreen: boolean })
   | (PlayerCommandBase & { type: "set-picture-in-picture"; enabled: boolean })
@@ -189,6 +227,11 @@ export interface PlayerSnapshot {
   audioTracks: PlayerTrack[];
   subtitleTracks: PlayerTrack[];
   subtitleScale: PlayerSubtitleScale;
+  videoEnhancement: PlayerVideoEnhancement;
+  videoEnhancementDegraded: boolean;
+  frameInterpolation: PlayerFrameInterpolation;
+  hdr: PlayerHdrMode;
+  enhancementDiagnostics: PlayerEnhancementDiagnostics;
   aspectRatio: PlayerAspectRatio;
   fullscreen: boolean;
   pictureInPicture: boolean;
@@ -219,6 +262,9 @@ export function createUnavailablePlayerCapabilities(
     supportsAudioTracks: false,
     supportsSubtitleTracks: false,
     supportsSubtitleScale: false,
+    supportsVideoEnhancement: false,
+    supportsFrameInterpolation: false,
+    supportsModelEnhancement: false,
     supportsAspectRatio: false,
     supportsFullscreen: false,
     supportsPictureInPicture: false,
@@ -226,6 +272,7 @@ export function createUnavailablePlayerCapabilities(
     supportsDirectPlayback: false,
     supportsTranscodingFallback: false,
     supportsHdr: false,
+    supportsDirectEnhancement: false,
     unavailableReason
   };
 }
@@ -263,6 +310,19 @@ export function createInitialPlayerSnapshot(input: InitialPlayerSnapshotInput): 
     audioTracks: [],
     subtitleTracks: [],
     subtitleScale: 100,
+    videoEnhancement: "off",
+    videoEnhancementDegraded: false,
+    frameInterpolation: "off",
+    hdr: "off",
+    enhancementDiagnostics: {
+      pipeline: "none",
+      droppedFrames: 0,
+      hdrCapabilities: {
+        sourceHdr: false,
+        rendererHdr: false,
+        displayHdr: false
+      }
+    },
     aspectRatio: "default",
     fullscreen: false,
     pictureInPicture: false
@@ -281,7 +341,48 @@ export function acceptPlayerSnapshot(
   if (current?.sessionId === incoming.sessionId && incoming.sequence <= current.sequence) {
     return current;
   }
-  return incoming;
+  const legacyPayload = incoming as unknown as {
+    capabilities?: Partial<PlayerCapabilities>;
+    enhancementDiagnostics?: Partial<PlayerEnhancementDiagnostics>;
+    frameInterpolation?: PlayerFrameInterpolation;
+    hdr?: PlayerHdrMode;
+    videoEnhancement?: PlayerVideoEnhancement;
+    videoEnhancementDegraded?: boolean;
+  };
+  const diagnostics = legacyPayload.enhancementDiagnostics;
+  const needsNormalization = legacyPayload.capabilities?.supportsFrameInterpolation === undefined
+    || legacyPayload.capabilities?.supportsModelEnhancement === undefined
+    || legacyPayload.videoEnhancement === undefined
+    || legacyPayload.videoEnhancementDegraded === undefined
+    || legacyPayload.frameInterpolation === undefined
+    || legacyPayload.hdr === undefined
+    || diagnostics?.pipeline === undefined
+    || diagnostics?.droppedFrames === undefined
+    || diagnostics?.hdrCapabilities === undefined;
+  if (!needsNormalization) return incoming;
+  // 允许旧版原生后端缺少终版增强字段，避免控制层读取 undefined。
+  return {
+    ...incoming,
+    capabilities: {
+      ...incoming.capabilities,
+      supportsFrameInterpolation: legacyPayload.capabilities?.supportsFrameInterpolation ?? false,
+      supportsModelEnhancement: legacyPayload.capabilities?.supportsModelEnhancement ?? false
+    },
+    videoEnhancement: incoming.videoEnhancement ?? "off",
+    videoEnhancementDegraded: incoming.videoEnhancementDegraded ?? false,
+    frameInterpolation: incoming.frameInterpolation ?? "off",
+    hdr: incoming.hdr ?? "off",
+    enhancementDiagnostics: {
+      ...(diagnostics ?? {}),
+      pipeline: diagnostics?.pipeline ?? "none",
+      droppedFrames: diagnostics?.droppedFrames ?? 0,
+      hdrCapabilities: diagnostics?.hdrCapabilities ?? {
+        sourceHdr: false,
+        rendererHdr: false,
+        displayHdr: false
+      }
+    }
+  };
 }
 
 /** 构造后端不支持命令时的统一拒绝结果。 */

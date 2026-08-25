@@ -4,7 +4,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use ani_contracts::{RemoteCertificateInfo, RemoteGatewayStatus, RemotePairingChallenge};
+use ani_contracts::{
+    RemoteCertificateInfo, RemoteDirectEnhancementDiagnostics, RemoteGatewayStatus,
+    RemotePairingChallenge, RemotePlaybackEnhancement,
+};
 use axum::body::{to_bytes, Body};
 use axum::extract::{ConnectInfo, Request, State};
 use axum::http::header::{
@@ -25,7 +28,9 @@ use tokio_util::io::ReaderStream;
 
 use crate::auth::{RemoteDeviceAuth, RemoteDeviceAuthError};
 use crate::image_cache::{ImageCache, ImageCacheError};
-use crate::media::{RemoteMediaAsset, RemoteMediaError, RemoteMediaSessionService};
+use crate::media::{
+    RemoteMediaAsset, RemoteMediaError, RemoteMediaSessionInput, RemoteMediaSessionService,
+};
 use crate::network::{
     is_trusted_host, is_trusted_origin, list_private_ipv4_addresses, TrustedOrigin,
 };
@@ -34,7 +39,8 @@ use crate::tls::{RemoteTlsBundle, RemoteTlsCertificateStore};
 
 const DEFAULT_PORT: u16 = 18_083;
 const MAX_BODY_BYTES: usize = 64 * 1024;
-const MEDIA_STREAM_BUFFER_BYTES: usize = 1024 * 1024;
+const DIRECT_MEDIA_STREAM_BUFFER_BYTES: usize = 64 * 1024;
+const ASSET_STREAM_BUFFER_BYTES: usize = 1024 * 1024;
 
 /// 设置中的远程网关监听选项。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -515,6 +521,7 @@ async fn handle_request(
                     (CACHE_CONTROL, "private, max-age=86400, immutable"),
                     (ETAG, &etag),
                 ],
+                ASSET_STREAM_BUFFER_BYTES,
             )
             .await;
         }
@@ -535,14 +542,19 @@ async fn handle_request(
         )
         .await?;
         let body: MediaSessionBody = parse_body(request).await?;
+        let input = RemoteMediaSessionInput {
+            task_id: &body.task_id,
+            requested_mode: &body.mode,
+            file_index: body.file_index,
+            enhancement: body.enhancement,
+            start_position_seconds: body.start_position_seconds,
+            subtitle_mode: &body.subtitle_mode,
+            subtitle_id: body.subtitle_id.as_deref(),
+        };
         let session = if path.ends_with("external-sessions") {
-            core.media
-                .create_external_session(&body.task_id, &device.id, &body.mode, body.file_index)
-                .await
+            core.media.create_external_session(&device.id, input).await
         } else {
-            core.media
-                .create_session(&body.task_id, &device.id, &body.mode, body.file_index)
-                .await
+            core.media.create_session(&device.id, input).await
         }
         .map_err(GatewayHttpError::from_media)?;
         let mut response = json_response(StatusCode::OK, serde_json::to_value(session)?);
@@ -563,6 +575,28 @@ async fn handle_request(
         }
         return Ok(response);
     }
+    if method == Method::PUT {
+        if let Some(session_id) = parse_browser_media_diagnostics_route(&path) {
+            let device = authenticate(core, request.headers(), true).await?;
+            consume_rate_limit(
+                core,
+                format!("media:{}:diagnostics", device.id),
+                120,
+                Duration::from_secs(60),
+            )
+            .await?;
+            let diagnostics: RemoteDirectEnhancementDiagnostics = parse_body(request).await?;
+            let session = core
+                .media
+                .report_direct_enhancement(&session_id, &device.id, diagnostics)
+                .await
+                .map_err(GatewayHttpError::from_media)?;
+            return Ok(json_response(
+                StatusCode::OK,
+                serde_json::to_value(session)?,
+            ));
+        }
+    }
     if let Some(route) = parse_browser_media_route(&path) {
         if method == Method::DELETE && route.asset_name.is_none() {
             let device = authenticate(core, request.headers(), true).await?;
@@ -580,15 +614,26 @@ async fn handle_request(
             return Ok(empty_response(StatusCode::NO_CONTENT));
         }
         if matches!(method, Method::GET | Method::HEAD) {
+            let device = authenticate(core, request.headers(), true).await?;
+            consume_rate_limit(
+                core,
+                format!("media:{}:read", device.id),
+                600,
+                Duration::from_secs(60),
+            )
+            .await?;
+            if route.asset_name.is_none() && method == Method::GET {
+                let session = core
+                    .media
+                    .get_session(&route.session_id, &device.id)
+                    .await
+                    .map_err(GatewayHttpError::from_media)?;
+                return Ok(json_response(
+                    StatusCode::OK,
+                    serde_json::to_value(session)?,
+                ));
+            }
             if let Some(asset_name) = route.asset_name {
-                let device = authenticate(core, request.headers(), true).await?;
-                consume_rate_limit(
-                    core,
-                    format!("media:{}:read", device.id),
-                    600,
-                    Duration::from_secs(60),
-                )
-                .await?;
                 let asset = core
                     .media
                     .get_asset(&route.session_id, &device.id, &asset_name)
@@ -734,11 +779,11 @@ async fn stream_media(
         .await
         .map_err(|_| GatewayHttpError::new(404, "MEDIA_ASSET_NOT_FOUND", "媒体资源不存在"))?;
     let requested_range = headers.get(RANGE).and_then(|value| value.to_str().ok());
-    let range = asset
-        .direct
+    let supports_range = asset.direct || asset.range_supported;
+    let range = supports_range
         .then(|| parse_byte_range(requested_range, metadata.len()))
         .flatten();
-    if asset.direct && requested_range.is_some() && range.is_none() {
+    if supports_range && requested_range.is_some() && range.is_none() {
         log::warn!(
             "Rust 远程媒体 Range 无效 method={} file_name={} requested_range={} total={}",
             method,
@@ -782,7 +827,7 @@ async fn stream_media(
         )
     });
     let mut extra_headers = vec![(CACHE_CONTROL, "no-store")];
-    if asset.direct {
+    if supports_range {
         extra_headers.push((ACCEPT_RANGES, "bytes"));
     }
     if let Some(content_disposition) = content_disposition.as_deref() {
@@ -794,6 +839,11 @@ async fn stream_media(
         &asset.content_type,
         range,
         &extra_headers,
+        if asset.direct {
+            DIRECT_MEDIA_STREAM_BUFFER_BYTES
+        } else {
+            ASSET_STREAM_BUFFER_BYTES
+        },
     )
     .await
 }
@@ -804,6 +854,7 @@ async fn stream_file(
     content_type: &str,
     range: Option<ByteRange>,
     extra_headers: &[(axum::http::HeaderName, &str)],
+    stream_buffer_bytes: usize,
 ) -> Result<Response<Body>, GatewayHttpError> {
     let metadata = tokio::fs::metadata(path)
         .await
@@ -844,7 +895,7 @@ async fn stream_file(
     file.seek(std::io::SeekFrom::Start(start))
         .await
         .map_err(|_| GatewayHttpError::internal())?;
-    let stream = ReaderStream::with_capacity(file.take(length), MEDIA_STREAM_BUFFER_BYTES);
+    let stream = ReaderStream::with_capacity(file.take(length), stream_buffer_bytes);
     response
         .body(Body::from_stream(stream))
         .map_err(|_| GatewayHttpError::internal())
@@ -1005,8 +1056,8 @@ fn add_inline_script_nonce(html: &str, script_nonce: &str) -> String {
 /// 创建远程 PWA CSP，只放行当前入口响应的内联初始化脚本。
 fn create_renderer_content_security_policy(script_nonce: Option<&str>) -> String {
     let script_source = script_nonce.map_or_else(
-        || "script-src 'self'".to_owned(),
-        |nonce| format!("script-src 'self' 'nonce-{nonce}'"),
+        || "script-src 'self' 'wasm-unsafe-eval'".to_owned(),
+        |nonce| format!("script-src 'self' 'wasm-unsafe-eval' 'nonce-{nonce}'"),
     );
     format!(
         "default-src 'self'; {script_source}; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; connect-src 'self'; media-src 'self' blob:; worker-src 'self' blob:; object-src 'none'; base-uri 'self'; frame-ancestors 'none'"
@@ -1065,6 +1116,18 @@ struct MediaSessionBody {
     mode: String,
     #[serde(default)]
     file_index: Option<i64>,
+    #[serde(default)]
+    enhancement: RemotePlaybackEnhancement,
+    #[serde(default)]
+    start_position_seconds: Option<f64>,
+    #[serde(default = "default_subtitle_mode")]
+    subtitle_mode: String,
+    #[serde(default)]
+    subtitle_id: Option<String>,
+}
+
+fn default_subtitle_mode() -> String {
+    "soft".to_owned()
 }
 
 struct BrowserMediaRoute {
@@ -1097,6 +1160,12 @@ fn parse_browser_media_route(path: &str) -> Option<BrowserMediaRoute> {
         session_id,
         asset_name,
     })
+}
+
+fn parse_browser_media_diagnostics_route(path: &str) -> Option<String> {
+    let rest = path.strip_prefix("/api/media/sessions/")?;
+    let session_id = rest.strip_suffix("/diagnostics")?;
+    valid_token(session_id, 32).then(|| session_id.to_owned())
 }
 
 fn parse_external_media_route(path: &str) -> Option<ExternalMediaRoute> {
@@ -1162,6 +1231,7 @@ fn is_subtitle_name(value: &str) -> bool {
             value
                 .strip_suffix(".ass")
                 .or_else(|| value.strip_suffix(".vtt"))
+                .or_else(|| value.strip_suffix(".sup"))
         })
         .is_some_and(|value| value.len() == 3 && value.bytes().all(|byte| byte.is_ascii_digit()))
 }
@@ -1349,6 +1419,7 @@ mod tests {
 
     struct TestMediaRepository {
         task: DownloadTask,
+        media_files: Vec<MediaFile>,
     }
 
     #[async_trait]
@@ -1358,7 +1429,7 @@ mod tests {
         }
 
         async fn list_media_files(&self) -> Result<Vec<MediaFile>, String> {
-            Ok(Vec::new())
+            Ok(self.media_files.clone())
         }
 
         async fn get_settings(&self) -> Result<AppSettings, String> {
@@ -1401,6 +1472,10 @@ mod tests {
             "/api/media/sessions/{session}/hls/segment-000001.ts"
         ))
         .is_some());
+        assert!(parse_browser_media_route(&format!(
+            "/api/media/sessions/{session}/subtitles/subtitle-001.sup"
+        ))
+        .is_some());
         assert!(
             parse_browser_media_route(&format!("/api/media/sessions/{session}/../../secret"))
                 .is_none()
@@ -1410,11 +1485,25 @@ mod tests {
             "/api/media/external/{token}/sessions/{session}/file"
         ))
         .is_some());
+        assert!(parse_external_media_route(&format!(
+            "/api/media/external/{token}/sessions/{session}/subtitles/subtitle-001.sup"
+        ))
+        .is_some());
         let named = parse_external_media_route(&format!(
-            "/api/media/external/{token}/sessions/{session}/%E6%B5%8B%E8%AF%95%20SP01.mkv"
+            "/api/media/external/{token}/sessions/{session}/%E6%B5%8B%E8%AF%95%20%5B01%5D%20%23100%25%3F.mkv"
         ))
         .expect("named media route");
-        assert_eq!(named.asset_name, "测试 SP01.mkv");
+        assert_eq!(named.asset_name, "测试 [01] #100%?.mkv");
+        assert_eq!(
+            parse_browser_media_diagnostics_route(&format!(
+                "/api/media/sessions/{session}/diagnostics"
+            )),
+            Some(session)
+        );
+        assert!(
+            parse_browser_media_diagnostics_route("/api/media/sessions/short/diagnostics")
+                .is_none()
+        );
     }
 
     /// 验证 HTTPS 的 HTTP/2 authority 与 HTTP/1.1 Host 都进入同一白名单校验。
@@ -1487,8 +1576,10 @@ mod tests {
         )
         .await
         .expect("write renderer service worker");
-        let media_bytes = b"0123456789";
-        tokio::fs::write(download.join("episode-01.mkv"), media_bytes)
+        let mut media_bytes = vec![b'x'; DIRECT_MEDIA_STREAM_BUFFER_BYTES * 4];
+        media_bytes[..10].copy_from_slice(b"0123456789");
+        let media_file_name = "测试 [01] #100%.mkv";
+        tokio::fs::write(download.join(media_file_name), &media_bytes)
             .await
             .expect("write media");
 
@@ -1520,7 +1611,7 @@ mod tests {
             files: vec![TorrentFile {
                 id: "file-0".to_owned(),
                 index: 0,
-                name: "episode-01.mkv".to_owned(),
+                name: media_file_name.to_owned(),
                 episode_id: Some("episode-1".to_owned()),
                 episode_no: Some(1.0),
                 size: media_bytes.len() as i64,
@@ -1531,15 +1622,34 @@ mod tests {
             created_at: "2026-07-25T12:00:00.000Z".to_owned(),
             completed_at: Some("2026-07-25T12:10:00.000Z".to_owned()),
         };
+        let registered_media: MediaFile = serde_json::from_value(json!({
+            "id": "media-1",
+            "animeId": "anime-1",
+            "episodeId": "episode-1",
+            "downloadTaskId": "task-1",
+            "filePath": download.join(media_file_name).to_string_lossy(),
+            "fileName": "stale-database-name.mkv",
+            "size": media_bytes.len(),
+            "normalizedVideoCodec": "Unknown",
+            "audioCodecs": [],
+            "subtitleTracks": []
+        }))
+        .expect("registered media fixture");
         let secret_store: Arc<dyn RemoteSecretStore> = Arc::new(MemorySecretStore::default());
         let auth = Arc::new(RemoteDeviceAuth::new(Arc::clone(&secret_store)));
         let rpc = Arc::new(RemoteRpcService::new(Arc::new(TestRpcHandler)));
         let media = Arc::new(RemoteMediaSessionService::new(
-            Arc::new(TestMediaRepository { task }),
+            Arc::new(TestMediaRepository {
+                task,
+                media_files: vec![registered_media],
+            }),
             RemoteMediaTools {
                 ffprobe_paths: Vec::new(),
                 ffmpeg_path: PathBuf::from("ffmpeg"),
                 timeout: Duration::from_secs(1),
+                rife_sidecar_root: None,
+                realesrgan_sidecar_root: None,
+                model_available_vram_bytes: 0,
             },
             temporary.path().join("sessions"),
         ));
@@ -1590,6 +1700,7 @@ mod tests {
             .expect("inline script nonce");
         assert!(renderer_html.contains("<base href=\"/\" />"));
         assert!(renderer_html.contains("<title>Ani</title>"));
+        assert!(content_security_policy.contains("script-src 'self' 'wasm-unsafe-eval'"));
         assert!(content_security_policy.contains(&format!("'nonce-{script_nonce}'")));
         assert!(!content_security_policy.contains("script-src 'self' 'unsafe-inline'"));
 
@@ -1648,6 +1759,41 @@ mod tests {
             serde_json::from_str(&paired.text().await.expect("pair body")).expect("pair response");
         let token = paired["token"].as_str().expect("access token");
 
+        let rejected_enhancement = client
+            .post(format!("{base_url}/api/media/sessions"))
+            .bearer_auth(token)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(
+                json!({
+                    "taskId": "task-1",
+                    "mode": "direct",
+                    "fileIndex": 0,
+                    "enhancement": {
+                        "videoEnhancement": "clear",
+                        "frameInterpolation": "off"
+                    }
+                })
+                .to_string(),
+            )
+            .send()
+            .await
+            .expect("invalid direct enhancement request");
+        assert_eq!(
+            rejected_enhancement.status(),
+            reqwest::StatusCode::BAD_REQUEST
+        );
+        let rejected_enhancement: Value = serde_json::from_str(
+            &rejected_enhancement
+                .text()
+                .await
+                .expect("invalid direct enhancement body"),
+        )
+        .expect("invalid direct enhancement response");
+        assert_eq!(
+            rejected_enhancement["code"],
+            "MEDIA_ENHANCEMENT_REQUIRES_TRANSCODE"
+        );
+
         let rpc_response = client
             .post(format!("{base_url}/api/rpc"))
             .bearer_auth(token)
@@ -1673,6 +1819,214 @@ mod tests {
         let session: Value =
             serde_json::from_str(&session_response.text().await.expect("media session body"))
                 .expect("media session response");
+        let session_id = session["id"].as_str().expect("session id");
+        let unauthorized_status = client
+            .get(format!("{base_url}/api/media/sessions/{session_id}"))
+            .send()
+            .await
+            .expect("unauthorized media session status request");
+        assert_eq!(
+            unauthorized_status.status(),
+            reqwest::StatusCode::UNAUTHORIZED
+        );
+        let status_response = client
+            .get(format!("{base_url}/api/media/sessions/{session_id}"))
+            .bearer_auth(token)
+            .send()
+            .await
+            .expect("media session status request");
+        assert_eq!(status_response.status(), reqwest::StatusCode::OK);
+        let status: Value = serde_json::from_str(
+            &status_response
+                .text()
+                .await
+                .expect("media session status body"),
+        )
+        .expect("media session status response");
+        assert_eq!(status["id"], session["id"]);
+        assert_eq!(status["diagnostics"]["enhancedFrameInput"], false);
+        assert_eq!(status["diagnostics"]["playbackPath"], "direct");
+        let diagnostics_response = client
+            .put(format!(
+                "{base_url}/api/media/sessions/{session_id}/diagnostics"
+            ))
+            .bearer_auth(token)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(
+                json!({
+                    "sequence": 1,
+                    "status": "active",
+                    "capabilitySupported": true,
+                    "webCodecs": true,
+                    "audioWebCodecs": true,
+                    "audioContext": true,
+                    "shader": true,
+                    "webGpu": true,
+                    "offscreenCanvas": true,
+                    "mediaCapabilities": true,
+                    "supportedCodecs": ["avc1.640028"],
+                    "smoothCodecs": ["avc1.640028"],
+                    "powerEfficientCodecs": ["avc1.640028"],
+                    "requestedPreset": "clear",
+                    "effectivePreset": "balanced",
+                    "audioClock": "audio-context",
+                    "hasAudioTrack": true,
+                    "renderedFrames": 120,
+                    "droppedFrames": 2,
+                    "droppedFrameRatio": 0.0164,
+                    "frameBudgetMs": 26.67,
+                    "gpuQueueP95Ms": 8.4,
+                    "currentAvDriftMs": 12.5,
+                    "maximumAvDriftMs": 42.0,
+                    "rangeRequestCount": 12,
+                    "receivedRangeBytes": 1048576,
+                    "rangeRetryCount": 1,
+                    "recoveredRangeCount": 1,
+                    "networkFailureCount": 1,
+                    "gpuEstimatedWorkingSetBytes": 134217728,
+                    "gpuResourceBudgetBytes": 536870912
+                })
+                .to_string(),
+            )
+            .send()
+            .await
+            .expect("direct enhancement diagnostics request");
+        assert_eq!(diagnostics_response.status(), reqwest::StatusCode::OK);
+        let diagnostics: Value = serde_json::from_str(
+            &diagnostics_response
+                .text()
+                .await
+                .expect("direct enhancement diagnostics body"),
+        )
+        .expect("direct enhancement diagnostics response");
+        assert_eq!(
+            diagnostics["diagnostics"]["playbackPath"],
+            "direct-enhanced"
+        );
+        assert_eq!(
+            diagnostics["diagnostics"]["directEnhancement"]["sequence"],
+            1
+        );
+        assert!(diagnostics["diagnostics"]["directEnhancement"]["reportedAt"].is_string());
+
+        let degraded_response = client
+            .put(format!(
+                "{base_url}/api/media/sessions/{session_id}/diagnostics"
+            ))
+            .bearer_auth(token)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(
+                json!({
+                    "sequence": 2,
+                    "status": "degraded",
+                    "capabilitySupported": true,
+                    "webCodecs": true,
+                    "audioWebCodecs": true,
+                    "audioContext": true,
+                    "shader": true,
+                    "webGpu": true,
+                    "offscreenCanvas": true,
+                    "mediaCapabilities": true,
+                    "supportedCodecs": ["avc1.640028"],
+                    "smoothCodecs": ["avc1.640028"],
+                    "powerEfficientCodecs": ["avc1.640028"],
+                    "requestedPreset": "clear",
+                    "effectivePreset": "balanced",
+                    "audioClock": "audio-context",
+                    "hasAudioTrack": true,
+                    "renderedFrames": 121,
+                    "droppedFrames": 2,
+                    "droppedFrameRatio": 0.0162,
+                    "rangeRequestCount": 13,
+                    "receivedRangeBytes": 1100000,
+                    "rangeRetryCount": 1,
+                    "recoveredRangeCount": 1,
+                    "networkFailureCount": 1,
+                    "degradationReason": "WebGPU device lost"
+                })
+                .to_string(),
+            )
+            .send()
+            .await
+            .expect("degraded direct enhancement diagnostics request");
+        assert_eq!(degraded_response.status(), reqwest::StatusCode::OK);
+        let degraded: Value = serde_json::from_str(
+            &degraded_response
+                .text()
+                .await
+                .expect("degraded direct enhancement diagnostics body"),
+        )
+        .expect("degraded direct enhancement diagnostics response");
+        assert_eq!(degraded["diagnostics"]["playbackPath"], "direct");
+        assert_eq!(
+            degraded["diagnostics"]["directEnhancement"]["degradationReason"],
+            "WebGPU device lost"
+        );
+        let stale_response = client
+            .put(format!(
+                "{base_url}/api/media/sessions/{session_id}/diagnostics"
+            ))
+            .bearer_auth(token)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(
+                json!({
+                    "sequence": 1,
+                    "status": "idle",
+                    "renderedFrames": 0,
+                    "droppedFrames": 0,
+                    "droppedFrameRatio": 0.0,
+                    "rangeRequestCount": 0,
+                    "receivedRangeBytes": 0,
+                    "rangeRetryCount": 0,
+                    "recoveredRangeCount": 0,
+                    "networkFailureCount": 0
+                })
+                .to_string(),
+            )
+            .send()
+            .await
+            .expect("stale direct enhancement diagnostics request");
+        assert_eq!(stale_response.status(), reqwest::StatusCode::OK);
+        let stale: Value = serde_json::from_str(
+            &stale_response
+                .text()
+                .await
+                .expect("stale direct enhancement diagnostics body"),
+        )
+        .expect("stale direct enhancement diagnostics response");
+        assert_eq!(stale["diagnostics"]["directEnhancement"]["sequence"], 2);
+        assert_eq!(
+            stale["diagnostics"]["directEnhancement"]["status"],
+            "degraded"
+        );
+
+        let invalid_active = client
+            .put(format!(
+                "{base_url}/api/media/sessions/{session_id}/diagnostics"
+            ))
+            .bearer_auth(token)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(
+                json!({
+                    "sequence": 3,
+                    "status": "active",
+                    "capabilitySupported": true,
+                    "effectivePreset": "balanced",
+                    "renderedFrames": 1,
+                    "droppedFrames": 0,
+                    "droppedFrameRatio": 0.0,
+                    "rangeRequestCount": 1,
+                    "receivedRangeBytes": 1,
+                    "rangeRetryCount": 0,
+                    "recoveredRangeCount": 0,
+                    "networkFailureCount": 0
+                })
+                .to_string(),
+            )
+            .send()
+            .await
+            .expect("invalid active direct enhancement diagnostics request");
+        assert_eq!(invalid_active.status(), reqwest::StatusCode::BAD_REQUEST);
         let stream_url = session["streamUrl"].as_str().expect("stream url");
         let range_response = client
             .get(format!("{base_url}{stream_url}"))
@@ -1690,7 +2044,7 @@ mod tests {
                 .headers()
                 .get(reqwest::header::CONTENT_RANGE)
                 .and_then(|value| value.to_str().ok()),
-            Some("bytes 2-5/10")
+            Some(format!("bytes 2-5/{}", media_bytes.len()).as_str())
         );
         assert_eq!(
             range_response
@@ -1704,7 +2058,7 @@ mod tests {
                 .headers()
                 .get(reqwest::header::CONTENT_DISPOSITION)
                 .and_then(|value| value.to_str().ok()),
-            Some("inline; filename*=UTF-8''episode%2D01%2Emkv")
+            Some("inline; filename*=UTF-8''%E6%B5%8B%E8%AF%95%20%5B01%5D%20%23100%25%2Emkv")
         );
         assert_eq!(
             range_response.bytes().await.expect("range body").as_ref(),
@@ -1715,7 +2069,14 @@ mod tests {
             .post(format!("{base_url}/api/media/external-sessions"))
             .bearer_auth(token)
             .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .body(json!({ "taskId": "task-1", "mode": "direct", "fileIndex": 0 }).to_string())
+            .body(
+                json!({
+                    "taskId": "task-1",
+                    "mode": "direct",
+                    "startPositionSeconds": 321.5
+                })
+                .to_string(),
+            )
             .send()
             .await
             .expect("external media session request");
@@ -1730,7 +2091,9 @@ mod tests {
         let external_stream_url = external_session["streamUrl"]
             .as_str()
             .expect("external stream url");
-        assert!(external_stream_url.ends_with("/episode-01.mkv"));
+        assert_eq!(external_session["mode"], "direct");
+        assert!(external_session["startPositionSeconds"].is_null());
+        assert!(external_stream_url.ends_with("/%E6%B5%8B%E8%AF%95%20%5B01%5D%20%23100%25.mkv"));
         let external_head = client
             .head(format!("{base_url}{external_stream_url}"))
             .send()
@@ -1743,6 +2106,64 @@ mod tests {
                 .get(reqwest::header::ACCEPT_RANGES)
                 .and_then(|value| value.to_str().ok()),
             Some("bytes")
+        );
+        assert_eq!(
+            external_head
+                .headers()
+                .get(reqwest::header::CONTENT_LENGTH)
+                .and_then(|value| value.to_str().ok()),
+            Some(media_bytes.len().to_string().as_str())
+        );
+        assert_eq!(
+            external_head
+                .headers()
+                .get(reqwest::header::CONTENT_DISPOSITION)
+                .and_then(|value| value.to_str().ok()),
+            Some("inline; filename*=UTF-8''%E6%B5%8B%E8%AF%95%20%5B01%5D%20%23100%25%2Emkv")
+        );
+
+        let mut interrupted_range = client
+            .get(format!("{base_url}{external_stream_url}"))
+            .header(reqwest::header::RANGE, "bytes=0-")
+            .send()
+            .await
+            .expect("open-ended range request");
+        assert_eq!(
+            interrupted_range.status(),
+            reqwest::StatusCode::PARTIAL_CONTENT
+        );
+        let first_chunk = interrupted_range
+            .chunk()
+            .await
+            .expect("first range chunk")
+            .expect("range body chunk");
+        assert!(
+            first_chunk.len() <= DIRECT_MEDIA_STREAM_BUFFER_BYTES,
+            "direct media chunk should be interruptible within {} bytes, got {}",
+            DIRECT_MEDIA_STREAM_BUFFER_BYTES,
+            first_chunk.len()
+        );
+        drop(interrupted_range);
+
+        let resume_start = media_bytes.len() - 4;
+        let resumed_range = tokio::time::timeout(
+            Duration::from_secs(2),
+            client
+                .get(format!("{base_url}{external_stream_url}"))
+                .header(reqwest::header::RANGE, format!("bytes={resume_start}-"))
+                .send(),
+        )
+        .await
+        .expect("range after interrupted transfer")
+        .expect("resume range request");
+        assert_eq!(resumed_range.status(), reqwest::StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            resumed_range
+                .bytes()
+                .await
+                .expect("resumed range body")
+                .as_ref(),
+            b"xxxx"
         );
 
         gateway.stop().await;

@@ -86,6 +86,8 @@ test("Tauri P6 远程网关契约金样可被 TypeScript 接受", () => {
   assert.equal(fixture.payload.gatewayStatus.devices[0]?.lastAccessedAt, null);
   assert.equal(fixture.payload.pairingChallenge.code, "123456");
   assert.equal(fixture.payload.playbackSession.mode, "direct");
+  assert.equal(fixture.payload.playbackSession.diagnostics?.enhancedFrameInput, false);
+  assert.equal(fixture.payload.playbackSession.diagnostics?.playbackPath, undefined);
 });
 
 /** 读取 P6 桌面功能对等金样，验证采集和单集预览字段。 */
@@ -333,6 +335,8 @@ test("Tauri P5 播放器命令契约金样可被 TypeScript 接受", () => {
     loadCommand: PlayerCommand;
     rejectedResult: PlayerCommandResult;
     subtitleScaleCommand: PlayerCommand;
+    frameInterpolationCommand: PlayerCommand;
+    hdrCommand: PlayerCommand;
     androidCapabilities: PlayerCapabilities;
     iosCapabilities: PlayerCapabilities;
     playbackSession: RemotePlaybackSession;
@@ -347,8 +351,18 @@ test("Tauri P5 播放器命令契约金样可被 TypeScript 接受", () => {
   assert.equal(fixture.payload.loadCommand.source.subtitles[0].type, "ass");
   assert.equal(fixture.payload.rejectedResult.accepted, false);
   assert.equal(fixture.payload.subtitleScaleCommand.type, "set-subtitle-scale");
+  assert.equal(fixture.payload.frameInterpolationCommand.type, "set-frame-interpolation");
+  if (fixture.payload.frameInterpolationCommand.type === "set-frame-interpolation") {
+    assert.equal(fixture.payload.frameInterpolationCommand.frameInterpolation, "rife-realtime");
+  }
+  assert.equal(fixture.payload.hdrCommand.type, "set-hdr");
+  if (fixture.payload.hdrCommand.type === "set-hdr") {
+    assert.equal(fixture.payload.hdrCommand.hdr, "auto");
+  }
   assert.equal(fixture.payload.androidCapabilities.platform, "android");
   assert.equal(fixture.payload.iosCapabilities.platform, "ios");
   assert.equal(fixture.payload.iosCapabilities.supportsTranscodingFallback, false);
+  assert.equal(fixture.payload.iosCapabilities.supportsHdr, false);
   assert.equal(fixture.payload.playbackSession.mode, "direct");
+  assert.equal(fixture.payload.playbackSession.diagnostics?.enhancedFrameInput, false);
 });

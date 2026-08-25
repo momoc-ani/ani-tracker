@@ -146,8 +146,8 @@ export interface AppClient {
 
   /** 列出本地番剧目录。 */
   listAnimeCatalog(year?: number, month?: number): Promise<Anime[]>;
-  /** 搜索本地与在线番剧目录。 */
-  searchAnimeCatalog(keyword: string): Promise<AnimeDiscoverySearchResult>;
+  /** 搜索本地番剧目录，并按需查询在线元数据来源。 */
+  searchAnimeCatalog(keyword: string, includeOnline?: boolean): Promise<AnimeDiscoverySearchResult>;
   /** 直接在线浏览 Bangumi，不读取或写入季度目录缓存。 */
   browseBangumiAnime(query: BangumiBrowseQuery): Promise<BangumiBrowseResult>;
   /** 保存 Bangumi 追番并在后台补全 AniList、Mikan 元数据。 */

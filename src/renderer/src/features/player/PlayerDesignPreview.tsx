@@ -10,6 +10,7 @@ import type { RemotePlaybackRequestMode, RemotePlaybackSession } from "@shared/c
 import type { Anime, DownloadTask, Episode } from "@shared/domain";
 import type { RemotePlaylistItem } from "@/features/player/playback-list-model";
 import type { PlayerSubtitleScale } from "@shared/player-contract";
+import type { PlayerVideoEnhancement } from "@shared/player-contract";
 
 const PREVIEW_DESKTOP_FRAME_URL = "https://lh3.googleusercontent.com/aida-public/AB6AXuAgL2mdTyi1Xs9Yb1id3AmPBIeCFYvY3nrylRUwWUo4ZN0w9MExoBEQiABCj5Up9Wo9PyCbZ2YSrLVvfVANbuBTxvKjqOKEKtzcfpaquZdgnIlHdH9-FLekoQyXY0UgHLYciZh92dSS2hw9zOWX7ocE6pEGW6_ZOxFfPSaBbZDgs9Oa5QrWK8URPx2SazTvrW-Kg-1MDJPsJlc9jSKldT9YMKsgaqCiIXrYQYjOYbZinQxIHWfvR9YPnQn8o4N1znZbRfjKMNlavdoh";
 const PREVIEW_LANDSCAPE_FRAME_URL = "https://lh3.googleusercontent.com/aida-public/AB6AXuD8BzePUI2MmVa32TfyST_TnZ4O2188fprpF8JpHDSGtzjI7mbh2KQm1hYcktxVwwTqkkedkdCobDBczFz4Mhlm1qEIWruz02t2lGRka9ZqdEwjFU_KJHKloj5sR37Ndev9kwU8qE1tcPE9WjI0Ydx7WkPPF-iLuGBNSXZxSB6x-2PLSX85MHIsvsQ9pti4BH989tUvLFPbL269TQKRrmesVoJSNoDxTo8AeVeHyTrtYdJd5JBhfvlKcq053xClbSJSgsUlA5nQW4pk";
@@ -31,6 +32,7 @@ export function PlayerDesignPreview({ mode }: { mode: string }) {
   const [playbackMode, setPlaybackMode] = useState<RemotePlaybackRequestMode>("direct");
   const [subtitleId, setSubtitleId] = useState<string | undefined>("chs-ass");
   const [subtitleScale, setSubtitleScale] = useState<PlayerSubtitleScale>(100);
+  const [videoEnhancement, setVideoEnhancement] = useState<PlayerVideoEnhancement>("balanced");
   const episodeItems = useMemo(createPreviewEpisodeItems, []);
 
   useEffect(() => {
@@ -64,6 +66,7 @@ export function PlayerDesignPreview({ mode }: { mode: string }) {
           onChangeRate={setRate}
           onChangeSubtitle={setSubtitleId}
           onChangeSubtitleScale={setSubtitleScale}
+          onChangeVideoEnhancement={setVideoEnhancement}
           onClose={() => undefined}
           onGoNext={() => undefined}
           onGoPrevious={() => undefined}
@@ -84,6 +87,8 @@ export function PlayerDesignPreview({ mode }: { mode: string }) {
           statusBadges={["原文件直传", "3 条字幕", "1080P"]}
           subtitleScale={subtitleScale}
           subtitleScaleAvailable
+          videoEnhancement={videoEnhancement}
+          videoEnhancementAvailable
           subtitles={previewSession.subtitles}
           visible
           volume={volume}
@@ -191,7 +196,15 @@ const previewSession: RemotePlaybackSession = {
     { id: "chs-ass", label: "简体中文", language: "zh-CN", type: "ass", url: "preview://chs", default: true },
     { id: "cht-ass", label: "繁体中文", language: "zh-TW", type: "ass", url: "preview://cht", default: false },
     { id: "jpn-vtt", label: "日文", language: "ja", type: "vtt", url: "preview://jpn", default: false }
-  ]
+  ],
+  diagnostics: {
+    encoder: "libx264",
+    encoderDegraded: true,
+    subtitleMode: "soft",
+    enhancedFrameInput: false,
+    videoEnhancement: "off",
+    frameInterpolation: "off"
+  }
 };
 
 /** 构造与 Stitch 稿一致的十二集预览状态。 */

@@ -286,6 +286,80 @@ pub struct SelectPlayerExecutableInput {
 pub enum PlayerBackend {
     Artplayer,
     Libvlc,
+    Mpv,
+}
+
+/// GPU 视频增强预设；字幕和 OSD 在该阶段之后由播放器合成。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum PlayerVideoEnhancement {
+    #[default]
+    Off,
+    Balanced,
+    Clear,
+}
+
+/// 基于模型的实时补帧模式；只有完成模型运行时接入后才可用。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum PlayerFrameInterpolation {
+    #[default]
+    Off,
+    DisplayResample,
+    MotionCompensated,
+    RifeRealtime,
+}
+
+/// HDR 输出模式；Auto 只有在源、渲染器和显示器能力齐全时才允许开启。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum PlayerHdrMode {
+    #[default]
+    Off,
+    Auto,
+}
+
+/// HDR 自动输出所需的三项独立能力；三者同时满足前不得声明 HDR 可用。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct PlayerHdrCapabilities {
+    #[serde(default)]
+    pub source_hdr: bool,
+    #[serde(default)]
+    pub renderer_hdr: bool,
+    #[serde(default)]
+    pub display_hdr: bool,
+}
+
+impl PlayerHdrCapabilities {
+    /// 返回源、渲染器和显示器是否形成完整 HDR 输出链路。
+    pub fn available(self) -> bool {
+        self.source_hdr && self.renderer_hdr && self.display_hdr
+    }
+}
+
+/// 当前增强链路的可观测信息，不代表模型一定已加载。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct PlayerEnhancementDiagnostics {
+    #[serde(default)]
+    pub pipeline: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gpu_vendor: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub renderer: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decoder: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_backend: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frame_time_ms: Option<f64>,
+    #[serde(default)]
+    pub dropped_frames: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub degradation_reason: Option<String>,
+    #[serde(default)]
+    pub hdr_capabilities: PlayerHdrCapabilities,
 }
 
 /// 播放器所在的平台宿主。
@@ -387,6 +461,12 @@ pub struct PlayerCapabilities {
     pub supports_subtitle_tracks: bool,
     #[serde(default)]
     pub supports_subtitle_scale: bool,
+    #[serde(default)]
+    pub supports_video_enhancement: bool,
+    #[serde(default)]
+    pub supports_frame_interpolation: bool,
+    #[serde(default)]
+    pub supports_model_enhancement: bool,
     pub supports_aspect_ratio: bool,
     pub supports_fullscreen: bool,
     pub supports_picture_in_picture: bool,
@@ -540,6 +620,15 @@ pub enum PlayerCommandAction {
     SetSubtitleScale {
         subtitle_scale: u16,
     },
+    SetVideoEnhancement {
+        video_enhancement: PlayerVideoEnhancement,
+    },
+    SetFrameInterpolation {
+        frame_interpolation: PlayerFrameInterpolation,
+    },
+    SetHdr {
+        hdr: PlayerHdrMode,
+    },
     SetAspectRatio {
         aspect_ratio: PlayerAspectRatio,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -571,6 +660,9 @@ impl PlayerCommand {
             PlayerCommandAction::SelectAudioTrack { .. } => "select-audio-track",
             PlayerCommandAction::SelectSubtitleTrack { .. } => "select-subtitle-track",
             PlayerCommandAction::SetSubtitleScale { .. } => "set-subtitle-scale",
+            PlayerCommandAction::SetVideoEnhancement { .. } => "set-video-enhancement",
+            PlayerCommandAction::SetFrameInterpolation { .. } => "set-frame-interpolation",
+            PlayerCommandAction::SetHdr { .. } => "set-hdr",
             PlayerCommandAction::SetAspectRatio { .. } => "set-aspect-ratio",
             PlayerCommandAction::SetFullscreen { .. } => "set-fullscreen",
             PlayerCommandAction::SetPictureInPicture { .. } => "set-picture-in-picture",
@@ -615,6 +707,16 @@ pub struct PlayerSnapshot {
     pub subtitle_tracks: Vec<PlayerTrack>,
     #[serde(default = "default_subtitle_scale")]
     pub subtitle_scale: u16,
+    #[serde(default)]
+    pub video_enhancement: PlayerVideoEnhancement,
+    #[serde(default)]
+    pub video_enhancement_degraded: bool,
+    #[serde(default)]
+    pub frame_interpolation: PlayerFrameInterpolation,
+    #[serde(default)]
+    pub hdr: PlayerHdrMode,
+    #[serde(default)]
+    pub enhancement_diagnostics: PlayerEnhancementDiagnostics,
     pub aspect_ratio: PlayerAspectRatio,
     pub fullscreen: bool,
     pub picture_in_picture: bool,
@@ -752,6 +854,153 @@ pub struct RemotePlaybackSubtitle {
     pub default: bool,
 }
 
+/// 远程 AI 插帧在当前源帧率、模型性能、显存和输出上限下的容量结果。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteInterpolationCapacity {
+    pub source_frame_rate: f64,
+    pub target_frame_rate: f64,
+    pub selected_multiplier: u8,
+    pub max_feasible_multiplier: u8,
+    pub output_frame_rate_cap: f64,
+    pub interval_budget_ms: f64,
+    pub estimated_interval_cost_ms: f64,
+    pub interpolation_p95_ms: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enhancement_p95_ms: Option<f64>,
+    pub latency_sample_count: u64,
+}
+
+/// 远程媒体会话实际采用的传输与增强路径。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RemotePlaybackPath {
+    #[default]
+    Direct,
+    DirectEnhanced,
+    Hls,
+}
+
+/// 远程浏览器中 WebCodecs/WebGPU 直传增强的生命周期状态。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RemoteDirectEnhancementStatus {
+    #[default]
+    Idle,
+    Probing,
+    Starting,
+    Active,
+    Degraded,
+}
+
+/// 远程浏览器提交的直传增强能力和有界运行指标。
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RemoteDirectEnhancementDiagnostics {
+    pub sequence: u64,
+    pub status: RemoteDirectEnhancementStatus,
+    #[serde(default)]
+    pub capability_supported: bool,
+    #[serde(default)]
+    pub web_codecs: bool,
+    #[serde(default)]
+    pub audio_web_codecs: bool,
+    #[serde(default)]
+    pub audio_context: bool,
+    #[serde(default)]
+    pub shader: bool,
+    #[serde(default)]
+    pub web_gpu: bool,
+    #[serde(default)]
+    pub offscreen_canvas: bool,
+    #[serde(default)]
+    pub media_capabilities: bool,
+    #[serde(default)]
+    pub supported_codecs: Vec<String>,
+    #[serde(default)]
+    pub smooth_codecs: Vec<String>,
+    #[serde(default)]
+    pub power_efficient_codecs: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_preset: Option<PlayerVideoEnhancement>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effective_preset: Option<PlayerVideoEnhancement>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio_clock: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub has_audio_track: Option<bool>,
+    #[serde(default)]
+    pub rendered_frames: u64,
+    #[serde(default)]
+    pub dropped_frames: u64,
+    #[serde(default)]
+    pub dropped_frame_ratio: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frame_budget_ms: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gpu_queue_p95_ms: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_av_drift_ms: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub maximum_av_drift_ms: Option<f64>,
+    #[serde(default)]
+    pub range_request_count: u64,
+    #[serde(default)]
+    pub received_range_bytes: u64,
+    #[serde(default)]
+    pub range_retry_count: u64,
+    #[serde(default)]
+    pub recovered_range_count: u64,
+    #[serde(default)]
+    pub network_failure_count: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gpu_estimated_working_set_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gpu_resource_budget_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub degradation_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reported_at: Option<String>,
+}
+
+/// 远程增强输出的实际传输和编码诊断，不代表请求一定使用了硬件编码。
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemotePlaybackDiagnostics {
+    #[serde(default)]
+    pub playback_path: RemotePlaybackPath,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encoder: Option<String>,
+    #[serde(default)]
+    pub encoder_degraded: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subtitle_mode: Option<String>,
+    #[serde(default)]
+    pub enhanced_frame_input: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_backend: Option<String>,
+    #[serde(default)]
+    pub video_enhancement: PlayerVideoEnhancement,
+    #[serde(default)]
+    pub frame_interpolation: PlayerFrameInterpolation,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interpolation_capacity: Option<RemoteInterpolationCapacity>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub degradation_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub direct_enhancement: Option<RemoteDirectEnhancementDiagnostics>,
+}
+
+/// 远程转码实际请求的像素处理链；直传模式必须保持关闭。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemotePlaybackEnhancement {
+    #[serde(default)]
+    pub video_enhancement: PlayerVideoEnhancement,
+    #[serde(default)]
+    pub frame_interpolation: PlayerFrameInterpolation,
+}
+
 /// 远程设备的短期受控播放会话，不暴露本地路径。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -768,7 +1017,11 @@ pub struct RemotePlaybackSession {
     pub duration_seconds: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub start_position_seconds: Option<f64>,
+    #[serde(default)]
+    pub stream_start_position_seconds: f64,
     pub subtitles: Vec<RemotePlaybackSubtitle>,
+    #[serde(default)]
+    pub diagnostics: RemotePlaybackDiagnostics,
 }
 
 #[cfg(test)]
@@ -779,10 +1032,26 @@ mod tests {
         ContractFixture, DesktopMediaToolsStatus, DownloadServiceMode, DownloadServiceState,
         DownloadServiceStatus, EmbeddedTorrentCoreStatus, ImageCacheResolveResult, PlaybackSession,
         PlayerCommand, PlayerCommandAction, PlayerCommandResult, PlayerDetectionResult,
-        PlayerHostPlatform, PlayerSnapshot, PlayerStatus, QbittorrentManagedStatus,
-        RemoteGatewayStatus, RemotePairingChallenge, RemotePlaybackSession,
-        TorrentConnectionTestResult,
+        PlayerHdrCapabilities, PlayerHostPlatform, PlayerSnapshot, PlayerStatus,
+        QbittorrentManagedStatus, RemoteGatewayStatus, RemotePairingChallenge, RemotePlaybackPath,
+        RemotePlaybackSession, TorrentConnectionTestResult,
     };
+
+    #[test]
+    fn hdr_requires_source_renderer_and_display_capabilities() {
+        assert!(!PlayerHdrCapabilities {
+            source_hdr: true,
+            renderer_hdr: true,
+            display_hdr: false,
+        }
+        .available());
+        assert!(PlayerHdrCapabilities {
+            source_hdr: true,
+            renderer_hdr: true,
+            display_hdr: true,
+        }
+        .available());
+    }
 
     #[derive(Deserialize)]
     #[serde(rename_all = "camelCase")]
@@ -853,6 +1122,10 @@ mod tests {
         assert_eq!(fixture.payload.pairing_challenge.code, "123456");
         assert!(fixture.payload.image_cache.url.starts_with("https://"));
         assert_eq!(fixture.payload.playback_session.mode, "direct");
+        assert_eq!(
+            fixture.payload.playback_session.diagnostics.playback_path,
+            RemotePlaybackPath::Direct
+        );
     }
 
     /// 验证 Rust 能严格解码前端共用的播放器快照金样。

@@ -6,9 +6,11 @@ use tauri::{
 #[cfg(desktop)]
 mod desktop;
 #[cfg(desktop)]
-mod desktop_runtime;
+mod enhancement;
 #[cfg(mobile)]
 mod mobile;
+#[cfg(desktop)]
+mod mpv_runtime;
 
 mod error;
 

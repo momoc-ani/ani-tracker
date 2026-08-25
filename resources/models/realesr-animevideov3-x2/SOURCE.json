@@ -1,0 +1,24 @@
+{
+  "repository": "https://github.com/xinntao/Real-ESRGAN-ncnn-vulkan.git",
+  "commit": "37026f49824c5cf84062e7c6a5dd71445dcf610f",
+  "modelId": "realesr-animevideov3-x2",
+  "backend": "ncnn-vulkan",
+  "target": "portable-model-weights",
+  "modelArchive": {
+    "repository": "https://github.com/xinntao/Real-ESRGAN",
+    "release": "v0.2.5.0",
+    "asset": "realesrgan-ncnn-vulkan-20220424-windows.zip",
+    "size": 45474481,
+    "sha256": "abc02804e17982a3be33675e4d471e91ea374e65b70167abc09e31acb412802d"
+  },
+  "modelFiles": [
+    {
+      "name": "realesr-animevideov3-x2.bin",
+      "sha256": "548a36f9c3f4ab8da56cd3b13badf23968bee207b396dad14d04b830e5f2ab2d"
+    },
+    {
+      "name": "realesr-animevideov3-x2.param",
+      "sha256": "b88ff4f00ebf019a7fdac17fdd45a7fd3665d37509efc5baf2e4da2e24420a04"
+    }
+  ]
+}

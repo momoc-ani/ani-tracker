@@ -9,6 +9,7 @@
     "outDir": "out/test-node"
   },
   "include": [
-    "src/shared/__tests__/**/*.test.ts"
+    "src/shared/__tests__/**/*.test.ts",
+    "src/shared/playback-session-refresh.ts"
   ]
 }

@@ -650,6 +650,11 @@ export type RemotePlaybackMode = "direct" | "hls";
 
 export type RemotePlaybackRequestMode = "direct" | "transcode";
 
+export interface RemotePlaybackEnhancement {
+  videoEnhancement: import("./player-contract").PlayerVideoEnhancement;
+  frameInterpolation: import("./player-contract").PlayerFrameInterpolation;
+}
+
 export interface DesktopPlayerWindowInput {
   taskId: string;
   fileIndex?: number;
@@ -677,7 +682,7 @@ export interface DesktopMediaToolsStatus {
   ffmpeg: MediaToolStatus;
 }
 
-export type RemotePlaybackSubtitleType = "ass" | "vtt";
+export type RemotePlaybackSubtitleType = "ass" | "vtt" | "pgs";
 
 export interface RemotePlaybackSubtitle {
   id: string;
@@ -686,6 +691,79 @@ export interface RemotePlaybackSubtitle {
   type: RemotePlaybackSubtitleType;
   url: string;
   default: boolean;
+}
+
+/** 基于当前源帧率、模型 P95、显存和输出上限得到的 AI 插帧计划。 */
+export interface RemoteInterpolationCapacity {
+  sourceFrameRate: number;
+  targetFrameRate: number;
+  selectedMultiplier: number;
+  maxFeasibleMultiplier: number;
+  outputFrameRateCap: number;
+  intervalBudgetMs: number;
+  estimatedIntervalCostMs: number;
+  interpolationP95Ms: number;
+  enhancementP95Ms?: number;
+  latencySampleCount: number;
+}
+
+export type RemotePlaybackPath = "direct" | "direct-enhanced" | "hls";
+
+export type RemoteDirectEnhancementStatus = "idle" | "probing" | "starting" | "active" | "degraded";
+
+/** 远程浏览器上报的 WebCodecs/WebGPU 直传增强运行快照。 */
+export interface RemoteDirectEnhancementReport {
+  sequence: number;
+  status: RemoteDirectEnhancementStatus;
+  capabilitySupported: boolean;
+  webCodecs: boolean;
+  audioWebCodecs: boolean;
+  audioContext: boolean;
+  shader: boolean;
+  webGpu: boolean;
+  offscreenCanvas: boolean;
+  mediaCapabilities: boolean;
+  supportedCodecs: string[];
+  smoothCodecs: string[];
+  powerEfficientCodecs: string[];
+  requestedPreset?: "balanced" | "clear";
+  effectivePreset?: "balanced" | "clear";
+  audioClock?: "audio-context";
+  hasAudioTrack?: boolean;
+  renderedFrames: number;
+  droppedFrames: number;
+  droppedFrameRatio: number;
+  frameBudgetMs?: number;
+  gpuQueueP95Ms?: number;
+  currentAvDriftMs?: number;
+  maximumAvDriftMs?: number;
+  rangeRequestCount: number;
+  receivedRangeBytes: number;
+  rangeRetryCount: number;
+  recoveredRangeCount: number;
+  networkFailureCount: number;
+  gpuEstimatedWorkingSetBytes?: number;
+  gpuResourceBudgetBytes?: number;
+  degradationReason?: string;
+}
+
+export interface RemoteDirectEnhancementDiagnostics extends RemoteDirectEnhancementReport {
+  reportedAt: string;
+}
+
+/** 远程播放实际采用的传输、编码、模型和终端增强路径。 */
+export interface RemotePlaybackDiagnostics {
+  playbackPath?: RemotePlaybackPath;
+  encoder?: string;
+  encoderDegraded: boolean;
+  subtitleMode?: "soft" | "burned";
+  enhancedFrameInput: boolean;
+  modelBackend?: string;
+  videoEnhancement: import("./player-contract").PlayerVideoEnhancement;
+  frameInterpolation: import("./player-contract").PlayerFrameInterpolation;
+  interpolationCapacity?: RemoteInterpolationCapacity;
+  degradationReason?: string;
+  directEnhancement?: RemoteDirectEnhancementDiagnostics;
 }
 
 export interface RemotePlaybackSession {
@@ -698,7 +776,9 @@ export interface RemotePlaybackSession {
   expiresAt: string;
   durationSeconds?: number;
   startPositionSeconds?: number;
+  streamStartPositionSeconds?: number;
   subtitles: RemotePlaybackSubtitle[];
+  diagnostics?: RemotePlaybackDiagnostics;
 }
 
 export interface MetadataProvider {

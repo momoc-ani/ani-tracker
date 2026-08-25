@@ -84,6 +84,7 @@ import { emitManualDownloadAdded } from "@/lib/mobile-download-notification";
 
 const WINDOW_STATE_CHANGED_EVENT = "window-state-changed";
 const DOWNLOAD_SERVICE_STATUS_CHANGED_EVENT = "download-service-status-changed";
+const LOCAL_DOWNLOAD_SERVICE_STATUS_CHANGED_EVENT = "ani:download-service-status-changed";
 const PLAYER_SNAPSHOT_EVENT = "player-snapshot";
 const LOCAL_MEDIA_IMPORT_STATUS_CHANGED_EVENT = "local-media-import-status-changed";
 
@@ -449,9 +450,9 @@ class TauriClientCore implements AppClient {
     });
   }
 
-  /** 按标题、原名和别名搜索本地番剧目录。 */
-  async searchAnimeCatalog(keyword: string): Promise<AnimeDiscoverySearchResult> {
-    return invoke<AnimeDiscoverySearchResult>("search_anime_catalog", { keyword }).catch((error) => {
+  /** 按标题、原名和别名搜索本地目录，并按需请求在线来源。 */
+  async searchAnimeCatalog(keyword: string, includeOnline = true): Promise<AnimeDiscoverySearchResult> {
+    return invoke<AnimeDiscoverySearchResult>("search_anime_catalog", { keyword, includeOnline }).catch((error) => {
       throw normalizeTauriError("search_anime_catalog", error);
     });
   }
@@ -618,6 +619,8 @@ class TauriClientCore implements AppClient {
   onDownloadServiceStatusChanged(listener: () => void): () => void {
     let disposed = false;
     let unlisten: UnlistenFn | undefined;
+    const handleLocalStatusChanged = () => listener();
+    window.addEventListener(LOCAL_DOWNLOAD_SERVICE_STATUS_CHANGED_EVENT, handleLocalStatusChanged);
     void listen(DOWNLOAD_SERVICE_STATUS_CHANGED_EVENT, () => listener()).then((dispose) => {
       if (disposed) {
         dispose();
@@ -628,7 +631,13 @@ class TauriClientCore implements AppClient {
     return () => {
       disposed = true;
       unlisten?.();
+      window.removeEventListener(LOCAL_DOWNLOAD_SERVICE_STATUS_CHANGED_EVENT, handleLocalStatusChanged);
     };
+  }
+
+  /** 通知当前渲染器立即刷新应用壳的下载服务状态。 */
+  private emitLocalDownloadServiceStatusChanged(): void {
+    window.dispatchEvent(new Event(LOCAL_DOWNLOAD_SERVICE_STATUS_CHANGED_EVENT));
   }
 
   /** 读取托管 qBittorrent-nox 进程状态。 */
@@ -640,16 +649,20 @@ class TauriClientCore implements AppClient {
 
   /** 启动托管 qBittorrent-nox。 */
   async startQbittorrentManaged(): Promise<QbittorrentManagedStatus> {
-    return invoke<QbittorrentManagedStatus>("start_qbittorrent_managed").catch((error) => {
+    const status = await invoke<QbittorrentManagedStatus>("start_qbittorrent_managed").catch((error) => {
       throw normalizeTauriError("start_qbittorrent_managed", error);
     });
+    this.emitLocalDownloadServiceStatusChanged();
+    return status;
   }
 
   /** 停止托管 qBittorrent-nox。 */
   async stopQbittorrentManaged(): Promise<QbittorrentManagedStatus> {
-    return invoke<QbittorrentManagedStatus>("stop_qbittorrent_managed").catch((error) => {
+    const status = await invoke<QbittorrentManagedStatus>("stop_qbittorrent_managed").catch((error) => {
       throw normalizeTauriError("stop_qbittorrent_managed", error);
     });
+    this.emitLocalDownloadServiceStatusChanged();
+    return status;
   }
 
   /** 读取内置 torrent-core 状态。 */
@@ -794,14 +807,14 @@ class TauriClientCore implements AppClient {
     });
   }
 
-  /** 打开 Tauri 桌面 libVLC 双窗口。 */
+  /** 打开 Tauri 桌面 libmpv 视频窗口与透明控制层。 */
   async openDesktopPlayerWindow(input: DesktopPlayerWindowInput): Promise<void> {
     return invoke<void>("open_desktop_player_window", { input }).catch((error) => {
       throw normalizeTauriError("open_desktop_player_window", error);
     });
   }
 
-  /** 关闭 Tauri 桌面 libVLC 双窗口。 */
+  /** 关闭 Tauri 桌面 libmpv 视频窗口与透明控制层。 */
   closeDesktopPlayerWindow(): void {
     void invoke<void>("close_desktop_player_window").catch((error) => {
       console.error("[tauri-client] 关闭播放器窗口失败", normalizeTauriError("close_desktop_player_window", error));
@@ -838,21 +851,21 @@ class TauriClientCore implements AppClient {
     });
   }
 
-  /** 读取 Tauri libVLC 后端能力。 */
+  /** 读取 Tauri libmpv 后端能力。 */
   async getDesktopPlayerCapabilities(): Promise<PlayerCapabilities> {
     return invoke<PlayerCapabilities>("get_desktop_player_capabilities").catch((error) => {
       throw normalizeTauriError("get_desktop_player_capabilities", error);
     });
   }
 
-  /** 向 Tauri libVLC 后端发送统一命令。 */
+  /** 向 Tauri libmpv 后端发送统一命令。 */
   async dispatchDesktopPlayerCommand(command: PlayerCommand): Promise<PlayerCommandResult> {
     return invoke<PlayerCommandResult>("dispatch_desktop_player_command", { command }).catch((error) => {
       throw normalizeTauriError("dispatch_desktop_player_command", error);
     });
   }
 
-  /** 订阅 Tauri libVLC 完整快照。 */
+  /** 订阅 Tauri libmpv 完整快照。 */
   onDesktopPlayerSnapshot(listener: (snapshot: PlayerSnapshot) => void): () => void {
     let disposed = false;
     let unlisten: UnlistenFn | undefined;

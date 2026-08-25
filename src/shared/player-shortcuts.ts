@@ -4,6 +4,7 @@ export type PlayerShortcutKey =
   | "arrowright"
   | "arrowup"
   | "arrowdown"
+  | "escape"
   | "m"
   | "f"
   | "l"
@@ -28,6 +29,7 @@ interface ClosestTarget {
 }
 
 const PLAYER_SHORTCUT_KEYS = new Set<PlayerShortcutKey>([
+  "escape",
   "arrowleft",
   "arrowright",
   "arrowup",
@@ -56,6 +58,21 @@ const PLAYER_SHORTCUT_BLOCK_SELECTOR = [
 
 /** 将键盘事件解析为播放器快捷键，并排除编辑态和控件原生交互。 */
 export function resolvePlayerShortcut(event: PlayerShortcutEvent): PlayerShortcutKey | undefined {
+  const isEscape = event.code === "Escape" || event.key.toLowerCase() === "escape";
+  if (isEscape) {
+    if (
+      event.defaultPrevented
+      || event.isComposing
+      || event.altKey
+      || event.ctrlKey
+      || event.metaKey
+      || isEscapeBlockedTarget(event.target)
+    ) {
+      return undefined;
+    }
+    return "escape";
+  }
+
   if (
     event.defaultPrevented
     || event.isComposing
@@ -81,4 +98,14 @@ function isPlayerShortcutBlockedTarget(target: unknown): boolean {
     return false;
   }
   return Boolean((target as ClosestTarget).closest(PLAYER_SHORTCUT_BLOCK_SELECTOR));
+}
+
+/** 允许按钮接收 ESC，但把输入框和弹层的 ESC 行为留给自身处理。 */
+function isEscapeBlockedTarget(target: unknown): boolean {
+  if (!target || typeof (target as Partial<ClosestTarget>).closest !== "function") {
+    return false;
+  }
+  return Boolean((target as ClosestTarget).closest(
+    "input, textarea, select, [contenteditable='true'], [role='dialog'], [role='menu'], [data-player-shortcut-ignore]"
+  ));
 }
