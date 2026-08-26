@@ -189,10 +189,16 @@ async function ensureSource(directory, offline) {
   await writeFile(join(directory, "src", "ncnn", "glslang", ".ani-submodule-commit"), `${REALESRGAN_SIDECAR_SOURCE.submodules.glslang}\n`, "utf8");
 }
 
-// 将上游可能使用的 SSH 子模块地址统一映射为无需密钥的 HTTPS 地址。
+// 将上游子模块地址规范化为无需密钥的 HTTPS 地址。
 function configureGitSubmoduleUrls(directory) {
-  run("git", ["config", "--local", "--add", "url.https://github.com/.insteadOf", "git@github.com:"], { cwd: directory });
-  run("git", ["config", "--local", "--add", "url.https://github.com/.insteadOf", "ssh://git@github.com/"], { cwd: directory });
+  const modules = [
+    ["submodule.src/ncnn.url", "https://github.com/Tencent/ncnn.git"],
+    ["submodule.src/libwebp.url", "https://github.com/webmproject/libwebp.git"]
+  ];
+  for (const [key, url] of modules) {
+    run("git", ["config", "-f", ".gitmodules", key, url], { cwd: directory });
+  }
+  run("git", ["submodule", "sync", "--recursive"], { cwd: directory });
 }
 
 async function readPinnedCommit(directory) {

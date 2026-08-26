@@ -64,9 +64,10 @@ test("RIFE sidecar 使用完整 Vulkan SDK 构建校验后再进入三平台安�
 
 test("模型 sidecar 在 CI 中使用 HTTPS 子模块并统一 MSVC 静态运行库", () => {
   for (const source of [rifeSidecarPrepare, realesrganSidecarPrepare]) {
-    assert.match(source, /git.*config.*url\.https:\/\/github\.com\/\.insteadOf/);
-    assert.match(source, /git@github\.com:/);
-    assert.match(source, /ssh:\/\/git@github\.com\//);
+    assert.match(source, /config", "-f", "\.gitmodules"/);
+    assert.match(source, /submodule\.src\/ncnn\.url/);
+    assert.match(source, /https:\/\/github\.com\/Tencent\/ncnn\.git/);
+    assert.match(source, /submodule.*sync.*--recursive/);
   }
   assert.match(rifeSidecarCmake, /CMAKE_MSVC_RUNTIME_LIBRARY[\s\S]*?MultiThreaded/);
   assert.match(realesrganSidecarCmake, /CMAKE_MSVC_RUNTIME_LIBRARY[\s\S]*?MultiThreaded/);
