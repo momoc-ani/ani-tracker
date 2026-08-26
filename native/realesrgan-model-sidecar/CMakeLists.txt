@@ -4,6 +4,11 @@ project(ani-realesrgan-model-sidecar LANGUAGES C CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+if(MSVC)
+  # 与上游静态库统一使用静态 MSVC 运行库，避免链接时 RuntimeLibrary 不一致。
+  set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded" CACHE STRING "MSVC runtime linkage")
+endif()
+
 find_package(Threads REQUIRED)
 
 set(REALESRGAN_SOURCE_DIR "" CACHE PATH "Pinned Real-ESRGAN-ncnn-vulkan checkout")

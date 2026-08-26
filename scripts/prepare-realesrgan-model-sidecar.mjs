@@ -181,11 +181,18 @@ async function ensureSource(directory, offline) {
   run("git", ["sparse-checkout", "set", "src"], { cwd: directory });
   run("git", ["fetch", "--depth", "1", "--filter=blob:none", "origin", REALESRGAN_SIDECAR_SOURCE.commit], { cwd: directory });
   run("git", ["switch", "--detach", "FETCH_HEAD"], { cwd: directory });
+  configureGitSubmoduleUrls(directory);
   run("git", ["submodule", "update", "--init", "--recursive", "--depth", "1"], { cwd: directory });
   await writeFile(join(directory, ".ani-source-commit"), `${REALESRGAN_SIDECAR_SOURCE.commit}\n`, "utf8");
   await writeFile(join(directory, "src", "ncnn", ".ani-submodule-commit"), `${REALESRGAN_SIDECAR_SOURCE.submodules.ncnn}\n`, "utf8");
   await writeFile(join(directory, "src", "libwebp", ".ani-submodule-commit"), `${REALESRGAN_SIDECAR_SOURCE.submodules.libwebp}\n`, "utf8");
   await writeFile(join(directory, "src", "ncnn", "glslang", ".ani-submodule-commit"), `${REALESRGAN_SIDECAR_SOURCE.submodules.glslang}\n`, "utf8");
+}
+
+// 将上游可能使用的 SSH 子模块地址统一映射为无需密钥的 HTTPS 地址。
+function configureGitSubmoduleUrls(directory) {
+  run("git", ["config", "--local", "--add", "url.https://github.com/.insteadOf", "git@github.com:"], { cwd: directory });
+  run("git", ["config", "--local", "--add", "url.https://github.com/.insteadOf", "ssh://git@github.com/"], { cwd: directory });
 }
 
 async function readPinnedCommit(directory) {
@@ -263,6 +270,7 @@ async function resolveMacosMoltenVk() {
   const includeDirectory = await firstDirectory([join(sdk, "include"), join(sdk, "MoltenVK", "include")]);
   const library = await firstFile([
     join(sdk, "MoltenVK", "MoltenVK.xcframework", "macos-arm64_x86_64", "libMoltenVK.a"),
+    join(sdk, "lib", "MoltenVK", "MoltenVK.xcframework", "macos-arm64_x86_64", "libMoltenVK.a"),
     join(sdk, "lib", "MoltenVK.xcframework", "macos-arm64_x86_64", "libMoltenVK.a"),
     join(sdk, "lib", "libMoltenVK.a")
   ]);

@@ -7,6 +7,10 @@ const workflow = await readFile(".github/workflows/tauri-release-desktop.yml", "
 const desktopWorkflow = await readFile(".github/workflows/tauri-desktop.yml", "utf8");
 const torrentCorePrepare = await readFile("scripts/prepare-desktop-torrent-core-dev.mjs", "utf8");
 const qbittorrentUnixBuild = await readFile("scripts/build-qbittorrent-nox-unix.sh", "utf8");
+const rifeSidecarPrepare = await readFile("scripts/prepare-rife-model-sidecar.mjs", "utf8");
+const realesrganSidecarPrepare = await readFile("scripts/prepare-realesrgan-model-sidecar.mjs", "utf8");
+const rifeSidecarCmake = await readFile("native/rife-model-sidecar/CMakeLists.txt", "utf8");
+const realesrganSidecarCmake = await readFile("native/realesrgan-model-sidecar/CMakeLists.txt", "utf8");
 const windowsSigningImport = await readFile("scripts/import-windows-signing-certificate.ps1", "utf8");
 const windowsSignatureVerification = await readFile("scripts/verify-windows-self-signature.ps1", "utf8");
 const windowsConfig = JSON.parse(await readFile("src-tauri/tauri.windows.conf.json", "utf8"));
@@ -37,12 +41,13 @@ test("桌面原生依赖统一使用 libmpv 且不再准备 VLC", () => {
   assert.match(workflow, /name: Build Linux managed qBittorrent[\s\S]*?shell: bash/);
 });
 
-test("RIFE sidecar 使用固定 Vulkan SDK 构建校验后再进入三平台安装包", () => {
+test("RIFE sidecar 使用完整 Vulkan SDK 构建校验后再进入三平台安装包", () => {
   const prepareIndex = workflow.indexOf("name: Build and verify RIFE model sidecar");
   const windowsBuildIndex = workflow.indexOf("name: Build signed Windows installers");
   const macosBuildIndex = workflow.indexOf("name: Build self-signed macOS app");
   const linuxBuildIndex = workflow.indexOf("name: Build Linux bundles");
-  assert.match(workflow, /name: Install pinned Vulkan SDK[\s\S]*?vulkan-query-version: 1\.3\.296\.0/);
+  assert.match(workflow, /name: Install pinned Vulkan SDK[\s\S]*?uses: humbletim\/install-vulkan-sdk@v1\.2[\s\S]*?version: 1\.3\.296\.0[\s\S]*?cache: true/);
+  assert.doesNotMatch(workflow, /humbletim\/setup-vulkan-sdk/);
   assert.match(workflow, /pnpm run prepare:rife-sidecar[\s\S]*?pnpm run verify:rife-sidecar/);
   assert.ok(prepareIndex >= 0 && prepareIndex < windowsBuildIndex);
   assert.ok(prepareIndex < macosBuildIndex && prepareIndex < linuxBuildIndex);
@@ -55,6 +60,16 @@ test("RIFE sidecar 使用固定 Vulkan SDK 构建校验后再进入三平台安�
     linuxConfig.bundle.resources["../out/model-sidecar/linux-x64/"],
     "model-sidecar/linux-x64/"
   );
+});
+
+test("模型 sidecar 在 CI 中使用 HTTPS 子模块并统一 MSVC 静态运行库", () => {
+  for (const source of [rifeSidecarPrepare, realesrganSidecarPrepare]) {
+    assert.match(source, /git.*config.*url\.https:\/\/github\.com\/\.insteadOf/);
+    assert.match(source, /git@github\.com:/);
+    assert.match(source, /ssh:\/\/git@github\.com\//);
+  }
+  assert.match(rifeSidecarCmake, /CMAKE_MSVC_RUNTIME_LIBRARY[\s\S]*?MultiThreaded/);
+  assert.match(realesrganSidecarCmake, /CMAKE_MSVC_RUNTIME_LIBRARY[\s\S]*?MultiThreaded/);
 });
 
 test("Real-ESRGAN sidecar 使用独立资源目录并在三平台打包前校验", () => {
