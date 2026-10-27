@@ -1,5 +1,5 @@
 import { AlertTriangle, CalendarDays, Check, CheckCircle2, ChevronDown, ChevronRight, CircleOff, Download, Plus, RefreshCw, Rss, Save, Search, SlidersHorizontal, Trash2, Unlink } from "lucide-react";
-import { useEffect, useId, useMemo, useRef, useState } from "react";
+import { useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { toast } from "@/lib/toast";
 import { useAppScrollContainer } from "@/components/app-shell";
@@ -195,6 +195,10 @@ export function MyAnimePage({
   const [previewingEpisodeId, setPreviewingEpisodeId] = useState<string | null>(null);
   const [addingReleaseId, setAddingReleaseId] = useState<string | null>(null);
   const [message, setMessage] = useState<{ tone: "success" | "error"; text: string } | null>(null);
+  const [updatingPreferenceIds, setUpdatingPreferenceIds] = useState<ReadonlySet<string>>(() => new Set());
+  const updatingPreferenceIdsRef = useRef(new Set<string>());
+  const appScrollContainerRef = useAppScrollContainer();
+  const previousStatusFilterRef = useRef<MyAnimeFilter>(statusFilter);
 
   useEffect(() => {
     let active = true;
@@ -269,6 +273,14 @@ export function MyAnimePage({
     () => items.filter((item) => statusFilter === "all" || item.status === statusFilter),
     [items, statusFilter]
   );
+
+  useLayoutEffect(() => {
+    if (previousStatusFilterRef.current === statusFilter) return;
+    previousStatusFilterRef.current = statusFilter;
+    appScrollContainerRef.current?.scrollTo({ top: 0, behavior: "auto" });
+    console.info("[my-anime] 已切换状态筛选并回到列表顶部", { statusFilter });
+  }, [appScrollContainerRef, statusFilter]);
+
   const draftPersisted = Boolean(draft && items.some((item) => item.id === draft.id));
   const activeFansubAnimeId = draft && draftPersisted ? draft.anime.id : downloadTarget?.anime.id;
 
@@ -456,6 +468,95 @@ export function MyAnimePage({
       });
       throw error;
     }
+  }
+
+  /** 标记追番偏好正在保存，避免同一行重复提交。 */
+  function beginPreferenceUpdate(itemId: string): boolean {
+    if (updatingPreferenceIdsRef.current.has(itemId)) return false;
+    updatingPreferenceIdsRef.current.add(itemId);
+    setUpdatingPreferenceIds(new Set(updatingPreferenceIdsRef.current));
+    return true;
+  }
+
+  /** 清除追番偏好的保存状态。 */
+  function endPreferenceUpdate(itemId: string): void {
+    updatingPreferenceIdsRef.current.delete(itemId);
+    setUpdatingPreferenceIds(new Set(updatingPreferenceIdsRef.current));
+  }
+
+  /** 列表缩短后收敛共享滚动容器，避免停留在已不存在的底部区域。 */
+  function clampMyAnimeScrollAfterListChange(): void {
+    window.requestAnimationFrame(() => {
+      const scrollContainer = appScrollContainerRef.current;
+      if (!scrollContainer) return;
+      const maxScrollTop = Math.max(0, scrollContainer.scrollHeight - scrollContainer.clientHeight);
+      if (scrollContainer.scrollTop <= maxScrollTop) return;
+      const previousScrollTop = scrollContainer.scrollTop;
+      scrollContainer.scrollTop = maxScrollTop;
+      console.info("[my-anime] 列表缩短后已修正滚动位置", {
+        previousScrollTop,
+        maxScrollTop
+      });
+    });
+  }
+
+  /** 保存追番状态或自动下载偏好，并用服务端结果刷新列表。 */
+  async function saveAnimePreference(
+    item: MyAnime,
+    changes: Partial<Pick<MyAnime, "status" | "autoDownload">>,
+    successText: string
+  ): Promise<void> {
+    if (!beginPreferenceUpdate(item.id)) return;
+    try {
+      const updatedAt = new Date().toISOString();
+      const nextItem = normalizeMyAnimeAutoDownload({ ...item, ...changes, updatedAt });
+      const updatedItems = await appApi.upsertMyAnime(nextItem);
+      const savedItem = updatedItems.find((entry) => entry.id === item.id);
+      setItems(updatedItems);
+      setDownloadTarget((current) => current?.id === item.id ? (savedItem ?? current) : current);
+      onDataChanged?.();
+      clampMyAnimeScrollAfterListChange();
+      toast.success(successText);
+      console.info("[my-anime] 追番偏好已保存", {
+        itemId: item.id,
+        animeId: item.anime.id,
+        status: savedItem?.status ?? nextItem.status,
+        autoDownload: savedItem?.autoDownload ?? nextItem.autoDownload
+      });
+    } catch (error) {
+      const text = error instanceof Error ? error.message : "更新追番偏好失败";
+      toast.error(text);
+      console.error("[my-anime] 追番偏好保存失败", { itemId: item.id, changes, error });
+    } finally {
+      endPreferenceUpdate(item.id);
+    }
+  }
+
+  /** 修改单部追番状态，并在终止状态下同步关闭自动下载。 */
+  function changeAnimeStatus(item: MyAnime, status: AnimeStatus): void {
+    if (item.status === status) return;
+    const autoDownloadWillStop = item.autoDownload && !canAnimeStatusAutoDownload(status);
+    void saveAnimePreference(
+      item,
+      { status },
+      autoDownloadWillStop
+        ? `追番状态已更新为「${statusText[status]}」，自动下载已切换为手动`
+        : `追番状态已更新为「${statusText[status]}」`
+    );
+  }
+
+  /** 切换自动下载；已完成和已弃的追番禁止重新开启。 */
+  function changeAnimeAutoDownload(item: MyAnime, enabled: boolean): void {
+    if (item.autoDownload === enabled) return;
+    if (enabled && !canAnimeStatusAutoDownload(item.status)) {
+      toast.warning("已完成或已弃的追番不能开启自动下载");
+      return;
+    }
+    void saveAnimePreference(
+      item,
+      { autoDownload: enabled },
+      enabled ? "已开启自动下载" : "已切换为手动"
+    );
   }
 
   async function addNextEpisode() {
@@ -1097,13 +1198,16 @@ export function MyAnimePage({
               downloadTasks={downloadTasks}
               fansubNames={fansubNames}
               items={visibleItems}
+              updatingPreferenceIds={updatingPreferenceIds}
               watchProgress={watchProgress}
+              onAutoDownloadChange={(item, enabled) => changeAnimeAutoDownload(item, enabled)}
               onOpenActive={(item) => openDownloadDetail(item, "active")}
               onOpenCompleted={(item) => openDownloadDetail(item, "completed")}
               onOpenDetail={(item) => onOpenAnimeDetail?.(item.anime.id)}
               onOpenDownloads={(item) => void openAnimeDownloads(item)}
               onOpenRules={openRulesDrawer}
               onRemove={setRemoveTarget}
+              onStatusChange={(item, status) => changeAnimeStatus(item, status)}
             />
           ) : (
             <Empty className="min-h-72">
@@ -1279,13 +1383,16 @@ interface VirtualMyAnimeListProps {
   downloadTasks: DownloadTask[];
   fansubNames: Map<string, string>;
   items: MyAnime[];
+  updatingPreferenceIds: ReadonlySet<string>;
   watchProgress: Record<string, AnimeWatchProgress>;
+  onAutoDownloadChange: (item: MyAnime, enabled: boolean) => void;
   onOpenActive: (item: MyAnime) => void;
   onOpenCompleted: (item: MyAnime) => void;
   onOpenDetail: (item: MyAnime) => void;
   onOpenDownloads: (item: MyAnime) => void;
   onOpenRules: (item: MyAnime) => void;
   onRemove: (item: MyAnime) => void;
+  onStatusChange: (item: MyAnime, status: AnimeStatus) => void;
 }
 
 /** 仅挂载视口附近的追番条目，并按真实行高修正滚动位置。 */
@@ -1293,25 +1400,43 @@ function VirtualMyAnimeList({
   downloadTasks,
   fansubNames,
   items,
+  updatingPreferenceIds,
   watchProgress,
+  onAutoDownloadChange,
   onOpenActive,
   onOpenCompleted,
   onOpenDetail,
   onOpenDownloads,
   onOpenRules,
-  onRemove
+  onRemove,
+  onStatusChange
 }: VirtualMyAnimeListProps) {
   const scrollContainerRef = useAppScrollContainer();
   const listRef = useRef<HTMLDivElement | null>(null);
   const scrollMargin = useVirtualizerScrollMargin(scrollContainerRef, listRef);
   const virtualizer = useVirtualizer({
     count: items.length,
-    estimateSize: () => 152,
+    estimateSize: estimateMyAnimeRowHeight,
     getItemKey: (index) => items[index]?.id ?? index,
     getScrollElement: () => scrollContainerRef.current,
-    overscan: 5,
+    overscan: 6,
     scrollMargin
   });
+  const virtualItemCount = virtualizer.getVirtualItems().length;
+
+  useEffect(() => {
+    const frame = window.requestAnimationFrame(() => {
+      if (items.length === 0 || !scrollContainerRef.current) return;
+      if (virtualizer.getVirtualItems().length > 0) return;
+      console.warn("[my-anime] 虚拟列表出现空白范围", {
+        itemCount: items.length,
+        scrollTop: scrollContainerRef.current.scrollTop,
+        totalSize: virtualizer.getTotalSize(),
+        scrollMargin
+      });
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [items.length, scrollContainerRef, scrollMargin, virtualItemCount, virtualizer]);
 
   return (
     <div className="min-w-0 border-y">
@@ -1343,12 +1468,15 @@ function VirtualMyAnimeList({
                 }}
                 defaultFansubName={fansubNames.get(item.defaultFansubGroupId ?? "") ?? "未设置"}
                 downloadSummary={summarizeAnimeDownloads(downloadTasks, item.anime.id)}
+                preferenceUpdating={updatingPreferenceIds.has(item.id)}
+                onAutoDownloadChange={(enabled) => onAutoDownloadChange(item, enabled)}
                 onOpenActive={() => onOpenActive(item)}
                 onOpenCompleted={() => onOpenCompleted(item)}
                 onOpenDetail={() => onOpenDetail(item)}
                 onOpenDownloads={() => onOpenDownloads(item)}
                 onOpenRules={() => onOpenRules(item)}
                 onRemove={() => onRemove(item)}
+                onStatusChange={(status) => onStatusChange(item, status)}
               />
             </div>
           );
@@ -1356,6 +1484,11 @@ function VirtualMyAnimeList({
       </div>
     </div>
   );
+}
+
+/** 按桌面或窄屏布局估算未测量行高，实际高度仍由虚拟列表测量修正。 */
+function estimateMyAnimeRowHeight(): number {
+  return window.matchMedia("(min-width: 768px)").matches ? 140 : 196;
 }
 
 /** 渲染追番列表加载中的结构化占位状态。 */

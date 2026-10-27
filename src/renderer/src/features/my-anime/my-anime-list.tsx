@@ -1,4 +1,4 @@
-import { Download, ImageOff, MoreHorizontal, SlidersHorizontal } from "lucide-react";
+import { ChevronDown, Download, ImageOff, MoreHorizontal, SlidersHorizontal } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import { CachedImage } from "@/components/cached-image";
 import { Badge } from "@/components/ui/badge";
@@ -8,6 +8,8 @@ import {
   DropdownMenuContent,
   DropdownMenuGroup,
   DropdownMenuItem,
+  DropdownMenuRadioGroup,
+  DropdownMenuRadioItem,
   DropdownMenuTrigger
 } from "@/components/ui/dropdown-menu";
 import { Progress } from "@/components/ui/progress";
@@ -16,6 +18,7 @@ import { formatMonth } from "@/lib/format";
 import { resolveAnimeTitleDisplay } from "@shared/anime-title";
 import type { AnimeWatchProgress } from "@shared/contracts";
 import type { AnimeStatus, MyAnime } from "@shared/domain";
+import { canAnimeStatusAutoDownload } from "@shared/my-anime-policy";
 import {
   formatSubtitleLanguages,
   formatVideoBitDepth,
@@ -29,6 +32,7 @@ const statusText: Record<AnimeStatus, string> = {
   paused: "暂停",
   dropped: "已弃"
 };
+const statusOptions = Object.entries(statusText) as Array<[AnimeStatus, string]>;
 
 const seasonLabels = {
   winter: "冬季",
@@ -54,13 +58,16 @@ interface MyAnimeRowProps {
   defaultFansubName: string;
   downloadSummary: MyAnimeDownloadSummary;
   item: MyAnime;
+  preferenceUpdating: boolean;
   watchProgress: AnimeWatchProgress;
+  onAutoDownloadChange: (enabled: boolean) => void;
   onOpenActive: () => void;
   onOpenCompleted: () => void;
   onOpenDetail: () => void;
   onOpenDownloads: () => void;
   onOpenRules: () => void;
   onRemove: () => void;
+  onStatusChange: (status: AnimeStatus) => void;
 }
 
 /** 按首播年份和季度归组追番，并优先展示较新的季度。 */
@@ -92,16 +99,21 @@ export function MyAnimeRow({
   defaultFansubName,
   downloadSummary,
   item,
+  preferenceUpdating,
   watchProgress,
+  onAutoDownloadChange,
   onOpenActive,
   onOpenCompleted,
   onOpenDetail,
   onOpenDownloads,
   onOpenRules,
-  onRemove
+  onRemove,
+  onStatusChange
 }: MyAnimeRowProps) {
   const titleDisplay = resolveAnimeTitleDisplay(item.anime);
   const ratingText = item.anime.rating ? item.anime.rating.score.toFixed(1) : "暂无";
+  const autoDownloadAllowed = canAnimeStatusAutoDownload(item.status);
+  const autoDownloadDisabled = preferenceUpdating || (!item.autoDownload && !autoDownloadAllowed);
   const [menuOpen, setMenuOpen] = useState(false);
   const menuCloseTimerRef = useRef<number>();
 
@@ -164,8 +176,53 @@ export function MyAnimeRow({
           </p>
           <div className="mt-2 flex min-w-0 flex-wrap gap-1.5">
             <Badge>{formatMonth(item.anime.premiereYear, item.anime.premiereMonth)}</Badge>
-            <Badge tone="primary">{statusText[item.status]}</Badge>
-            <Badge tone={item.autoDownload ? "green" : "neutral"}>{item.autoDownload ? "自动" : "手动"}</Badge>
+            <DropdownMenu modal={false}>
+              <DropdownMenuTrigger asChild>
+                <button
+                  aria-label={`修改追番状态，当前${statusText[item.status]}`}
+                  className="rounded-md outline-none transition-opacity hover:opacity-80 focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-wait disabled:opacity-60"
+                  disabled={preferenceUpdating}
+                  title="点击修改追番状态"
+                  type="button"
+                >
+                  <Badge className="gap-0.5 pr-1.5" tone="primary">
+                    {statusText[item.status]}
+                    <ChevronDown aria-hidden="true" className="size-3" />
+                  </Badge>
+                </button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="start" className="w-36">
+                <DropdownMenuRadioGroup
+                  onValueChange={(value) => {
+                    if (value !== item.status) {
+                      onStatusChange(value as AnimeStatus);
+                    }
+                  }}
+                  value={item.status}
+                >
+                  {statusOptions.map(([value, label]) => (
+                    <DropdownMenuRadioItem key={value} value={value}>
+                      {label}
+                    </DropdownMenuRadioItem>
+                  ))}
+                </DropdownMenuRadioGroup>
+              </DropdownMenuContent>
+            </DropdownMenu>
+            <button
+              aria-label={`${item.autoDownload ? "关闭自动下载，切换为手动" : "开启自动下载"}${autoDownloadDisabled && !preferenceUpdating ? "，当前状态不允许开启" : ""}`}
+              aria-pressed={item.autoDownload}
+              className="rounded-md outline-none transition-opacity hover:opacity-80 focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-60"
+              disabled={autoDownloadDisabled}
+              onClick={() => onAutoDownloadChange(!item.autoDownload)}
+              title={autoDownloadDisabled && !preferenceUpdating
+                ? "已完成或已弃的追番不能开启自动下载"
+                : item.autoDownload ? "点击切换为手动" : "点击开启自动下载"}
+              type="button"
+            >
+              <Badge tone={item.autoDownload ? "green" : "neutral"}>
+                {item.autoDownload ? "自动" : "手动"}
+              </Badge>
+            </button>
             <Badge className="max-w-full truncate" title={defaultFansubName}>{defaultFansubName}</Badge>
             {item.preferredResolution && <Badge>{item.preferredResolution}</Badge>}
             {item.preferredCodec && <Badge tone="blue">{item.preferredCodec}</Badge>}
